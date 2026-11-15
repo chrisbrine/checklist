@@ -14,6 +14,7 @@ final class StorageUpgradePreparationTests: XCTestCase {
             object = attachment["path"] as? String
         }
         let identity = try f.router!.dbQueue.write {db -> StoreIdentityReceipt in
+            try db.execute(sql:"DROP INDEX records_delivery_message; DROP INDEX records_delivery_recipient_generation")
             let current = try StoreIdentityReceipt.decode(Data((try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'"))!.utf8)).withSchema(3)
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try current.encoded(),as:UTF8.self)])
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(SchemaMigrations.ledgers(3))])

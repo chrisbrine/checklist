@@ -65,7 +65,7 @@ def default_parent() -> Path:
 
 
 def swift_test(scratch: Path, method: str, env: dict[str, str], log) -> tuple[int, float]:
-    command = ['swift', 'test', '--skip-build', '--scratch-path', str(scratch),
+    command = ['swift', 'test', '--skip-build', '--skip-update', '--skip', 'HumanClaimsKeychainTests', '--scratch-path', str(scratch),
                '--filter', f'^{TEST_CLASS}/{method}$']
     started = time.monotonic()
     log.write(f'$ {" ".join(command)}\n')

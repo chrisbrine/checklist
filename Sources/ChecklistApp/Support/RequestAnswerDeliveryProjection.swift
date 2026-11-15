@@ -35,11 +35,15 @@ struct RequestAnswerDeliveryProjection {
         guard matching.count == 1, let message = matching.first else { return unavailable() }
         let deliveries = message.records("deliveries")
         let anchors = latest ? request.records("continuation_deliveries") : []
-        if deliveries.isEmpty && anchors.isEmpty && message.string("delivery_status") == "saved_for_pickup" {
+        let omissions = message.records("delivery_omissions")
+        let omissionAnchors = anchors.filter(isBindingOmission)
+        let deliveryAnchors = anchors.filter { !isBindingOmission($0) }
+        if deliveries.isEmpty && anchors.isEmpty && omissions.isEmpty && message.string("delivery_status") == "saved_for_pickup" {
             return .init(recipients: [], summary: snapshotCurrent ? "Saved on the ticket; no recipient delivery is observed." : "Last known delivery status: saved on the ticket with no recipient delivery.")
         }
         let currentPrefix = snapshotCurrent ? "" : "Last known · "
         var rows: [Recipient] = []
+        var verifiedDeliveries: [Record] = []
         for (index, delivery) in deliveries.enumerated() {
             let sid = delivery.string("recipient_session_id"), generation = delivery.string("recipient_authorization_generation")
             let fallbackLabel = historicalLabel(delivery)
@@ -49,7 +53,7 @@ struct RequestAnswerDeliveryProjection {
                   delivery.string("project_id") == project, delivery.string("message_id") == message.id else {
                 rows.append(.init(id: rowID, label: fallbackLabel, receipt: "Delivery status unavailable")); continue
             }
-            let expected = anchors.filter { $0.id == delivery.id }
+            let expected = deliveryAnchors.filter { $0.id == delivery.id }
             if expected.count > 1 || expected.first.map({
                 $0.string("project_id") != project || $0.string("message_id") != message.id ||
                 $0.string("recipient_session_id") != sid || $0.string("recipient_authorization_generation") != generation
@@ -59,11 +63,12 @@ struct RequestAnswerDeliveryProjection {
             // Current-handler routing mints its own generation-bound delivery.
             // The requester's historical generation fences only the extra
             // requester fallback, even when that requester later handles work.
-            let handlerDelivery = ["handler", "registered_child", "coordinator"].contains(delivery.string("recipient_role"))
+            let handlerDelivery = ["handler", "registered_child", "coordinator", "triage_orchestrator"].contains(delivery.string("recipient_role"))
             if sid == request.string("requester_session_id"),
                request.string("requester_authorization_generation") != generation, !handlerDelivery {
                 rows.append(.init(id: rowID, label: fallbackLabel, receipt: "Requester connection changed; delivery status unavailable")); continue
             }
+            verifiedDeliveries.append(delivery)
             let availability = recipientAvailability(sessionID: sid, generation: generation, project: project, sessions: sessions)
             let label = availability.currentLabel ?? fallbackLabel
             let state = delivery.string("state")
@@ -81,11 +86,52 @@ struct RequestAnswerDeliveryProjection {
             }
             rows.append(.init(id: rowID, label: label, receipt: receipt))
         }
-        for (index, anchor) in anchors.enumerated() where !deliveries.contains(where: { $0.id == anchor.id }) {
+        for (index, omission) in omissions.enumerated() {
+            let matches = omissionAnchors.filter { sameOmissionFacts($0, omission) }
+            let unique = omissions.filter { sameOmissionFacts($0, omission) }.count == 1
+            let valid = validBindingOmission(omission, project: project, message: message.id) && unique &&
+                (!latest || (matches.count == 1 && validBindingOmission(matches[0], project: project, message: message.id)))
+            let recovered = verifiedDeliveries.contains {
+                $0.string("recipient_role") == "triage_orchestrator" &&
+                $0.string("recipient_session_id") == omission.string("recipient_session_id") &&
+                $0.string("recipient_authorization_generation") != omission.string("binding_authorization_generation")
+            }
+            let receipt = recovered ? "Not delivered when answered · Triage binding needed resume" : "Not delivered · Triage binding needs resume"
+            // An omission records what happened when this answer was saved. A
+            // later resume may add a real delivery without erasing that history.
+            rows.append(.init(id: "omission:\(message.id):\(index)", label: omissionLabel(omission),
+                              receipt: valid ? currentPrefix + receipt : "Delivery status unavailable"))
+        }
+        for (index, anchor) in omissionAnchors.enumerated() where !omissions.contains(where: { sameOmissionFacts($0, anchor) }) {
+            rows.append(.init(id: "unavailable-omission-anchor:\(index)", label: omissionLabel(anchor), receipt: "Delivery status unavailable"))
+        }
+        for (index, anchor) in deliveryAnchors.enumerated() where !deliveries.contains(where: { $0.id == anchor.id }) {
             rows.append(.init(id: "unavailable-anchor:\(index)", label: historicalLabel(anchor), receipt: "Delivery status unavailable"))
         }
         guard !rows.isEmpty else { return unavailable() }
         return .init(recipients: rows, summary: snapshotCurrent ? "Delivery status for this saved response." : "Last known delivery status. Checklist is " + (serviceUpgrading ? "upgrading" : "disconnected") + "; the saved answer is unchanged.")
+    }
+
+    private static func isBindingOmission(_ record: Record) -> Bool {
+        record.string("state") == "not_delivered_binding_stale"
+    }
+
+    private static let omissionFacts = ["message_id", "project_id", "recipient_role", "recipient_session_id", "triage_id", "orchestration_id", "state", "reason", "binding_authorization_generation"]
+
+    private static func sameOmissionFacts(_ lhs: Record, _ rhs: Record) -> Bool {
+        omissionFacts.allSatisfy { lhs.string($0) == rhs.string($0) }
+    }
+
+    private static func validBindingOmission(_ record: Record, project: String, message: String) -> Bool {
+        isBindingOmission(record) && record.values["id"] == nil &&
+            record.string("project_id") == project && record.string("message_id") == message &&
+            record.string("recipient_role") == "triage_orchestrator" &&
+            omissionFacts.allSatisfy { present(record.string($0)) }
+    }
+
+    private static func omissionLabel(_ record: Record) -> String {
+        let name = record.string("recipient_display", fallback: record.string("recipient_label"))
+        return "Triage orchestrator" + (present(name) && UUID(uuidString: name) == nil ? " · " + name : "")
     }
 
     private struct Availability {

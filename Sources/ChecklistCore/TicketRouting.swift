@@ -87,6 +87,91 @@ extension CommandRouter {
         for key in ["label", "triage_id"] { if let value = recipient[key], !(value is NSNull) { delivery[key] = value } }
     }
 
+    /// Immutable send-time evidence, not an outbox receipt. Keep the original Triage
+    /// and orchestration even if the ticket later leaves that work list.
+    func staleTriageCopyOmissions(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
+        guard let pid = message["project_id"] as? String, let tid = message["task_id"] as? String,
+              message["audience"] as? String != "holder",
+              let task = try? scoped(db, tid, pid, type: "task"),
+              let group = try ticketOrchestratedTriage(db, task: task),
+              let orchestration = group["orchestration"] as? JSON,
+              let sid = orchestration["session_id"] as? String,
+              sid != message["author_session_id"] as? String,
+              !recipients.contains(where: { $0["session_id"] as? String == sid }),
+              let session = try? scoped(db, sid, pid, type: "session"),
+              sessionGeneration(session) != orchestration["session_authorization_generation"] as? String else { return [] }
+        let mid = try StoredRecord(message, family: "message").string("id")
+        let reached = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM records WHERE type='delivery' AND project_id=?"
+            + " AND json_extract(data,'$.message_id')=? COLLATE BINARY AND json_extract(data,'$.recipient_session_id')=? COLLATE BINARY)",
+            arguments: [pid, mid, sid]) ?? false
+        guard !reached else { return [] }
+        return [["project_id": pid, "message_id": mid,
+                 "recipient_role": "triage_orchestrator", "recipient_session_id": sid,
+                 "recipient_display": session["label"] ?? sessionThreadLabel(session),
+                 "triage_id": try StoredRecord(group, family: "group").string("id"),
+                 "orchestration_id": try StoredRecord(orchestration, family: "orchestration").string("id"),
+                 "binding_authorization_generation": orchestration["session_authorization_generation"] ?? "",
+                 "state": "not_delivered_binding_stale",
+                 "reason": "This conversation's authorization generation changed. Explicitly resume its Triage binding to receive the missed copy."]]
+    }
+
+    /// Direct mandatory notices do not pass through messageWrite. Record their
+    /// missing copy at the queue boundary without inventing a queued delivery.
+    func recordStaleTriageCopyOmissions(_ db: Database, message: JSON, recipients: [JSON]) throws {
+        guard message["delivery_omissions"] == nil else { return }
+        let omissions = try staleTriageCopyOmissions(db, message: message, recipients: recipients)
+        guard !omissions.isEmpty else { return }
+        var stored = message; stored["delivery_omissions"] = omissions
+        stored.removeValue(forKey: "deliveries"); stored.removeValue(forKey: "subject")
+        try save(db, stored, type: "message")
+    }
+
+    /// Resume remembers only its own verified orchestration ancestry. New notes use
+    /// recorded omissions. Older notes require positive default/mandatory-route and
+    /// historical membership facts within the verified closure-to-resume window.
+    /// Any receipt to this conversation (including an explicit recipient or mention)
+    /// prevents a second copy, across generations and repeated recovery periods.
+    func deliverMissedTriageNotes(_ db: Database, group: JSON) throws -> (delivered: Int, hasMore: Bool) {
+        guard let recipient = triageOrchestratorRecipient(db, group: group),
+              let sid = recipient["session_id"] as? String,
+              let orchestration = group["orchestration"] as? JSON,
+              bool(orchestration,"missed_note_delivery_pending") else { return (0, false) }
+        let ids = strings(orchestration, "missed_note_orchestration_ids")
+        guard !ids.isEmpty else { return (0, false) }
+        let pid = try StoredRecord(group, family: "group").string("project_id")
+        let gid = try StoredRecord(group, family: "group").string("id")
+        let windows = orchestration["missed_note_windows"] as? [JSON] ?? []
+        let sql = "WITH reached AS MATERIALIZED (SELECT DISTINCT json_extract(data,'$.message_id') AS mid FROM records"
+            + " WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.recipient_session_id')=CAST(? AS TEXT) COLLATE BINARY)"
+            + " SELECT " + Self.canonicalColumns(alias: "m") + " FROM records m LEFT JOIN reached ON reached.mid=m.id WHERE m.type='message' AND m.project_id=CAST(? AS TEXT) AND reached.mid IS NULL"
+            + " AND COALESCE(json_extract(m.data,'$.author_session_id'),'')<>CAST(? AS TEXT) COLLATE BINARY"
+            + " AND (EXISTS (SELECT 1 FROM json_each(m.data,'$.delivery_omissions') o WHERE json_extract(o.value,'$.state')='not_delivered_binding_stale'"
+            + " AND json_extract(o.value,'$.triage_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(o.value,'$.recipient_session_id')=CAST(? AS TEXT) COLLATE BINARY"
+            + " AND json_extract(o.value,'$.orchestration_id') IN (SELECT value FROM json_each(?)))"
+            + " OR (json_extract(m.data,'$.delivery_omissions') IS NULL AND json_extract(m.data,'$.conversation_id') IS NULL"
+            + " AND COALESCE(json_extract(m.data,'$.audience'),'all')<>'holder'"
+            + " AND (json_extract(m.data,'$.ordinary_routing')='handlers' OR json_extract(m.data,'$.human_request_id') IS NOT NULL"
+            + " OR json_extract(m.data,'$.requires_action')=1 OR (json_extract(m.data,'$.origin')='system' AND json_extract(m.data,'$.kind') IN ('work_health','project_context_changed')))"
+            + " AND EXISTS (SELECT 1 FROM json_each(?) w WHERE m.rowid>(SELECT rowid FROM records WHERE type='native_closure' AND project_id=m.project_id AND id=json_extract(w.value,'$.native_closure_ref'))"
+            + " AND m.rowid<=CAST((SELECT value FROM metadata WHERE key='triage-note-cutover:'||json_extract(w.value,'$.cutover_ref')) AS INTEGER))"
+            + " AND (EXISTS (SELECT 1 FROM records i WHERE i.type='triage_membership_interval' AND i.project_id=m.project_id"
+            + " AND json_extract(i.data,'$.triage_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(i.data,'$.task_id')=json_extract(m.data,'$.task_id') COLLATE BINARY"
+            + " AND (json_extract(i.data,'$.joined_at')<json_extract(m.data,'$.created_at') COLLATE BINARY OR (json_extract(i.data,'$.joined_at')=json_extract(m.data,'$.created_at') COLLATE BINARY AND i.rowid<m.rowid))"
+            + " AND NOT EXISTS (SELECT 1 FROM records x WHERE x.type='triage_membership_exit' AND x.project_id=i.project_id AND json_extract(x.data,'$.membership_id')=i.id COLLATE BINARY"
+            + " AND (json_extract(x.data,'$.exited_at')<json_extract(m.data,'$.created_at') COLLATE BINARY OR (json_extract(x.data,'$.exited_at')=json_extract(m.data,'$.created_at') COLLATE BINARY AND x.rowid<m.rowid))))"
+            + " OR EXISTS (SELECT 1 FROM json_each(?) member WHERE json_extract(member.value,'$.task_id')=json_extract(m.data,'$.task_id') COLLATE BINARY"
+            + " AND json_extract(member.value,'$.joined_at')<json_extract(m.data,'$.created_at') COLLATE BINARY"
+            + " AND NOT EXISTS (SELECT 1 FROM records i WHERE i.type='triage_membership_interval' AND i.project_id=m.project_id AND json_extract(i.data,'$.triage_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(i.data,'$.task_id')=json_extract(m.data,'$.task_id') COLLATE BINARY)))))"
+            + " ORDER BY m.rowid LIMIT 51"
+        let rows = try Row.fetchAll(db, sql: sql, arguments: [Data(pid.utf8), Data(sid.utf8), Data(pid.utf8), Data(sid.utf8), Data(gid.utf8), Data(sid.utf8), try jsonString(ids), try jsonString(windows), Data(gid.utf8), try jsonString(group["members"] as? [JSON] ?? []), Data(gid.utf8)])
+        for row in rows.prefix(50) {
+            let message = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "message").object
+            var copy = recipient; copy["label"] = "Missed Triage copy, delivered after you resumed \(group["name"] as? String ?? "this Triage")."
+            _ = try queueDirectionDeliveries(db, message: message, recipients: [copy])
+        }
+        return (min(rows.count, 50), rows.count > 50)
+    }
+
     /// Mandatory notices (takeover, handoff): an explicit copy to each earlier holder that
     /// can receive, plus the Triage orchestrator. With no receiving earlier holder the
     /// notice uses the default route (holder and orchestrator, never the sender).
@@ -105,6 +190,14 @@ extension CommandRouter {
             copy["label"] = "Also sent to \(earlierThread), which held \(key)."
             notices[0]["deliveries"] = try queueDirectionDeliveries(db, message: notices[0], recipients: [copy])
             notices[0]["delivery_status"] = "queued"
+        }
+        let delivered = notices.flatMap { $0["deliveries"] as? [JSON] ?? [] }
+            .map { ["session_id": $0["recipient_session_id"] ?? ""] as JSON }
+        let omissions = try staleTriageCopyOmissions(db, message: notices[0], recipients: delivered)
+        if !omissions.isEmpty {
+            notices[0]["delivery_omissions"] = omissions
+            let mid = try StoredRecord(notices[0], family: "message").string("id")
+            try recordStaleTriageCopyOmissions(db, message: try scoped(db, mid, pid, type: "message"), recipients: delivered)
         }
         return notices
     }

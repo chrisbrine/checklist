@@ -111,7 +111,8 @@ enum StorageBootstrap {
                         if version < 2 { try SchemaMigrations.upgradeProtocol(db,identity:prepared,protectedSnapshot:protected) }
                         if version < 3 { try SchemaMigrations.upgradeManagedPaths(db,identity:prepared,root:root,plan:plan,protectedSnapshot:protected) }
                         if version < 4 { try SchemaMigrations.upgradeTriageMembership(db,identity:prepared,protectedSnapshot:protected) }
-                        try SchemaMigrations.upgradeBackupReceipts(db,identity:prepared,root:root,protectedSnapshot:protected)
+                        if version < 5 { try SchemaMigrations.upgradeBackupReceipts(db,identity:prepared,root:root,protectedSnapshot:protected) }
+                        if version < 6 { try measured("schema.delivery-indexes") { try SchemaMigrations.upgradeDeliveryLookups(db,identity:prepared,protectedSnapshot:protected,observe:qualificationObserve) } }
                         if let protectedOperation { try CommandRouter.enqueueAutomaticBackupRetention(db,root:root,incarnation:identity.incarnation,operation:protectedOperation) }
                         observe(.upgradeBeforeCommit)
                     }

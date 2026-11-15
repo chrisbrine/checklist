@@ -243,6 +243,8 @@ extension CommandRouter {
            !recipients.contains(where: { $0["session_id"] as? String == copy["session_id"] as? String }) {
             recipients.append(copy)
         }
+        let omissions = try staleTriageCopyOmissions(db, message: message, recipients: recipients)
+        if !omissions.isEmpty { message["delivery_omissions"] = omissions; try save(db,message,type:"message") }
         let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients, at: date)
         try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": (try StoredRecord(message,
             family: "record").requiredValue("id"))])

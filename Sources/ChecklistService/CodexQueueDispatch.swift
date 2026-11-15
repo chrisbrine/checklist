@@ -278,6 +278,7 @@ extension Coordinator {
             let refuse: @Sendable (CodexQueueObservation) -> Void = { [self] observation in
                 fputs("ChecklistService: Codex queue route refused delivery \(id): \(observation.reason.rawValue).\n",stderr)
                 queue.async { [self] in
+                  performNativeLifecycleWrite { [self] in
                     attemptedDeliveries.remove(id);route.open -= 1
                     // No later check can repair this by itself, so the receipt states the reason.
                     if observation.reason == .registrationUnproven {
@@ -287,17 +288,18 @@ extension Coordinator {
                         nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"unavailable","queue_refusal_receipt":true,"receipt":receipt],deliveryID:id,routeGeneration:generation)
                     }
                     route.retryAt[thread] = route.effects.now().addingTimeInterval(CodexQueueBounds.retrySeconds)
+                  }
                 }
             }
             let first = route.effects.preflight(start.registration,proven)
             if case .refused(let observation) = first { return refuse(observation) }
             if case .occupied = first { return resumeCodexQueueItem(start,proven:proven) }
-            let fenceFailure = queue.sync { codexQueueFence(deliveryID:id,enrollment:start.enrollment) }
+            let fenceFailure = syncNativeLifecycleWrite { [self] in codexQueueFence(deliveryID:id,enrollment:start.enrollment) }
             if let fenceFailure { return refuse(.init(reason:fenceFailure)) }
             // The holder can change while the fence commits, so this check is the last step before the call.
             let last = route.effects.preflight(start.registration,proven)
             guard case .allowed(let observation,let executable) = last else {
-                queue.sync { [self] in
+                syncNativeLifecycleWrite { [self] in
                     _ = nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"unavailable","release_queue_fence":true],deliveryID:id,routeGeneration:generation)
                 }
                 if case .refused(let refusal) = last { refuse(refusal) }
@@ -306,12 +308,14 @@ extension Coordinator {
             }
             let finish: @Sendable (String,Data) -> Void = { [self] state,bytes in
                 queue.async { [self] in
+                  performNativeLifecycleWrite { [self] in
                     let receipt = (try? JSONSerialization.jsonObject(with:bytes)) as? [String:Any] ?? [:]
                     nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":state,"receipt":receipt],deliveryID:id,routeGeneration:generation)
                     route.open -= 1
                     changed()
                     // A second note to this thread waited for a later pass.
                     dispatchNative()
+                  }
                 }
             }
             do {
@@ -326,7 +330,7 @@ extension Coordinator {
                 if let item = sent.itemID { accepted["queued_item_id"] = item }
                 let acceptedBytes = try JSONSerialization.data(withJSONObject:accepted)
                 // Preserve queue acceptance before the wait. A crash cannot send this again or mint acknowledgment.
-                let recorded = queue.sync { [self] () -> Bool in
+                let recorded = syncNativeLifecycleWrite { [self] () -> Bool in
                     let fields = (try? JSONSerialization.jsonObject(with:acceptedBytes)) as? [String:Any] ?? [:]
                     if case .recorded = nativeOutcomes().record("delivery_record",params:["delivery_id":id,"state":"provider_accepted","receipt":fields],deliveryID:id,routeGeneration:generation) { changed();return true }
                     return false
@@ -335,7 +339,7 @@ extension Coordinator {
                     accepted["queue_poll_result"] = "authorization_changed";accepted["open_result"] = "authorization_changed"
                     return finish("provider_accepted",(try? JSONSerialization.data(withJSONObject:accepted)) ?? acceptedBytes)
                 }
-                let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in queue.sync { codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
+                let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in syncNativeLifecycleWrite { [self] in codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
                 var environment = route.effects.followup(start.registration,route.lane,status)
                 environment.reserveOpen = { route.reserveOpen(threadID:thread) }
                 CodexQueueFollowup.run(itemID:sent.itemID,registration:start.registration,environment:environment) { result in
@@ -358,7 +362,7 @@ extension Coordinator {
     /// No poll, timer or second queue call is added here.
     private func resumeCodexQueueItem(_ start: CodexQueueStart, proven: Bool) {
         let route = codexRoute,id = start.deliveryID,thread = start.registration.sessionID
-        let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in queue.sync { codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
+        let status: @Sendable () -> CodexQueueDeliveryStatus = { [self] in syncNativeLifecycleWrite { [self] in codexQueueDeliveryStatus(id:id,enrollment:start.enrollment) } }
         let environment = route.effects.followup(start.registration,route.lane,status)
         let result: CodexQueueFollowupReceipt
         if case .current = status() {
@@ -377,6 +381,7 @@ extension Coordinator {
             }
         } else { result = .init(pollResult:"queue_occupied",openResult:"authorization_changed") }
         queue.async { [self] in
+          performNativeLifecycleWrite { [self] in
             var receipt: [String:Any] = ["route":"codex_app_queue","route_generation":start.enrollment.generation,"result":"refused",
                 "reason_code":"queue_occupied","observer":"codex_state_5_threads_source","source":"vscode"]
             receipt.merge(result.metadata) { _,new in new }
@@ -384,6 +389,7 @@ extension Coordinator {
             attemptedDeliveries.remove(id);route.open -= 1
             route.retryAt[thread] = route.effects.now().addingTimeInterval(CodexQueueBounds.retrySeconds)
             changed()
+          }
         }
     }
 
@@ -422,6 +428,10 @@ extension Coordinator {
 
     /// Only a true result is stored. A false proof never replaces an earlier true one here.
     func storeCodexAppHostProof(installation: String, generation: String) {
+        requireCommandQueue()
+        performNativeLifecycleWrite { [self] in storeCodexAppHostProofOnQueue(installation: installation, generation: generation) }
+    }
+    private func storeCodexAppHostProofOnQueue(installation: String, generation: String) {
         requireCommandQueue()
         guard enrollments[installation]?.generation == generation,enrollments[installation]?.codexAppHostProven != true else { return }
         enrollments[installation]?.codexAppHostProven = true

@@ -11,7 +11,7 @@ public enum NativeRelayOrigin: String, Sendable {
     /// relays only with its delivery's own marker, so requests queued by an earlier build are not sent late.
     public static func forDispatch(messageOrigin: String?, nativeRelay: String?) -> NativeRelayOrigin? {
         guard let origin = messageOrigin.flatMap(NativeRelayOrigin.init(rawValue:)) else { return nil }
-        return origin == .system && nativeRelay != "work_health" ? nil : origin
+        return origin == .system && !["work_health", "triage_recovery"].contains(nativeRelay ?? "") ? nil : origin
     }
 }
 
@@ -46,7 +46,7 @@ public enum NativeRelayContent {
         switch origin {
         case .humanUI: authorship = "human_ui (the owner, through the Checklist app)"
         case .agent: authorship = "agent (an agent-authored Checklist note)"
-        case .system: authorship = "system (an automatic Checklist work health request, written by no person or agent)"
+        case .system: authorship = "system (an automatic Checklist notice, written by no person or agent)"
         }
         let reply: String
         if let permittedReply {

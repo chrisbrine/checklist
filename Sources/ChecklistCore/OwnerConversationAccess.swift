@@ -149,6 +149,7 @@ extension CommandRouter {
                     }
                     session.removeValue(forKey:"ended_at")
                     result = self.revised(session); try self.save(db,result,type:"session")
+                    try self.queueTriageBindingRecoveryNotices(db, session: result, caller: caller)
                     try self.event(db,caller:caller,project:resumption.projectID,entity:resumption.sessionID,kind:"owner_allowed_conversation_reconnected")
                     return .commit
                 }

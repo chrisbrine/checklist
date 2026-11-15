@@ -1,0 +1,49 @@
+{
+  "message": {
+    "id": "00000000-0000-0000-0000-000000000601",
+    "delivery_omissions": [
+      {
+        "message_id": "00000000-0000-0000-0000-000000000601",
+        "project_id": "00000000-0000-0000-0000-000000000602",
+        "recipient_role": "triage_orchestrator",
+        "recipient_session_id": "00000000-0000-0000-0000-000000000603",
+        "triage_id": "00000000-0000-0000-0000-000000000604",
+        "orchestration_id": "00000000-0000-0000-0000-000000000605",
+        "state": "not_delivered_binding_stale",
+        "reason": "This conversation's authorization generation changed. Explicitly resume its Triage binding to receive the missed copy.",
+        "recipient_display": "Claude · demo-orchestrator",
+        "binding_authorization_generation": "generation-before-resume"
+      }
+    ]
+  },
+  "request": {
+    "continuation_message_id": "00000000-0000-0000-0000-000000000601",
+    "continuation_deliveries": [
+      {
+        "id": "00000000-0000-0000-0000-000000000606",
+        "message_id": "00000000-0000-0000-0000-000000000601",
+        "project_id": "00000000-0000-0000-0000-000000000602",
+        "recipient_session_id": "00000000-0000-0000-0000-000000000607",
+        "recipient_authorization_generation": "generation-current-holder",
+        "recipient_role": "handler",
+        "state": "queued"
+      },
+      {
+        "message_id": "00000000-0000-0000-0000-000000000601",
+        "project_id": "00000000-0000-0000-0000-000000000602",
+        "recipient_role": "triage_orchestrator",
+        "recipient_session_id": "00000000-0000-0000-0000-000000000603",
+        "triage_id": "00000000-0000-0000-0000-000000000604",
+        "orchestration_id": "00000000-0000-0000-0000-000000000605",
+        "state": "not_delivered_binding_stale",
+        "reason": "This conversation's authorization generation changed. Explicitly resume its Triage binding to receive the missed copy.",
+        "recipient_display": "Claude · demo-orchestrator",
+        "binding_authorization_generation": "generation-before-resume"
+      }
+    ]
+  },
+  "pickup": {
+    "missed_notes_delivered": 50,
+    "missed_note_delivery_has_more": true
+  }
+}

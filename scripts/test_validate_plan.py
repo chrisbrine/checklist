@@ -63,7 +63,8 @@ class SkillReferenceConsistencyTests(unittest.TestCase):
                                     '## Reads that run as operations\n\n' + rows + '\n## Next\n') + '\n'
             (root / rel).write_text(body)
         (root / 'skills/checklist/SKILL.md').write_text(
-            ' '.join(f'references/{Path(rel).name}' for rel in rules))
+            rules['skills/checklist/SKILL.md'] + '\n'
+            + ' '.join(f'references/{Path(rel).name}' for rel in rules))
         (root / 'docs/mcp-contract.md').write_text(
             'The service always uses this route for `backup_create`, `policy_preview`. `project_edit` and others.\n'
             'Read operations run exactly as their synchronous reads: These are `attachment_read`, `policy_preview`'

@@ -77,6 +77,21 @@ final class BootstrapAdmissionTests: XCTestCase {
         XCTAssertTrue(coordinator.backupDeferredCalls.isEmpty)
     }
 
+    func testWorkerDeferralReportedAfterBackupUnlockResumesWithoutAnotherEvent() throws {
+        let coordinator = coordinator!, resumed = expectation(description: "Late worker resumes after completed unlock")
+        try coordinator.router.backupWrites.beginCapture()
+        coordinator.router.backupWrites.endBackup(router: coordinator.router)
+        // Drain the only unlock notification before the worker reports its
+        // earlier refusal. A later notification must not be needed to reply.
+        coordinator.queue.sync {}
+        coordinator.queue.sync {
+            XCTAssertFalse(coordinator.router.writeAdmissionStatus["locked"] as? Bool == true)
+            coordinator.afterBackupWriteAdmission { resumed.fulfill() }
+            XCTAssertTrue(coordinator.backupDeferredCalls.isEmpty)
+        }
+        wait(for: [resumed], timeout: 10)
+    }
+
     func testFreshBootstrapReadsAndTwoQueuedWritesFinishWhileActualWriterIsHeld() throws {
         let router = coordinator.router
         let epic = try XCTUnwrap(try router.handle(method: "epic_create", params: ["command_id": UUID().uuidString,

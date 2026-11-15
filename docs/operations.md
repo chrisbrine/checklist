@@ -122,6 +122,49 @@ Purge replaces the ticket with an immutable **Purged ticket** reference retainin
 
 After the ticket records are permanently removed, Checklist cleans up managed originals, previews and captured-source files that belonged only to that ticket, including captured file lists and links. Before deleting each file, it checks again for reasons to keep it: shared references, Keep original, files in use by readers or media, backup protection, workspace overlap or uncertainty about ownership. A captured symbolic link that is kept also keeps every link in its target chain and the final file. Cleanup runs after the purge commits and may finish later; its receipt reports files removed, kept, pending or already missing, with reasons. Reported file sizes do not measure reclaimed disk space or promise secure erasure. External originals and workspace files are never deleted. Known backup counts and recorded times come from existing metadata; unrecorded backups/exports may also contain the ticket. **Checklist does not change existing backups or exports; delete those copies yourself if needed.** Automatic CL-193 project ticket-cleanup rules also remove eligible Done-ticket evidence and purge closed Done/Canceled tickets after the configured age (default 15 days), with the same ownership and retention checks; see [automatic ticket cleanup](archive-cleanup.md#done-evidence-and-aged-closed-tickets-cl-193). No backup indexing, secure erasure or conversation-redaction system is added.
 
+## Diagnose a busy service queue (CL-462)
+
+The service records each completed command-queue callback that takes more than
+one second. It writes the last 64 periods to
+`~/Library/Logs/Checklist/service-command-queue.json`. A test slot writes
+`service-command-queue-test<N>.json` in that directory. The file survives a service
+restart. It contains `started_at` in UTC, monotonic `duration_ms`, the source work
+label and `activities_ms` for the command and lifecycle phases. It contains no
+command arguments, credentials or caller identity. File writes run on a separate
+lane. Reading this file requires no database or running service:
+
+```sh
+python3 -m json.tool "$HOME/Library/Logs/Checklist/service-command-queue.json"
+```
+
+A missing file means no period has been recorded at that path. The diagnostic
+records completed work; it cannot report a callback that has not returned, a
+process killed before publication, or a file write that failed. A short callback
+does not establish an end-to-end latency bound: queue wait and client startup
+still need a concurrent read measurement.
+
+Native process and registry events coalesce into a pass that inspects one
+enrollment per queue turn. A reconnect resolves its own earlier registration if
+that observation has not run yet. Connection bootstraps also run one per turn,
+so a burst of reconnects leaves ordinary app and agent reads between them.
+Resumption runs its atomic Core transaction on a worker. Codex post-closure
+verification and its bounded retries also run there. Credential and enrollment
+staging, current owner checks and completion stay on the command queue. The
+service returns the bootstrap result after Core commits. A failed transaction
+restores only its own staged local generation; a committed transaction never
+restores the old authority.
+
+While a resumption owns the writer, new mutation requests, coordinator-owned
+setup and native outcome writes wait in memory. They resume in order, one per queue turn, before the next
+bootstrap. Relay workers wait outside the command queue for their durable fence
+before external IO. Core reads use workers and ordinary pooled reads continue. A service crash loses these in-memory waits, as it loses other pending
+RPCs; staged enrollments still require a matching committed session on restart.
+Each conversation keeps its atomic claim release, generation fence and notice
+redelivery. Fresh redelivery receipts are saved once with their lineage. Delivery
+lookups use the schema 6 indexes described in [database storage](database-storage.md).
+Queue timing and concurrent reads still need measurement on the target host;
+this scheduling is not a hard real-time guarantee.
+
 ## CLI JSON results
 
 Every successful `checklist call` result is one RFC 8259 JSON value followed by a newline. Literal U+0000–U+001F inside string keys or values are escaped at the CLI output boundary; existing escapes and formatting whitespace outside strings are preserved. Standard strict JSON parsers can consume the output. MCP tool/resource JSON and SDK protocol frames have separate control-character regression coverage.

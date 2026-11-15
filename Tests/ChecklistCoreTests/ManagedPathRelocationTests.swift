@@ -87,6 +87,7 @@ final class ManagedPathRelocationTests: XCTestCase {
             let queue = try DatabaseQueue(path: root.appendingPathComponent("checklist.sqlite").path, configuration: configuration)
             try queue.write { db in
                 try db.execute(sql: schema < 2 ? SchemaMigrations.baselineSQL : SchemaMigrations.currentSQL)
+                if schema >= 6 {try db.execute(sql:SchemaMigrations.deliveryLookupIndexSQL)}
                 try db.execute(sql: "INSERT INTO metadata(key,value) VALUES ('incarnation',?)", arguments: [identity.incarnation])
                 if schema != 0 {
                     try db.execute(sql: "INSERT INTO metadata(key,value) VALUES ('store_identity',?),('schema_migrations',?)", arguments: [

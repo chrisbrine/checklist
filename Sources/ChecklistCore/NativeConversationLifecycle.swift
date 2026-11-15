@@ -118,6 +118,7 @@ extension CommandRouter {
             session["resumed_at"] = now(); session["last_seen"] = now()
             session = revised(session); try save(db, session, type: "session")
             try redeliverNativeClosureNotices(db, session: session, closure: observation)
+            try queueTriageBindingRecoveryNotices(db, session: session, caller: caller)
             var evidence: JSON = ["observation_ref": observationID, "ended_authorization_generation": endedGeneration]
             if let counts = codexRestartScanCounts {
                 evidence["incomplete_non_codex_first"] = counts.first
@@ -130,6 +131,58 @@ extension CommandRouter {
             }
             return result
           }
+        }
+    }
+
+    /// The old orchestration cannot route a copy after enrollment rotates the
+    /// session generation. Address this notice to the verified new generation
+    /// directly; only an explicit triage_orchestrate action can rebind authority.
+    func queueTriageBindingRecoveryNotices(_ db: Database, session: JSON, caller: Caller) throws {
+        let stored = StoredRecord(session, family: "session")
+        let pid = try stored.string("project_id"), sid = try stored.string("id")
+        guard session["role"] as? String == "worker", canReceive(session, project: pid) else { return }
+        let generation = sessionGeneration(session)
+        let rows = try Row.fetchAll(db, sql: "SELECT " + Self.canonicalRecordColumns
+            + " FROM records WHERE type='group' AND project_id=? AND json_extract(data,'$.kind')='triage'"
+            + " AND COALESCE(json_extract(data,'$.archived'),0)=0"
+            + " AND json_extract(data,'$.orchestration.state')='active'"
+            + " AND json_extract(data,'$.orchestration.session_id')=? COLLATE BINARY ORDER BY rowid",
+            arguments: [pid, sid])
+        for row in rows {
+            let group = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "group").object
+            guard let orchestration = group["orchestration"] as? JSON,
+                  orchestration["session_authorization_generation"] as? String != generation else { continue }
+            let groupRecord = StoredRecord(group, family: "group"), gid = try groupRecord.string("id")
+            let orchestrationID = try StoredRecord(orchestration, family: "orchestration").string("id")
+            // The helper can be retried within the enrollment transaction without
+            // making a second note or a second relay-eligible receipt.
+            let exists = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM records WHERE type='message' AND project_id=?"
+                + " AND json_extract(data,'$.triage_id')=? COLLATE BINARY"
+                + " AND json_extract(data,'$.recovery_orchestration_id')=? COLLATE BINARY"
+                + " AND json_extract(data,'$.recovery_authorization_generation')=? COLLATE BINARY)",
+                arguments: [pid, gid, orchestrationID, generation]) ?? false
+            guard !exists else { continue }
+            let command: JSON = ["method": "triage_orchestrate", "arguments": [
+                "project_id": pid, "triage_id": gid, "expected_revision": try groupRecord.requiredValue("revision"),
+                "action": "resume", "reason": "Continue this conversation's orchestration after reconnecting.", "command_id": uuid()
+            ] as JSON]
+            let message: JSON = ["id": uuid(), "project_id": pid, "triage_id": gid, "kind": "note", "origin": "system",
+                "author": "system", "author_display": "Checklist", "author_session_id": "system",
+                "requires_action": false, "addressed": false, "revision": 1, "created_at": now(),
+                "recovery_orchestration_id": orchestrationID, "recovery_authorization_generation": generation,
+                "orchestration_connection": "recovery_required", "resume_command": command,
+                "body": "A new installation or process of this conversation changed its authorization binding. Triage \(try agentReference(db, group)) is recovery_required. Member-ticket notes cannot reach your orchestrator copy until you explicitly resume.\nRun \(try jsonString(command)). Refresh triage_list if its revision changed. Resume requires the existing verified-resumption authority; if it is refused, the owner can finish the stale orchestration or another eligible conversation can explicitly take over. Ticket claims are not restored."]
+            try save(db, message, type: "message")
+            let deliveries = try queueDirectionDeliveries(db, message: message, recipients: [[
+                "session_id": sid, "recipient_role": "triage_orchestrator", "triage_id": gid,
+                "display_name": session["label"] ?? sessionThreadLabel(session)
+            ]])
+            for var delivery in deliveries {
+                delivery["native_relay"] = "triage_recovery"
+                try save(db, delivery, type: "delivery")
+            }
+            try event(db, caller: caller, project: pid, entity: gid, kind: "message_saved",
+                      data: ["message_id": message["id"]!, "origin": "system"])
         }
     }
 

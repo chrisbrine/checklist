@@ -35,7 +35,25 @@ extension CommandRouter {
                 boundProject = matches.count == 1 ? try? scope(db, ["project_id": matches[0]["id"]!], c) : nil
             } else { boundProject = nil }
             if let pid = boundProject, let triage = try? callerOrchestratedTriage(db, project: pid, caller: c) {
-                callerInfo["orchestrated_triage"] = ["triage_id": triage["id"] ?? NSNull(), "key": triage["key"] ?? NSNull(), "name": triage["name"] ?? NSNull()] as JSON
+                var orchestrated: JSON = ["triage_id": triage["id"] ?? NSNull(), "key": triage["key"] ?? NSNull(), "name": triage["name"] ?? NSNull()]
+                // CL-461: a reconnected conversation sees at once that its binding needs an explicit resume.
+                // The command is only shown, never run here; resume stays the verified conversation's own action.
+                let connection = (try? groupProjection(db, triage, fields: ["orchestration_connection"]))?["orchestration_connection"] as? String
+                orchestrated["orchestration_connection"] = connection ?? NSNull()
+                orchestrated["expected_revision"] = triage["revision"] ?? NSNull()
+                if connection == "recovery_required" {
+                    let orchestration = triage["orchestration"] as? JSON ?? [:]
+                    let session = c.sessionID.flatMap { try? scoped(db, $0, pid, type: "session") }
+                    let resumable = (session.flatMap { try? resumedTriageClosure(db, orchestration, $0, pid) }) != nil
+                    orchestrated["resume_available"] = resumable
+                    orchestrated["resume_command"] = resumable ? ["method": "triage_orchestrate", "arguments": [
+                        "project_id": pid, "triage_id": triage["id"] ?? NSNull(), "expected_revision": triage["revision"] ?? NSNull(),
+                        "action": "resume", "reason": "Continue this conversation's orchestration after reconnecting."] as JSON] as JSON : NSNull()
+                    orchestrated["recovery_step"] = resumable
+                        ? "Send resume_command with a new UUID as command_id. Until then, default-route notes of member tickets do not reach this conversation."
+                        : "This conversation has no verified resumption of the recorded orchestrator process. The owner may finish the orchestration, or another eligible conversation may take it over with a reason."
+                }
+                callerInfo["orchestrated_triage"] = orchestrated
             }
             info["caller"] = callerInfo
             info["native_reply_listener"] = nativeReplyListenerStatus.serviceInfo

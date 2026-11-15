@@ -144,6 +144,17 @@ extension CommandRouter {
                 ended["resumed_by_principal"] = c.principal
                 ended["resumed_by_authorization_generation"] = sessionGeneration(session)
                 orchestration["resumed_from_orchestration_id"] = previous["id"]
+                let pending = bool(previous,"missed_note_delivery_pending")
+                orchestration["missed_note_orchestration_ids"] = (pending ? strings(previous,"missed_note_orchestration_ids") : []) + [try StoredRecord(previous,family:"orchestration").string("id")]
+                var windows = pending ? previous["missed_note_windows"] as? [JSON] ?? [] : []
+                // Keep internal ordering private and durable even if an unrelated
+                // ticket's last message is cleaned up before the next page.
+                let cutover = uuid()
+                let upper = try Int64.fetchOne(db,sql:"SELECT COALESCE(MAX(rowid),0) FROM records") ?? 0
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["triage-note-cutover:"+cutover,String(upper)])
+                windows.append(["native_closure_ref":recoveryClosure,"cutover_ref":cutover])
+                orchestration["missed_note_windows"] = windows
+                orchestration["missed_note_delivery_pending"] = true
                 orchestration["native_closure_ref"] = recoveryClosure;orchestration["resume_reason"] = reason
                 if let progress = previous["progress"] { orchestration["progress"] = progress }
                 try event(db,caller:c,project:pid,entity:gid,kind:"triage_orchestration_rebound",data:["orchestration":ended,"member_claims_unchanged":true,"memberships_unchanged":true])
@@ -166,7 +177,14 @@ extension CommandRouter {
                 guard session["installation"] as? String == c.installation,session["execution_domain"] as? String == c.executionDomain else { throw CoreError("FORBIDDEN","Use the authenticated current session connection.") }
                 let current = orchestration["principal"] as? String == c.principal && orchestration["session_id"] as? String == c.sessionID && orchestration["execution_domain"] as? String == c.executionDomain && orchestration["session_authorization_generation"] as? String == sessionGeneration(session)
                 if !current {
-                    guard action == "finish",let closure = try resumedTriageClosure(db,orchestration,session,pid) else { throw CoreError("FORBIDDEN","Only the recorded current session can checkpoint or finish. A verified resumed conversation rebinds its earlier record in one step with action=resume and a reason (or finishes it with a reason); an eligible different coordinator can explicitly take over.") }
+                    guard action == "finish",let closure = try resumedTriageClosure(db,orchestration,session,pid) else {
+                        if orchestration["session_id"] as? String == sid,
+                           orchestration["session_authorization_generation"] as? String != sessionGeneration(session) {
+                            let command: JSON = ["method":"triage_orchestrate","arguments":["project_id":pid,"triage_id":gid,"expected_revision":int(group,"revision"),"action":"resume","reason":"Continue orchestration after this conversation reconnected."]]
+                            throw CoreError("FORBIDDEN","A new installation or process of this conversation changed its Triage binding. Use action=resume explicitly: \(try jsonString(command)). Only the verified same conversation can resume; another coordinator must take over.",details:["resume_command":command])
+                        }
+                        throw CoreError("FORBIDDEN","Only the recorded current session can checkpoint or finish. A verified resumed conversation rebinds its earlier record in one step with action=resume and a reason (or finishes it with a reason); an eligible different coordinator can explicitly take over.")
+                    }
                     orchestration["recovery_finish_reason"] = try text(p,"reason",max:4000)
                     orchestration["native_closure_ref"] = closure;orchestration["finished_by_principal"] = c.principal
                     orchestration["finished_by_authorization_generation"] = sessionGeneration(session)
@@ -186,9 +204,18 @@ extension CommandRouter {
         // the current orchestrator's checkpoint continues the pickup while more remain.
         let pickup = action == "start" || action == "takeover" || action == "checkpoint" || action == "resume"
         let saved: (delivered: Int, hasMore: Bool) = pickup ? try deliverSavedTriageNotes(db,group:group) : (0,false)
+        let missed: (delivered: Int, hasMore: Bool) = pickup ? try deliverMissedTriageNotes(db,group:group) : (0,false)
+        if pickup, !missed.hasMore, bool(orchestration,"missed_note_delivery_pending") {
+            // Once exhausted, a checkpoint does no project-history scan. A later
+            // verified resume starts a fresh window for its new stale period.
+            orchestration["missed_note_delivery_pending"] = false
+            group["orchestration"] = orchestration
+            try save(db,group,type:"group")
+        }
         var result = try groupProjection(db,group)
         if let notice { result["takeover_notice"] = notice }
         if pickup { result["saved_notes_delivered"] = saved.delivered; result["saved_note_delivery_has_more"] = saved.hasMore }
+        if pickup { result["missed_notes_delivered"] = missed.delivered; result["missed_note_delivery_has_more"] = missed.hasMore }
         return result
     }
     func taskEpicContext(_ db: Database,_ task: JSON) throws -> Any {

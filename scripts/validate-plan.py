@@ -426,6 +426,29 @@ def check() -> dict:
     bad = copy.deepcopy(examples['human-request']); bad['file_requests'][0]['kind'] = 'file_or_directory'
     reject('human-request', bad, 'file_or_directory instead of either')
 
+    recovery = examples['triage-note-recovery']
+    for field, value in [('id', '00000000-0000-0000-0000-000000000608'),
+                         ('delivery_id', '00000000-0000-0000-0000-000000000608'),
+                         ('state', 'queued'), ('recipient_role', 'handler'),
+                         ('binding_authorization_generation', '')]:
+        bad = copy.deepcopy(recovery); bad['message']['delivery_omissions'][0][field] = value
+        reject('triage-note-recovery', bad, 'missed-copy omission ' + field)
+    for field in ('message_id', 'project_id', 'recipient_session_id', 'triage_id',
+                  'orchestration_id', 'reason', 'recipient_display', 'binding_authorization_generation'):
+        bad = copy.deepcopy(recovery); bad['request']['continuation_deliveries'][1].pop(field)
+        reject('triage-note-recovery', bad, 'request omission missing ' + field)
+    for field, value in [('missed_notes_delivered', 51), ('missed_notes_delivered', -1),
+                         ('missed_notes_delivered', True), ('missed_note_delivery_has_more', 1)]:
+        bad = copy.deepcopy(recovery); bad['pickup'][field] = value
+        reject('triage-note-recovery', bad, 'missed-note pickup ' + field)
+    bad = copy.deepcopy(recovery); bad['request']['continuation_deliveries'][0].pop('id')
+    reject('triage-note-recovery', bad, 'queued delivery without a receipt ID')
+    omission = recovery['message']['delivery_omissions'][0]
+    if (recovery['message']['id'] != recovery['request']['continuation_message_id']
+            or omission['message_id'] != recovery['message']['id']
+            or recovery['request']['continuation_deliveries'][1] != omission):
+        errors.append('Triage missed-note recovery example: send-time omission anchors disagree')
+
     triage = examples['triage-orchestrator']
     bad = copy.deepcopy(triage); bad['triage']['orchestrator'] = None
     reject('triage-orchestrator', bad, 'orchestrated Triage without an orchestrator')

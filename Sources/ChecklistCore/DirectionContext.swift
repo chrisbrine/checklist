@@ -37,12 +37,34 @@ extension CommandRouter {
         return try withTriageOrchestratorCopy(db,task:task,holders:holders,sender:sender)
     }
 
-    func queueDirectionDeliveries(_ db: Database, message: JSON, recipients: [JSON]) throws -> [JSON] {
+    struct NativeClosureReceiptLineage {
+        let oldDeliveryID: String
+        let closureID: String
+
+        func apply(to delivery: inout JSON) {
+            delivery["resumed_from_delivery_id"] = oldDeliveryID
+            delivery["resumed_native_closure_ref"] = closureID
+        }
+    }
+
+    func queueDirectionDeliveries(_ db: Database, message: JSON, recipients: [JSON], recordOrchestratorOmission: Bool = false,
+                                  nativeClosureLineage: NativeClosureReceiptLineage? = nil) throws -> [JSON] {
+        if recordOrchestratorOmission { try recordStaleTriageCopyOmissions(db, message: message, recipients: recipients) }
         let pid = (try StoredRecord(message, family: "message").string("project_id")), mid = (try StoredRecord(message, family: "message").string("id"))
         var deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? COLLATE BINARY ORDER BY rowid",arguments:[pid,mid]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
         for recipient in recipients {
             let sid = (try StoredRecord(recipient, family: "recipient").string("session_id")), session = try scoped(db,sid,pid,type:"session"), generation = sessionGeneration(session)
-            if deliveries.contains(where: {$0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation}) { continue }
+            if let index = deliveries.firstIndex(where: {$0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == generation}) {
+                if let nativeClosureLineage {
+                    // Resumption always rewrote the first current-generation
+                    // receipt, including duplicate old notices of the same note.
+                    var delivery = deliveries[index]
+                    nativeClosureLineage.apply(to: &delivery)
+                    try save(db, delivery, type: "delivery")
+                    deliveries[index] = delivery
+                }
+                continue
+            }
             var delivery: JSON = ["id":uuid(),"project_id":pid,"message_id":mid,"recipient_session_id":sid,"recipient_authorization_generation":generation,"recipient_role":recipient["recipient_role"] ?? "recipient","recipient_display":recipient["display_name"] ?? session["label"] ?? "Worker","state":"queued","push_state":"unavailable","push_reason":"Native push is unqualified; available on recipient MCP pickup.","revision":1,"created_at":now()]
             if let aid = recipient["attempt_id"] { delivery["recipient_attempt_id"] = aid }
             // CL-398: a new generation of the same conversation keeps this receipt for pickup,
@@ -61,6 +83,7 @@ extension CommandRouter {
                 delivery["push_reason"] = "The relay already wrote this note to this conversation, or the conversation received it. It stays available through Checklist pickup."
             }
             copyRoleLabel(recipient, into: &delivery)
+            nativeClosureLineage?.apply(to: &delivery)
             try save(db,delivery,type:"delivery"); deliveries.append(delivery)
         }
         return deliveries
@@ -225,7 +248,7 @@ extension CommandRouter {
                 continue
             }
             let message: JSON = ["id":uuid(),"project_id":pid,"task_id":task["id"]!,"body":"Ticket metadata: \(try agentReference(db,task)). The approved project context changed. Read the current project brief and applicable pinned decisions before continuing.","kind":"project_context_changed","origin":"human_ui","author":caller.principal,"author_display":author(db,caller),"author_session_id":"human","original_requester_session_id":"human","requires_action":true,"addressed":false,"source_revisions":["project_revision":int(updated,"revision"),"brief_revision":int(updated,"brief_revision"),"decisions_revision":int(updated,"decisions_revision")],"previous_context_revision_id":updated["previous_context_revision_id"] ?? NSNull(),"revision":1,"created_at":now()]
-            try save(db,message,type:"message"); _ = try queueDirectionDeliveries(db,message:message,recipients:relevantHandlerRecipients(db,task:task))
+            try save(db,message,type:"message"); _ = try queueDirectionDeliveries(db,message:message,recipients:relevantHandlerRecipients(db,task:task),recordOrchestratorOmission:true)
             try event(db,caller:caller,project:pid,entity:task["id"] as? String,kind:"message_saved",data:["message_id":message["id"]!,"origin":"human_ui","reason":"project_context_changed"])
         }
     }

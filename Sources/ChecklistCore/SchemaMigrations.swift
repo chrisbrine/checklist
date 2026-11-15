@@ -22,7 +22,7 @@ struct StoreIdentityReceipt: Codable, Equatable {
         let keys: Set<String> = ["format_version", "logical_store_id", "incarnation", "database_generation", "schema_revision", "state"]
         guard let object = try? JSONSerialization.jsonObject(with: bytes) as? JSON, Set(object.keys) == keys,
               let value = try? JSONDecoder().decode(Self.self, from: bytes) else { throw StoreRecovery.required("invalid_identity_receipt") }
-        guard value.format_version == 1, (1...5).contains(value.schema_revision) else { throw StoreRecovery.upgradeUnavailable() }
+        guard value.format_version == 1, (1...SchemaMigrations.currentSchema).contains(value.schema_revision) else { throw StoreRecovery.upgradeUnavailable() }
         guard UUID(uuidString: value.logical_store_id) != nil, UUID(uuidString: value.incarnation) != nil,
               value.database_generation == 1, ["preparing", "ready"].contains(value.state) else { throw StoreRecovery.required("invalid_identity_receipt") }
         return value
@@ -99,16 +99,51 @@ enum SchemaMigrations {
     static var managedPathsChecksum: String { hash(Data("0003-instance-local-managed-paths;reader=3;writer=3;protected-relative-rewrite;single-origin-local-content-proof;immutable-manifest-capture-sidecar".utf8)) }
     /// 0004 (CL-125): one orchestrator per Triage, one Triage per ticket, plans and
     /// automatic archive of empty plans (docs/triage-orchestrators.md#store-upgrade-rules).
-    static let currentSchema = 5
+    static let currentSchema = 6
     static var triageMembershipChecksum: String { hash(Data("0004-triage-orchestrator-membership;reader=4;writer=4;one-triage-per-ticket;upgrade-single-membership;plans;empty-plan-archive;phase-history-label".utf8)) }
     static var triageMembershipLedger: JSON { ["migration_id":"0004-triage-orchestrator-membership","checksum":triageMembershipChecksum,"from_version":3,"to_version":4,"minimum_reader":4,"minimum_writer":4,"maximum_writer":4,"phase":"applied"] }
     static var backupReceiptChecksum: String { hash(Data("0005-compact-backup-receipts;reader=5;writer=5;immutable-sha-bound-manifest;instance-local-manifest-or-exact-raw-historical-catalog-without-copy-authority;exact-historical-object-binding;content-addressed-membership-index;atomic-sql;resumable-vacuum".utf8)) }
     static var backupReceiptLedger: JSON { ["migration_id":"0005-compact-backup-receipts","checksum":backupReceiptChecksum,"from_version":4,"to_version":5,"minimum_reader":5,"minimum_writer":5,"maximum_writer":5,"phase":"applied"] }
-    static func ledgers(_ version: Int) -> [JSON] { Array([ledger,protocolLedger,managedPathsLedger,triageMembershipLedger,backupReceiptLedger].prefix(max(0,version))) }
+    /// 0006 leaves canonical rows and query predicates unchanged. Equality on
+    /// every key retains rowid order. The final-key predicate keeps queries
+    /// without that equality on their original scope index.
+    static let deliveryLookupIndexSQL = """
+    CREATE INDEX records_delivery_message ON records(project_id,json_extract(data,'$.message_id') COLLATE BINARY) WHERE type='delivery' AND json_extract(data,'$.message_id') IS NOT NULL;
+    CREATE INDEX records_delivery_recipient_generation ON records(project_id,json_extract(data,'$.recipient_session_id') COLLATE BINARY,json_extract(data,'$.recipient_authorization_generation') COLLATE BINARY) WHERE type='delivery' AND json_extract(data,'$.recipient_authorization_generation') IS NOT NULL;
+    """
+    static var deliveryLookupChecksum: String { hash(Data((deliveryLookupIndexSQL + "\n0006-delivery-lookups;reader=6;writer=6;preserve-record-bytes-rowids-and-receipt-order;protected-snapshot").utf8)) }
+    static var deliveryLookupLedger: JSON { ["migration_id":"0006-delivery-lookups","checksum":deliveryLookupChecksum,"from_version":5,"to_version":6,"minimum_reader":6,"minimum_writer":6,"maximum_writer":6,"phase":"applied"] }
+    static func ledgers(_ version: Int) -> [JSON] { Array([ledger,protocolLedger,managedPathsLedger,triageMembershipLedger,backupReceiptLedger,deliveryLookupLedger].prefix(max(0,version))) }
+    static func upgradeDeliveryLookups(_ db: Database, identity: StoreIdentityReceipt, protectedSnapshot: JSON,
+                                      observe: ((String,TimeInterval)->Void)? = nil) throws {
+        guard case .current(let old) = try inspect(db), old.schema_revision == 5,
+              old.logical_store_id == identity.logical_store_id, old.incarnation == identity.incarnation else { throw StoreRecovery.required("migration_source_changed") }
+        do {
+            let started = ProcessInfo.processInfo.systemUptime
+            defer {observe?("migration.delivery-index-build",ProcessInfo.processInfo.systemUptime-started)}
+            try db.execute(sql:deliveryLookupIndexSQL)
+        }
+        try retainPriorProtectedSnapshot(db,replacingWith:protectedSnapshot)
+        let ready = identity.withSchema(6).withState("ready")
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try ready.encoded(),as:UTF8.self)])
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(ledgers(6))])
+        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('preupgrade_snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(protectedSnapshot)])
+        try db.execute(sql:"PRAGMA user_version=6")
+        guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
+    }
     static func upgradeBackupReceipts(_ db: Database, identity: StoreIdentityReceipt, root: URL, protectedSnapshot: JSON) throws {
         guard case .current(let old) = try inspect(db), old.schema_revision == 4,
               old.logical_store_id == identity.logical_store_id, old.incarnation == identity.incarnation else { throw StoreRecovery.required("migration_source_changed") }
         try StorageBackupReceiptMigration.apply(db,root:root,identity:identity)
+        try retainPriorProtectedSnapshot(db,replacingWith:protectedSnapshot)
+        let ready = identity.withSchema(5).withState("ready")
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try ready.encoded(),as:UTF8.self)])
+        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(ledgers(5))])
+        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('preupgrade_snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(protectedSnapshot)])
+        try db.execute(sql:"PRAGMA user_version=5")
+        guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
+    }
+    private static func retainPriorProtectedSnapshot(_ db: Database, replacingWith protectedSnapshot: JSON) throws {
         if let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='preupgrade_snapshot'") {
             let prior = jsonObject(raw)
             if prior["protected"] as? Bool == true,prior["operation_id"] as? String != protectedSnapshot["operation_id"] as? String {
@@ -121,12 +156,6 @@ enum SchemaMigrations {
                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-protected-history',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(history)])
             }
         }
-        let ready = identity.withSchema(5).withState("ready")
-        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try ready.encoded(),as:UTF8.self)])
-        try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(ledgers(5))])
-        try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('preupgrade_snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(protectedSnapshot)])
-        try db.execute(sql:"PRAGMA user_version=5")
-        guard case .current(let actual) = try inspect(db), actual == ready else { throw StoreRecovery.required("migration_result_invalid") }
     }
     static func upgradeTriageMembership(_ db: Database, identity: StoreIdentityReceipt, protectedSnapshot: JSON) throws {
         guard case .current(let old) = try inspect(db), old.schema_revision == 3,
@@ -262,7 +291,7 @@ enum SchemaMigrations {
     /// execute an unknown trigger. This check is shared by read-only preflight
     /// and adoptBaseline's inspection inside the writer transaction.
     private static func validateKnownSQLObjects(_ db: Database) throws {
-        let names: [(String, String, String)] = [
+        var names: [(String, String, String)] = [
             ("table", "metadata", "metadata"),
             ("table", "records", "records"),
             ("index", "records_scope", "records"),
@@ -271,7 +300,9 @@ enum SchemaMigrations {
             ("index", "events_scope", "events"),
             ("table", "cursors", "cursors")]
         let version = try Int.fetchOne(db,sql:"PRAGMA user_version") ?? 0
-        let statements = (version >= 2 ? currentSQL : baselineSQL).split(separator: ";").map(String.init).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if version >= 6 {names += [("index","records_delivery_message","records"),("index","records_delivery_recipient_generation","records")]}
+        let sql = (version >= 2 ? currentSQL : baselineSQL) + (version >= 6 ? "\n" + deliveryLookupIndexSQL : "")
+        let statements = sql.split(separator: ";").map(String.init).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard statements.count == names.count else { throw StoreRecovery.required("unsupported_container_sql_objects") }
         let expected = Dictionary(uniqueKeysWithValues: zip(names, statements).map { entry in
             (entry.0.1, (entry.0.0, entry.0.2, normalizedDefinition(entry.1)))

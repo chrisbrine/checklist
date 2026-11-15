@@ -2,6 +2,19 @@ import Foundation
 import GRDB
 
 extension CommandRouter {
+    /// Service-internal notification boundary. Observe committed event progress
+    /// with pooled reads; no sequence is exposed to a caller or stored in a receipt.
+    /// A partial multi-project reconciliation still wakes readers if it throws.
+    public func withNativeLifecycleCommitNotification<T>(_ body: () throws -> T, onCommit: () -> Void) throws -> T {
+        let before = try readForPreparation { try Int64.fetchOne($0, sql: "SELECT COALESCE(MAX(seq),0) FROM events") ?? 0 }
+        defer {
+            if let after = try? readForPreparation({ try Int64.fetchOne($0, sql: "SELECT COALESCE(MAX(seq),0) FROM events") ?? 0 }), after != before {
+                onCommit()
+            }
+        }
+        return try body()
+    }
+
     /// Exact old-generation receipts only. The original records and their fences
     /// are immutable; queueDirectionDeliveries deduplicates the new generation.
     private func nativeClosureNotices(_ db: Database, closure: JSON) throws -> [JSON] {
@@ -42,15 +55,11 @@ extension CommandRouter {
         for old in try nativeClosureNotices(db, closure: closure) {
             guard let message = try nativeClosureNoticeMessage(db, delivery: old, project: pid),
                   !Self.resumptionSkipsNote(message) else { continue }
-            let receipts = try queueDirectionDeliveries(db, message: message, recipients: [[
+            _ = try queueDirectionDeliveries(db, message: message, recipients: [[
                 "session_id": sid, "recipient_role": "resumed_conversation",
                 "label": "Notice from this conversation's earlier process; its original delivery remains fenced."
-            ]])
-            if var receipt = receipts.first(where: { $0["recipient_session_id"] as? String == sid && $0["recipient_authorization_generation"] as? String == sessionGeneration(session) }) {
-                receipt["resumed_from_delivery_id"] = old["id"]
-                receipt["resumed_native_closure_ref"] = closure["id"]
-                try save(db, receipt, type: "delivery")
-            }
+            ]], nativeClosureLineage: .init(oldDeliveryID: try StoredRecord(old, family: "delivery").string("id"),
+                closureID: try StoredRecord(closure, family: "native_closure").string("id")))
         }
     }
 

@@ -214,12 +214,16 @@ extension CommandRouter {
         let replyRecipient = explicitSessionID ?? (recipientDetails.isEmpty ? recipients.first : (recipientDetails.first { $0["recipient_role"] as? String == replyRole }
             ?? (hasHandler ? nil : recipientDetails.first { $0["recipient_role"] as? String == "triage_orchestrator" }))?["session_id"] as? String)
         if bool(p,"expects_reply"),let sid = replyRecipient { m["reply_allowed"] = true; m["reply_used"] = false; m["reply_recipient_session_id"] = sid; m["reply_sender_session_id"] = c.sessionID ?? "human";m["reply_recipient_authorization_generation"] = sessionGeneration(try scoped(db,sid,pid,type:"session"));m["reply_sender_authorization_generation"] = try callerSessionGeneration(db,c,project:pid) }
+        if method == "message_send", explicitSessionID == nil, mentionTarget == nil, conversationID == nil {
+            let omissions = try staleTriageCopyOmissions(db, message: m, recipients: recipientDetails)
+            if !omissions.isEmpty { m["delivery_omissions"] = omissions }
+        }
         try save(db,m,type:"message")
         if let health = try reconcileHealthReply(db,reply:m,caller:c) { m["health_reconciliation"] = health }
         let details = ordinaryRoute?.recipients ?? recipients.map {sid in recipientDetails.first {$0["session_id"] as? String == sid} ?? ["session_id":sid,"recipient_role":"recipient"]}
         let deliveries = ordinaryRoute != nil
             ? try queueOrdinaryDeliveries(db,message:m,recipients:details)
-            : try queueDirectionDeliveries(db,message:m,recipients:details)
+            : try queueDirectionDeliveries(db,message:m,recipients:details,recordOrchestratorOmission:false)
         try event(db,caller:c,project:pid,entity:taskID ?? conversationID ?? m["triage_id"] as? String,kind:"message_saved",data:["message_id":mid,"origin":origin])
             // entity: ticket, conversation or (CL-248) the Triage of a ticket-free note
         m["subject"] = try subject(db,message:m);m["deliveries"] = deliveries; m["delivery_status"] = recipients.isEmpty ? "saved_for_pickup" : "queued"; m["native_push"] = false; return m

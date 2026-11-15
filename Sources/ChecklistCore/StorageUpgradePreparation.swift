@@ -75,7 +75,7 @@ public enum StorageUpgradePreparation {
             let identities = try fileIdentities(root:root,generation:generation,manifest:manifest,budget:budget,verifySource:true)
             let receipt = Receipt(format:2,sourceRoot:root.path,identity:identity,operation:operation,
                 manifestSHA256:snapshot.manifestSHA256,sourceFingerprint:protected["source_fingerprint"] as! String,
-                targetChecksum:SchemaMigrations.backupReceiptChecksum,executableSHA256:try executableSHA256(),fileIdentities:identities)
+                targetChecksum:SchemaMigrations.deliveryLookupChecksum,executableSHA256:try executableSHA256(),fileIdentities:identities)
             try publish(try StorageSnapshot.encoded(receipt),name:receiptName,root:root)
             let unchanged = try source.read { try SchemaMigrations.contentFingerprint($0) == receipt.sourceFingerprint }
             timingOutcome = "complete"
@@ -91,7 +91,7 @@ public enum StorageUpgradePreparation {
         let receipt = try JSONDecoder().decode(Receipt.self,from:files.read(receiptName,maximum:16_384))
         guard receipt.format == 2,receipt.sourceRoot.utf8.elementsEqual(root.path.utf8),
               receipt.identity.withState("ready") == identity.withSchema(receipt.identity.schema_revision).withState("ready"),
-              receipt.targetChecksum == SchemaMigrations.backupReceiptChecksum,
+              receipt.targetChecksum == SchemaMigrations.deliveryLookupChecksum,
               receipt.executableSHA256 == (try executableSHA256()) else {throw StorageSnapshotFailure.incomplete}
         guard try queue.read({try SchemaMigrations.contentFingerprint($0)}) == receipt.sourceFingerprint else {return nil}
         let useLease = try StorageBackupUseLease(root:receipt.generation)
@@ -227,7 +227,7 @@ public enum StorageUpgradePreparation {
         let copy = try DatabaseQueue(path:copyURL.path,configuration:read)
         let fingerprint = try copy.read {try SchemaMigrations.contentFingerprint($0)};try copy.close()
         let protected: JSON = ["operation_id":operation.uuidString.lowercased(),"path":generation.path,"manifest_sha256":manifestSHA256,
-            "source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.backupReceiptChecksum,"protected":true]
+            "source_fingerprint":fingerprint,"target_migration_checksum":SchemaMigrations.deliveryLookupChecksum,"protected":true]
         let files = try StorageObjectFiles(root:root)
         let (fd,_) = try files.parent("staging/.preupgrade",create:true);Darwin.close(fd)
         let rehearsal = root.appendingPathComponent("staging/preupgrade-" + operation.uuidString.lowercased() + ".sqlite")
@@ -245,6 +245,7 @@ public enum StorageUpgradePreparation {
                 if version < 3 {try SchemaMigrations.upgradeManagedPaths(db,identity:identity.withSchema(3),root:root,plan:plan,protectedSnapshot:protected)}
                 if version < 4 {try SchemaMigrations.upgradeTriageMembership(db,identity:identity.withSchema(4),protectedSnapshot:protected)}
                 if version < 5 {try SchemaMigrations.upgradeBackupReceipts(db,identity:identity.withSchema(5),root:root,protectedSnapshot:protected)}
+                if version < 6 {try SchemaMigrations.upgradeDeliveryLookups(db,identity:identity.withSchema(6),protectedSnapshot:protected)}
             }
             try StorageBackupReceiptMigration.finishCompaction(candidate)
             try candidate.read {db in _ = try SchemaMigrations.inspect(db);guard try String.fetchOne(db,sql:"PRAGMA integrity_check") == "ok" else {throw StoreRecovery.required("migration_rehearsal_integrity_failed")}}

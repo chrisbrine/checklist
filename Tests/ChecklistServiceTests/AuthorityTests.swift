@@ -254,6 +254,43 @@ final class AuthorityTests: XCTestCase {
         coordinator.workHealthWake?.cancel()
     }
 
+    func testPeerCoreWriteWaitsForResumptionWithoutHoldingReadAdmission() throws {
+        let coordinator = coordinator!, enrollment = enrollment()
+        try register(enrollment)
+        let session = try XCTUnwrap(coordinator.router.connectionSession(sessionID: enrollment.sessionID, project: project, caller: owner))
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let writerFinished = DispatchGroup(), replied = expectation(description: "Committed deferred write reply")
+        writerFinished.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { writerFinished.leave() }
+            coordinator.router.dbQueue.writeWithoutTransaction { _ in
+                entered.signal()
+                XCTAssertEqual(release.wait(timeout: .now() + 15), .success)
+            }
+        }
+        defer { release.signal(); _ = writerFinished.wait(timeout: .now() + 15) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success)
+        coordinator.queue.sync { coordinator.nativeLifecycle.resumptionInFlight = true }
+        var input = request("session_update")
+        input["params"] = ["project_id": project!, "command_id": UUID().uuidString,
+            "expected_revision": session["revision"]!, "state": "connected"]
+        let expectedRevision = try XCTUnwrap(session["revision"] as? Int) + 1
+        let peer = Peer(coordinator: coordinator, connection: connection)
+        peer.execute(try JSONSerialization.data(withJSONObject: input)) { bytes in
+            let result = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any] ?? [:]
+            XCTAssertNil(result["error"], String(describing: result))
+            XCTAssertEqual((result["data"] as? [String: Any])?["revision"] as? Int, expectedRevision)
+            replied.fulfill()
+        }
+        // This has to finish before releasing the actual writer. The former
+        // inline route would hold command admission waiting for that writer.
+        XCTAssertNotNil(try peerReply(request("service_info"))["data"])
+        release.signal()
+        XCTAssertEqual(writerFinished.wait(timeout: .now() + 10), .success)
+        coordinator.queue.async { coordinator.finishNativeBootstrapWork {} }
+        wait(for: [replied], timeout: 10)
+    }
+
     func testBootstrapRechecksCurrentRegistrationAfterFreshCredentialRead() throws {
         let sid = UUID().uuidString, domain = "synthetic-recheck-domain"
         let digest = SHA256.hash(data:Data("codex|\(sid)|\(project!)".utf8)).map {String(format:"%02x",$0)}.joined()

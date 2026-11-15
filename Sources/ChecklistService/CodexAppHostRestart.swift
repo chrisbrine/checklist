@@ -28,7 +28,7 @@ struct CodexAppHostRestartEffects: Sendable {
     }
 }
 
-struct CodexAppHostRestartEvidence {
+struct CodexAppHostRestartEvidence: Sendable {
     let process: NativeLifecycleObservation.ProcessState
     let counts: CodexRestartScanCounts
 }
@@ -50,16 +50,24 @@ extension Coordinator {
     /// Permanent errors and owner revocation leave immediately, without waiting.
     func verifyCodexRestartAfterClosure(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration,
                                        checkOwner: () throws -> Void) throws -> CodexAppHostRestartEvidence {
+        try Self.verifyCodexRestartAfterClosure(effects: codexAppHostRestartEffects, old: old, new: new, checkOwner: checkOwner)
+    }
+
+    /// The immutable effects snapshot is safe on a native-bootstrap worker. Its
+    /// owner check returns to the command queue before any SQL/gate is acquired.
+    static func verifyCodexRestartAfterClosure(effects: CodexAppHostRestartEffects,
+                                               old: NativeLifecycleRegistration, new: NativeLifecycleRegistration,
+                                               checkOwner: () throws -> Void) throws -> CodexAppHostRestartEvidence {
         var retriesRemaining = 2
         while true {
             try checkOwner()
             let evidence: CodexAppHostRestartEvidence
-            do { evidence = try verifyCodexRestartHost(old: old, new: new) }
+            do { evidence = try verifyCodexRestartHost(effects: effects, old: old, new: new) }
             catch {
                 try checkOwner()
                 guard retriesRemaining > 0, CodexRestartRefusal.applies(error) else { throw error }
                 retriesRemaining -= 1
-                codexAppHostRestartEffects.pauseBeforeRetry()
+                effects.pauseBeforeRetry()
                 continue
             }
             try checkOwner()
@@ -70,7 +78,11 @@ extension Coordinator {
     /// The owner accepted first-bootstrap thread trust, not an exclusive registry
     /// lease. Check again after closure and inside the credential commit boundary.
     func verifyCodexRestartHost(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration) throws -> CodexAppHostRestartEvidence {
-        let effects = codexAppHostRestartEffects
+        try Self.verifyCodexRestartHost(effects: codexAppHostRestartEffects, old: old, new: new)
+    }
+
+    static func verifyCodexRestartHost(effects: CodexAppHostRestartEffects,
+                                      old: NativeLifecycleRegistration, new: NativeLifecycleRegistration) throws -> CodexAppHostRestartEvidence {
         func refusal(_ message: String, scan: CodexHostScan? = nil, extra: [CodexProcessBlocker] = []) -> ChecklistError {
             var blockers = scan?.blockers ?? []
             for process in scan?.holders ?? [] where process.pid != new.processID || process.role != .appHost {

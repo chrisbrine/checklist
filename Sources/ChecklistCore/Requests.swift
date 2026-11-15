@@ -125,7 +125,7 @@ extension CommandRouter {
         r["state"] = complete ? "answered" : "pending"; r["owner_snoozed"] = false; r = revised(r)
         let message = try notifyHumanResponse(db,request:r,response:response,caller:c)
         r["continuation_message_id"] = message["id"]
-        r["continuation_deliveries"] = message["deliveries"] ?? []
+        r["continuation_deliveries"] = (message["deliveries"] as? [JSON] ?? []) + (message["delivery_omissions"] as? [JSON] ?? [])
         r["continuation_delivery"] = (message["deliveries"] as? [JSON] ?? []).isEmpty ? "available_for_current_handlers_or_next_pickup" : "queued_for_pickup"
         try save(db,r,type:"request")
         try event(db,caller:c,project:pid,entity:r["task_id"] as? String,kind:"human_request_answered",data:["request_id":(try StoredRecord(r,
@@ -381,6 +381,13 @@ extension CommandRouter {
         }
         message["human_request_id"] = request["id"]; message["human_response_id"] = response["id"]; message["form_revision"] = int(request,"form_revision",default:1)
         message["deliveries"] = deliveries; message["delivery_status"] = deliveries.isEmpty ? "saved_for_pickup" : "queued"
+        // An exact requester fallback may already have reached this conversation;
+        // in that case no orchestrator copy was actually missed.
+        let omissions = (message["delivery_omissions"] as? [JSON] ?? []).filter { omission in
+            !deliveries.contains { $0["recipient_session_id"] as? String == omission["recipient_session_id"] as? String }
+        }
+        if omissions.isEmpty { message.removeValue(forKey:"delivery_omissions") }
+        else { message["delivery_omissions"] = omissions }
         // Persist source links without embedding transient delivery projections in the message.
         var stored = message; stored.removeValue(forKey:"deliveries"); try save(db,stored,type:"message")
         return message

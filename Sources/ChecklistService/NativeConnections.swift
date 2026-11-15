@@ -10,7 +10,8 @@ import ChecklistBridges
 // Automatic worker connections have a native process boundary. A thread ID is
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
-    struct BootstrapResult { let reply:[String:Any]; let changed:Bool }
+    // The JSON reply is immutable after construction on the coordinator queue.
+    struct BootstrapResult: @unchecked Sendable { let reply:[String:Any]; let changed:Bool }
     /// A new transport can reuse current committed authority during capture.
     /// Registration changes must never enqueue an owner write and then expose a
     /// prepared enrollment as committed; retry the complete bootstrap on admission.
@@ -77,6 +78,11 @@ extension Coordinator {
             try requireCommittedRegistration(existing,project:pid,caller:owner)
         }
         guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
+        if let earlier = enrollments[installation], earlier.nativeExecutionDomain != executionDomain,
+           earlier.ownerRevoked != true,
+           !nativeLifecycle.reconciled.contains(earlier.installation + "/" + earlier.generation) {
+            observeNativeConversationLifecycle(earlier)
+        }
         if var existing=enrollments[installation] {
             let session = try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
             if let session {
@@ -259,7 +265,7 @@ extension Coordinator {
         }
     }
 
-    private func bindProviderEndpoint(_ enrollment:inout Enrollment,endpoint:String,process:pid_t) throws {
+    func bindProviderEndpoint(_ enrollment:inout Enrollment,endpoint:String,process:pid_t) throws {
         let expected=NativeProviderTransport.expectedEndpoint(provider:enrollment.provider,processID:process)
         var attrs=stat()
         guard endpoint == expected,lstat(endpoint,&attrs)==0,attrs.st_mode & S_IFMT == S_IFSOCK,attrs.st_uid == getuid(),attrs.st_mode & 0o077 == 0 else { throw ChecklistError("NATIVE_ROUTE_MISMATCH","Claude's local route does not belong to this native process.") }
@@ -318,6 +324,11 @@ extension Coordinator {
                 guard released else {
                     throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier Codex app host must stop and return for pickup before reconnecting.")
                 }
+                if nativeResumptionIsDeferred {
+                    throw NativeBootstrapContinuation(coordinator: self, existing: existing, project: project,
+                        oldExecutionDomain: oldDomain, executionDomain: executionDomain, binding: binding, process: process, endpoint: endpoint,
+                        kind: .codexRestart(old: old, new: new, effects: codexAppHostRestartEffects))
+                }
                 _ = try verifyCodexRestartAfterClosure(old: old, new: new, checkOwner: checkOwnerRevocation)
                 codexRestart = (old, new)
             } else {
@@ -333,6 +344,11 @@ extension Coordinator {
             guard oldDomain != executionDomain else { throw ownerDisconnected }
         }
         guard existing.workspace == binding,existing.projectIDs == [project] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
+        if nativeResumptionIsDeferred {
+            throw NativeBootstrapContinuation(coordinator: self, existing: existing, project: project,
+                oldExecutionDomain: oldDomain, executionDomain: executionDomain, binding: binding, process: process, endpoint: endpoint,
+                kind: ownerAllowed ? .ownerAllowed : .verifiedClosure)
+        }
         // An owner disconnect before this build removed the saved credential; a verified closure kept it.
         // Allow again is the owner's explicit fresh bootstrap, so an unreadable old credential cannot block it.
         let priorCredential:String?
@@ -361,8 +377,9 @@ extension Coordinator {
                 let evidence = try codexRestart.map {
                     try verifyCodexRestartAfterClosure(old: $0.0, new: $0.1, checkOwner: checkOwnerRevocation)
                 }
-                return try router.resumeVerifiedNativeSession(resumption, caller: owner,
-                    codexRestartScanCounts: evidence?.counts)
+                return try queue.activity("native_resumption_transaction") {
+                    try router.resumeVerifiedNativeSession(resumption, caller: owner, codexRestartScanCounts: evidence?.counts)
+                }
             },
             rollback: { try ConnectionCommit.restore(enrollment: { enrollments[existing.installation] = existing; try saveEnrollments() }, credential: {
                 if let priorCredential { try credentials.write(existing.installation, priorCredential) }

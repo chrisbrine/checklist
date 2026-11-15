@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Triage missed-note recovery projections",
+  "description": "Selected output fields, not complete tool replies or command inputs. Message and request projections refer to one owner-answer notice sent while its Triage binding was stale. Pickup shows the separate bounded missed-note counters from an authorized resume or checkpoint. Service rules validate identity, matching message/project/orchestration references and exactly-once recovery; this schema grants no recovery authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "delivery_omissions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/omission"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "delivery_omissions"
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "continuation_message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "continuation_deliveries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/queuedDelivery"
+              },
+              {
+                "$ref": "#/$defs/omission"
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "continuation_message_id",
+        "continuation_deliveries"
+      ]
+    },
+    "pickup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "missed_notes_delivered": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50
+        },
+        "missed_note_delivery_has_more": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "missed_notes_delivered",
+        "missed_note_delivery_has_more"
+      ]
+    }
+  },
+  "required": [
+    "message",
+    "request",
+    "pickup"
+  ],
+  "$defs": {
+    "omission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_role": {
+          "const": "triage_orchestrator"
+        },
+        "recipient_session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "triage_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "orchestration_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "const": "not_delivered_binding_stale"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recipient_display": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding_authorization_generation": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "message_id",
+        "project_id",
+        "recipient_role",
+        "recipient_session_id",
+        "triage_id",
+        "orchestration_id",
+        "state",
+        "reason",
+        "recipient_display",
+        "binding_authorization_generation"
+      ],
+      "description": "Immutable send-time evidence that a stale Triage binding omitted this copy. This is not a delivery: no id, delivery_id, queued state or recipient_authorization_generation is present."
+    },
+    "queuedDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "message_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "project_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_session_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "recipient_authorization_generation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recipient_role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "const": "queued"
+        }
+      },
+      "required": [
+        "id",
+        "message_id",
+        "project_id",
+        "recipient_session_id",
+        "recipient_authorization_generation",
+        "recipient_role",
+        "state"
+      ],
+      "description": "Selected fields of an actual delivery snapshot recorded when the owner answer was saved. Current receipt state must be read from the actual delivery, not this snapshot."
+    }
+  }
+}

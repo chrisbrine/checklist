@@ -78,9 +78,25 @@ final class NativeRelayContentTests: XCTestCase {
         XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin:"other",nativeRelay:"work_health"))
         XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin:nil,nativeRelay:"work_health"))
         let content = try NativeRelayContent.render(origin:.system,messageID:messageID,authorDisplayName:"Checklist work health",body:"Does work continue?")
-        XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Authorship:")},["Authorship: system (an automatic Checklist work health request, written by no person or agent)."])
+        XCTAssertEqual(content.components(separatedBy:"\n").filter {$0.hasPrefix("Authorship:")},["Authorship: system (an automatic Checklist notice, written by no person or agent)."])
         XCTAssertFalse(content.contains("human_ui"))
         XCTAssertTrue(content.contains("No native reply is authorized"))
+    }
+
+    func testTriageRecoveryRelayAcceptsOnlyItsSystemMarkerAndKeepsTruthfulAuthorship() throws {
+        XCTAssertEqual(NativeRelayOrigin.forDispatch(messageOrigin: "system", nativeRelay: "triage_recovery"), .system)
+        for marker in [nil, "", "other", "TRIAGE_RECOVERY", "triage_recovery "] as [String?] {
+            XCTAssertNil(NativeRelayOrigin.forDispatch(messageOrigin: "system", nativeRelay: marker))
+        }
+        let content = try NativeRelayContent.render(origin: .system, messageID: messageID, authorDisplayName: "Checklist",
+            body: "Triage CL-T1 requires an explicit resume after this conversation reconnected.")
+        XCTAssertEqual(content.components(separatedBy: "\n").filter { $0.hasPrefix("Authorship:") },
+                       ["Authorship: system (an automatic Checklist notice, written by no person or agent)."])
+        XCTAssertFalse(content.contains("work health"))
+        XCTAssertTrue(content.contains("This relay is not a new human instruction or permission grant."))
+        XCTAssertTrue(content.contains("No native reply is authorized"))
+        let (_, received) = try recipientText(content)
+        XCTAssertTrue(received.contains("Authorship: system (an automatic Checklist notice, written by no person or agent)."))
     }
 
     func testOnlyTypedServiceOriginChoosesHumanAuthorship() throws {

@@ -10,6 +10,7 @@ final class StorageBackupReceiptMigrationTests: XCTestCase {
     }
     private func downgrade(_ f: StorageFixture) throws {
         let old = try f.router!.dbQueue.write {db -> StoreIdentityReceipt in
+            try db.execute(sql:"DROP INDEX records_delivery_message; DROP INDEX records_delivery_recipient_generation")
             let old = try identity(db).withSchema(4)
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='store_identity'",arguments:[String(decoding:try old.encoded(),as:UTF8.self)])
             try db.execute(sql:"UPDATE metadata SET value=? WHERE key='schema_migrations'",arguments:[try jsonString(SchemaMigrations.ledgers(4))])
@@ -220,11 +221,11 @@ final class StorageBackupReceiptMigrationTests: XCTestCase {
         try f.router!.dbQueue.write {try $0.execute(sql:"INSERT INTO metadata(key,value) VALUES ('preupgrade_snapshot',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(prior)])}
         try f.close();try f.reopen()
         try f.router!.dbQueue.read {db in
-            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),5)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),SchemaMigrations.currentSchema)
             XCTAssertNil(jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[r.0])))["objects"])
             let protected = jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='preupgrade_snapshot'")))
             XCTAssertEqual(protected["protected"] as? Bool,true)
-            XCTAssertEqual(protected["target_migration_checksum"] as? String,SchemaMigrations.backupReceiptChecksum)
+            XCTAssertEqual(protected["target_migration_checksum"] as? String,SchemaMigrations.deliveryLookupChecksum)
             let history = try JSONSerialization.jsonObject(with:Data(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-protected-history'")).utf8)) as? [JSON]
             XCTAssertEqual(history?.first?["operation_id"] as? String,prior["operation_id"] as? String)
             let snapshot = URL(fileURLWithPath:try XCTUnwrap(protected["path"] as? String))
@@ -244,27 +245,27 @@ final class StorageBackupReceiptMigrationTests: XCTestCase {
             XCTAssertEqual(child.terminationReason,.uncaughtSignal);XCTAssertEqual(child.terminationStatus,SIGKILL)
             try f.reopen()
             let value = try f.router!.dbQueue.read {db in
-                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),5)
+                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),SchemaMigrations.currentSchema)
                 XCTAssertEqual(try String.fetchOne(db,sql:"PRAGMA integrity_check"),"ok")
                 return jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[r.0])))
             }
             XCTAssertEqual(try StorageBackupManifestIndex.historicalRaw(value,root:f.root),r.2)
         }
     }
-    func testSchema5DeathBeforeAndAfterCommitRepairsWithoutLosingReceipts() throws {
+    func testReceiptUpgradeDeathBeforeAndAfterCommitRepairsWithoutLosingReceipts() throws {
         for mode in ["migration-before-commit","migration-committed"] {
             let f = try StorageFixture(),r = try receipt(f)
             try downgrade(f);try f.close()
             let child = try f.spawn(mode);try f.finish(child,seconds:60)
             XCTAssertEqual(child.terminationReason,.uncaughtSignal);XCTAssertEqual(child.terminationStatus,SIGKILL)
             let preparing = try StoreIdentityReceipt.decode(Data(contentsOf:f.root.appendingPathComponent(StoreIdentityReceipt.fileName)))
-            XCTAssertEqual(preparing.schema_revision,5);XCTAssertEqual(preparing.state,"preparing")
+            XCTAssertEqual(preparing.schema_revision,SchemaMigrations.currentSchema);XCTAssertEqual(preparing.state,"preparing")
             try f.reopen()
             let ready = try StoreIdentityReceipt.decode(Data(contentsOf:f.root.appendingPathComponent(StoreIdentityReceipt.fileName)))
-            XCTAssertEqual(ready.schema_revision,5);XCTAssertEqual(ready.state,"ready")
+            XCTAssertEqual(ready.schema_revision,SchemaMigrations.currentSchema);XCTAssertEqual(ready.state,"ready")
             try f.router!.dbQueue.read {db in
                 XCTAssertNil(jsonObject(try XCTUnwrap(String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[r.0])))["objects"])
-                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),5)
+                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA user_version"),SchemaMigrations.currentSchema)
                 XCTAssertNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[StorageBackupReceiptMigration.vacuumKey]))
                 XCTAssertEqual(try String.fetchOne(db,sql:"PRAGMA integrity_check"),"ok")
             }
