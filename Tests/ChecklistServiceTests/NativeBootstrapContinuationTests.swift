@@ -342,4 +342,57 @@ final class NativeBootstrapContinuationTests: XCTestCase {
         XCTAssertFalse(local.revoked == true || local.ownerRevoked == true)
         XCTAssertNotEqual(try fixture.coordinator.credentials.read(local.installation), fixture.token)
     }
+
+    func testFreshBootstrapOfStagedConversationWaitsForItsRealCommit() throws {
+        let fixture = try Fixture()
+        defer { XCTAssertNoThrow(try fixture.close()) }
+        try fixture.seedNotices(3)
+        // Pause the real continuation after local credential/enrollment staging,
+        // before Core writer admission, while pooled reads see the ended generation.
+        fixture.evidence.refusedScans = [5]
+        let paused = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        fixture.evidence.pause = { paused.signal(); _ = release.wait(timeout: .now() + 15) }
+        let continuation = try fixture.continuation(), (done, result) = fixture.start(continuation)
+        XCTAssertEqual(paused.wait(timeout: .now() + 10), .success)
+        let secondDone = DispatchSemaphore(value: 0), second = ResultBox<Result<Coordinator.BootstrapResult, Error>>()
+        let queued = fixture.coordinator.queue.sync { () -> Bool in
+            do {
+                let staged = try XCTUnwrap(fixture.coordinator.enrollments[fixture.original.installation])
+                XCTAssertNotEqual(staged.generation, fixture.original.generation)
+                let canonical = try fixture.session()
+                XCTAssertEqual(canonical["state"] as? String, "ended")
+                XCTAssertEqual(canonical["installation"] as? String, fixture.original.installation + "/" + fixture.original.generation)
+                let current = try fixture.coordinator.attemptCurrentNativeBootstrap({
+                    try fixture.coordinator.bootstrapVerifiedWorkspace([:], native: .init(provider: "codex", session: fixture.original.sessionID,
+                        process: fixture.evidence.host.pid, executionDomain: "codex:24681:6:0", workspace: fixture.root.path),
+                        readCredential: fixture.coordinator.credentials.read, currentConnectionOnly: true)
+                }, retry: {
+                    second.set(Result { try fixture.bootstrap() }); secondDone.signal()
+                })
+                XCTAssertNil(current, "Staged authority must not reply before its real Core commit")
+                XCTAssertNil(second.value)
+                XCTAssertEqual(fixture.coordinator.nativeLifecycle.connectionRequests.count, 1)
+                XCTAssertTrue(fixture.coordinator.nativeLifecycle.resumptionInFlight)
+                return current == nil
+            } catch {
+                XCTFail("A fresh bootstrap must wait for the staged generation instead of failing early: \(error)")
+                return false
+            }
+        }
+        release.signal()
+        XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
+        XCTAssertTrue(try XCTUnwrap(result.value).get().changed)
+        guard queued else { return }
+        XCTAssertEqual(secondDone.wait(timeout: .now() + 20), .success)
+        let secondResult = try XCTUnwrap(second.value).get()
+        XCTAssertFalse(secondResult.changed, "Retry reuses the now-committed generation")
+        let current = try XCTUnwrap(fixture.coordinator.enrollments[fixture.original.installation])
+        let session = try fixture.session()
+        XCTAssertEqual(session["installation"] as? String, current.installation + "/" + current.generation)
+        XCTAssertEqual(session["state"] as? String, "connected")
+        XCTAssertEqual((secondResult.reply["data"] as? JSON)?["installation"] as? String, current.installation)
+        XCTAssertNotEqual(current.generation, fixture.original.generation)
+    }
+
 }

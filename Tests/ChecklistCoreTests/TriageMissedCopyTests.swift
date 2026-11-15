@@ -574,3 +574,175 @@ extension EvidenceAuthorityTests {
     }
 
 }
+
+// VS1 independent regression: retained pre-upgrade mandatory exact-recipient
+// notices lack the newly introduced omission field. Keep ordinary exact routes
+// distinct; this test asserts the ticket's unrestricted missed-note requirement.
+extension EvidenceAuthorityTests {
+    func testVS1LegacyMandatoryRoleChangeMustReachResumedOrchestrator() throws {
+        let f = try missedFixture(), resumed = try missedResumeConversation(f.p, f.o)
+        let project = try missedRecord(f.p["id"]!, "project")
+        let takeover = try call("work_takeover", ["project_id": f.p["id"]!, "task_id": f.task["id"]!,
+            "expected_revision": try missedRecord(f.task["id"]!, "task")["revision"]!,
+            "reason": "Independent reviewer synthetic takeover", "policy_revision": project["policy_revision"] ?? 1], f.peer)
+        let noticeRef = try XCTUnwrap((takeover["takeover_notices"] as? [JSON])?.first)
+        let notice = try missedRecord(noticeRef["message_id"]!, "message")
+        _ = try missedOmission(f, notice)
+        print("VS1 takeover notice reply has omission=\(noticeRef["delivery_omissions"] != nil)")
+        try router.dbQueue.write { db in
+            var legacy = try router.record(db, notice["id"] as! String, type: "message")
+            legacy.removeValue(forKey: "delivery_omissions")
+            XCTAssertNil(legacy["ordinary_routing"])
+            XCTAssertNil(legacy["human_request_id"])
+            XCTAssertEqual(legacy["requires_action"] as? Bool, false)
+            try router.save(db, legacy, type: "message")
+        }
+        let result = try call("triage_orchestrate", missedOrchestrateInput(f, "resume"), resumed)
+        print("VS1 legacy mandatory replay count=\(result["missed_notes_delivered"] ?? -1) has_more=\(result["missed_note_delivery_has_more"] ?? true)")
+        XCTAssertEqual(result["missed_notes_delivered"] as? Int, 1, "The mandatory member-ticket notice was missed while binding was stale")
+        XCTAssertEqual(try missedReceipts(f, notice["id"]!).count, 1)
+    }
+}
+
+extension EvidenceAuthorityTests {
+    private func missedLegacyRoleNotice(_ reference: JSON) throws -> JSON {
+        let notice = try missedRecord(reference["message_id"]!, "message")
+        return try router.dbQueue.write { db in
+            var legacy = notice
+            legacy.removeValue(forKey: "delivery_omissions")
+            XCTAssertNil(legacy["ordinary_routing"])
+            XCTAssertNil(legacy["human_request_id"])
+            XCTAssertEqual(legacy["requires_action"] as? Bool, false)
+            XCTAssertEqual(legacy["origin"] as? String, "agent")
+            XCTAssertEqual(legacy["kind"] as? String, "note")
+            try router.save(db, legacy, type: "message")
+            return legacy
+        }
+    }
+
+    private func missedTakeover(_ f: MissedFixture, _ caller: Caller, command: String = UUID().uuidString) throws -> JSON {
+        try call("work_takeover", ["project_id": f.p["id"]!, "task_id": f.task["id"]!,
+            "expected_revision": try missedRecord(f.task["id"]!, "task")["revision"]!,
+            "reason": "Continue the member ticket during Triage recovery"], caller, command: command)
+    }
+
+    private func missedFreshRoleClaim() throws -> (f: MissedFixture, attempt: JSON) {
+        var f = try missedFixture()
+        f.task = try ready(f.p)
+        _ = try call("group_membership", ["project_id": f.p["id"]!, "group_id": f.group["id"]!,
+            "expected_revision": try missedRecord(f.group["id"]!, "group")["revision"]!,
+            "task_id": f.task["id"]!, "action": "add"], f.o)
+        let attempt = try claim(f.p, missedRecord(f.task["id"]!, "task"), files: [["path": "Sources", "access": "write"]], caller: f.holder)
+        return (f, attempt)
+    }
+
+    func testTriageMissedLegacyHandoffReplaysOnceButSameAgeExactNoteStaysPrivate() throws {
+        let (f, attempt) = try missedFreshRoleClaim(), resumed = try missedResumeConversation(f.p, f.o)
+        var input = auth(f.p, attempt)
+        input["target_session_id"] = f.peer.sessionID!; input["summary"] = "Continue from the saved checkpoint"
+        let offer = try call("work_handoff_offer", input, f.holder)
+        let accepted = try call("work_handoff_accept", ["project_id": f.p["id"]!, "offer_id": offer["id"]!], f.peer)
+        let reference = try XCTUnwrap((accepted["handoff_notices"] as? [JSON])?.first)
+        let notice = try missedLegacyRoleNotice(reference)
+        let privateNote = try missedNote(f, f.peer, ["body": notice["body"]!, "recipient": ["kind": "session", "session_id": f.holder.sessionID!]])
+        try router.dbQueue.write { db in
+            var sameAge = try router.record(db, privateNote["id"] as! String, type: "message")
+            sameAge["created_at"] = notice["created_at"]
+            XCTAssertNil(sameAge["ordinary_routing"]); XCTAssertNil(sameAge["delivery_omissions"])
+            try router.save(db, sameAge, type: "message")
+        }
+        let resume = try missedOrchestrateInput(f, "resume"), command = UUID().uuidString
+        let result = try call("triage_orchestrate", resume, resumed, command: command)
+        XCTAssertEqual(result["missed_notes_delivered"] as? Int, 1)
+        XCTAssertEqual(result["missed_note_delivery_has_more"] as? Bool, false)
+        XCTAssertEqual(try missedReceipts(f, notice["id"]!).count, 1)
+        XCTAssertEqual(try missedReceipts(f, privateNote["id"]!).count, 0)
+        XCTAssertEqual(try jsonString(call("triage_orchestrate", resume, resumed, command: command)), try jsonString(result))
+        XCTAssertEqual(try call("triage_orchestrate", missedOrchestrateInput(f, "checkpoint"), resumed)["missed_notes_delivered"] as? Int, 0)
+        XCTAssertEqual(try missedReceipts(f, notice["id"]!).count, 1)
+        XCTAssertEqual(try missedReceipts(f, privateNote["id"]!).count, 0)
+    }
+
+    func testTriageMissedLegacyRoleChangesPageFiftyOfFiftyTwoAndDeduplicate() throws {
+        let f = try missedFixture(), resumed = try missedResumeConversation(f.p, f.o)
+        var ids: [String] = []
+        for index in 0..<52 {
+            let taken = try missedTakeover(f, index.isMultiple(of: 2) ? f.peer : f.holder)
+            let reference = try XCTUnwrap((taken["takeover_notices"] as? [JSON])?.first)
+            ids.append(try missedLegacyRoleNotice(reference)["id"] as! String)
+        }
+        let input = try missedOrchestrateInput(f, "resume"), command = UUID().uuidString
+        let result = try call("triage_orchestrate", input, resumed, command: command)
+        XCTAssertEqual(result["missed_notes_delivered"] as? Int, 50)
+        XCTAssertEqual(result["missed_note_delivery_has_more"] as? Bool, true)
+        XCTAssertEqual(try ids.reduce(0) { try $0 + missedReceipts(f, $1).count }, 50)
+        XCTAssertEqual(try jsonString(call("triage_orchestrate", input, resumed, command: command)), try jsonString(result))
+        XCTAssertEqual(try ids.reduce(0) { try $0 + missedReceipts(f, $1).count }, 50)
+        let next = try call("triage_orchestrate", missedOrchestrateInput(f, "checkpoint"), resumed)
+        XCTAssertEqual(next["missed_notes_delivered"] as? Int, 2)
+        XCTAssertEqual(next["missed_note_delivery_has_more"] as? Bool, false)
+        XCTAssertEqual(try call("triage_orchestrate", missedOrchestrateInput(f, "checkpoint"), resumed)["missed_notes_delivered"] as? Int, 0)
+        for id in ids { XCTAssertEqual(try missedReceipts(f, id).count, 1) }
+    }
+
+    func testTriageMissedLegacyTakeoverCopiesOnlyFirstNoticeForMultipleEarlierHolders() throws {
+        let (f, attempt) = try missedFreshRoleClaim()
+        var input = auth(f.p, attempt)
+        input["child_session_id"] = f.peer.sessionID!
+        input["file_scopes"] = [["path": "Sources/Child.swift", "access": "write"]]
+        let delegation = try call("work_delegate", input, f.holder)
+        _ = try call("work_child_accept", ["project_id": f.p["id"]!, "delegation_id": delegation["id"]!], f.peer)
+        let taker = try native(f.p, "legacy-taker", domain: "codex:legacy-taker")
+        let resumed = try missedResumeConversation(f.p, f.o)
+        let taken = try missedTakeover(f, taker), references = try XCTUnwrap(taken["takeover_notices"] as? [JSON])
+        XCTAssertEqual(references.count, 2)
+        let notices = try references.map(missedLegacyRoleNotice)
+        let result = try call("triage_orchestrate", missedOrchestrateInput(f, "resume"), resumed)
+        XCTAssertEqual(result["missed_notes_delivered"] as? Int, 1)
+        XCTAssertEqual(try missedReceipts(f, notices[0]["id"]!).count, 1)
+        XCTAssertEqual(try missedReceipts(f, notices[1]["id"]!).count, 0, "The original route copied only notices[0] to the orchestrator.")
+    }
+
+    func testTriageMissedLegacyRoleChangeRejectsMismatchedStoredLinks() throws {
+        for field in ["project_id", "task_id", "session_id", "principal", "message_id"] {
+            let f = try missedFixture(), resumed = try missedResumeConversation(f.p, f.o), command = UUID().uuidString
+            let taken = try missedTakeover(f, f.peer, command: command)
+            let notice = try missedLegacyRoleNotice(XCTUnwrap((taken["takeover_notices"] as? [JSON])?.first))
+            try router.dbQueue.write { db in
+                let literal = try XCTUnwrap(String.fetchOne(db, sql: "SELECT result FROM commands WHERE principal=? AND command_id=?", arguments: [f.peer.principal, command]))
+                var result = jsonObject(literal), data = result["data"] as! JSON
+                if field == "message_id" {
+                    var references = data["takeover_notices"] as! [JSON]
+                    references[0]["message_id"] = UUID().uuidString; data["takeover_notices"] = references
+                } else if field != "principal" { data[field] = UUID().uuidString }
+                result["data"] = data
+                try db.execute(sql: "UPDATE commands SET result=?,principal=? WHERE principal=? AND command_id=?",
+                    arguments: [try jsonString(result), field == "principal" ? "unrelated-principal" : f.peer.principal, f.peer.principal, command])
+            }
+            let result = try call("triage_orchestrate", missedOrchestrateInput(f, "resume"), resumed)
+            XCTAssertEqual(result["missed_notes_delivered"] as? Int, 0, field)
+            XCTAssertEqual(try missedReceipts(f, notice["id"]!).count, 0, field)
+        }
+    }
+
+    func testTriageMissedLegacyRoleChangeWithExpiredLinkIsNotGuessedFromHistoryOrText() throws {
+        let f = try missedFixture(), resumed = try missedResumeConversation(f.p, f.o), command = UUID().uuidString
+        let taken = try missedTakeover(f, f.peer, command: command)
+        let notice = try missedLegacyRoleNotice(XCTUnwrap((taken["takeover_notices"] as? [JSON])?.first))
+        try router.dbQueue.writeWithoutTransaction { db in
+            // A prepared store already has a recent retention mark. Advance past
+            // the hourly mark interval so this notice's command is in the cutoff.
+            let date = Date().addingTimeInterval(CommandRouter.commandMarkInterval + 1)
+            _ = try router.pruneRoutineRecords(db, now: date)
+            _ = try router.pruneRoutineRecords(db, now: date.addingTimeInterval(CommandRouter.commandResultRetention + 1))
+            let literal = try XCTUnwrap(String.fetchOne(db, sql: "SELECT result FROM commands WHERE principal=? AND command_id=?", arguments: [f.peer.principal, command]))
+            XCTAssertTrue(CommandRouter.isPrunedResult(jsonObject(literal)))
+            let attempt = try router.record(db, taken["id"] as! String, type: "attempt")
+            XCTAssertNil(attempt["takeover_notices"])
+            XCTAssertEqual(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM events WHERE project_id=? AND entity_id=? AND kind='work_taken_over'", arguments: [f.p["id"] as! String, f.task["id"] as! String]), 1)
+        }
+        let result = try call("triage_orchestrate", missedOrchestrateInput(f, "resume"), resumed)
+        XCTAssertEqual(result["missed_notes_delivered"] as? Int, 0)
+        XCTAssertEqual(try missedReceipts(f, notice["id"]!).count, 0)
+    }
+}

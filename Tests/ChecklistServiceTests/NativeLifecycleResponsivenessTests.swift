@@ -23,10 +23,11 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
         let enrollments: [Enrollment]
         let attempts: [String]
         let notesPerSession: Int
+        let reader: Enrollment
         init(root: URL, coordinator: Coordinator, project: String, readTask: String,
-             enrollments: [Enrollment], attempts: [String], notesPerSession: Int) {
+             enrollments: [Enrollment], attempts: [String], notesPerSession: Int, reader: Enrollment) {
             self.root = root; self.coordinator = coordinator; self.project = project; self.readTask = readTask
-            self.enrollments = enrollments; self.attempts = attempts; self.notesPerSession = notesPerSession
+            self.enrollments = enrollments; self.attempts = attempts; self.notesPerSession = notesPerSession; self.reader = reader
         }
     }
 
@@ -75,16 +76,28 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
         private func submit() {
             let submitted = ProcessInfo.processInfo.systemUptime
             pending.enter()
-            fixture.coordinator.queue.async { [self] in
-                let dequeued = ProcessInfo.processInfo.systemUptime
+            let bootstrap: @Sendable (Bool) throws -> Coordinator.BootstrapResult = { [self] currentConnectionOnly in
+                let e = fixture.reader
+                return try fixture.coordinator.bootstrapVerifiedWorkspace([:], native: .init(provider: e.provider,
+                    session: e.sessionID, process: 29680, executionDomain: e.nativeExecutionDomain!, workspace: fixture.root.path),
+                    readCredential: fixture.coordinator.credentials.read, currentConnectionOnly: currentConnectionOnly)
+            }
+            let read: @Sendable (Result<Coordinator.BootstrapResult, Error>, TimeInterval) -> Void = { [self] result, dequeued in
+                var bootstrapFailure: String?
+                do {
+                    if try result.get().changed { bootstrapFailure = "Current reader bootstrap changed authority" }
+                } catch { bootstrapFailure = String(describing: error) }
                 fixture.coordinator.observeNativeConversationLifecycles()
                 let observed = ProcessInfo.processInfo.systemUptime
+                let checkedFailure = bootstrapFailure
                 DispatchQueue.global(qos: .userInitiated).async { [self] in autoreleasepool {
-                    var failure: String?
+                    var failure = checkedFailure
                     do {
                         let reply = try fixture.coordinator.router.handle(method: "task_get",
                             params: ["project_id": fixture.project, "task_id": fixture.readTask],
-                            caller: Caller(role: "owner", installation: "lifecycle-read-client", projectIDs: []))
+                            caller: Caller(role: "worker", installation: fixture.reader.installation + "/" + fixture.reader.generation,
+                                projectIDs: [fixture.project], sessionID: fixture.reader.sessionID, workspace: fixture.root.path,
+                                executionDomain: fixture.reader.nativeExecutionDomain))
                         if (reply["data"] as? [String: Any])?["id"] as? String != fixture.readTask {
                             failure = "task_get did not return the selected task"
                         }
@@ -96,7 +109,18 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
                     first.signal(); pending.leave()
                 }}
             }
+            fixture.coordinator.queue.async { [self] in
+                let dequeued = ProcessInfo.processInfo.systemUptime
+                do {
+                    guard let current = try fixture.coordinator.attemptCurrentNativeBootstrap({ try bootstrap(true) }, retry: {
+                        let began = ProcessInfo.processInfo.systemUptime
+                        read(Result { try bootstrap(false) }, began)
+                    }) else { return }
+                    read(.success(current), dequeued)
+                } catch { read(.failure(error), dequeued) }
+            }
         }
+
         func stop() throws -> [ReadSample] {
             timer?.cancel(); timerQueue.sync {}; timer = nil
             guard pending.wait(timeout: .now() + 1800) == .success else {
@@ -113,8 +137,8 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
     }
 
     private func fixture(claudeCount: Int, notes: Int, deliveries: Int, fillerBytes: Int) throws -> Fixture {
-        let parent = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification/r12-N/test-fixtures")
-        let root = parent.appendingPathComponent("native-lifecycle-response-" + UUID().uuidString)
+        let parent = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification/r12-N2/test-fixtures")
+        let root = parent.appendingPathComponent("native-lifecycle-response-" + UUID().uuidString).resolvingSymlinksInPath().standardizedFileURL
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let instance = try ChecklistInstance(home: root, environment: [:])
         let router = try CommandRouter(root: root.appendingPathComponent("store"))
@@ -157,6 +181,19 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
             let message = try router.dbQueue.read { try router.record($0, note["id"] as! String, type: "message") }
             prototypes.append((message, enrollment)); enrollments.append(enrollment)
         }
+        // An unrelated enrolled conversation stays current throughout the burst.
+        let sid = UUID().uuidString.lowercased(), token = "synthetic-current-reader"
+        let identity = SHA256.hash(data: Data("claude|\(sid)|\(project)".utf8)).map { String(format: "%02x", $0) }.joined()
+        var reader = Enrollment(installation: "auto-claude-" + identity.prefix(40), name: "Current read connection", provider: "claude",
+            role: "worker", projectIDs: [project], sessionID: sid, workspace: root.path, profileID: nil,
+            tokenDigest: SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined(), generation: "reader-generation")
+        reader.automatic = true; reader.nativeSessionID = sid; reader.nativeExecutionDomain = "claude:29680:6:0"
+        reader.identityVerification = ProviderPluginRegistry.bundled.plugin("claude", requiring: .workSession)?.nativeHost?.identityVerification
+        _ = try call(router, "session_register", ["project_id": project, "project_ids": [project], "session_id": sid,
+            "installation": reader.installation + "/" + reader.generation, "provider": "claude", "role": "worker",
+            "workspace": root.path, "execution_domain": reader.nativeExecutionDomain!])
+        coordinator.enrollments[reader.installation] = reader
+        try credentials.write(reader.installation, token)
         try coordinator.saveEnrollments()
         // Setup uses the real receipt function; this is outside the measured interval.
         try router.dbQueue.write { db in
@@ -192,7 +229,7 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
             .init(hosts: [host], holders: [host], unreadable: false, execClaim: false, incompleteNonCodex: 0, blockers: [])
         }, signed: { _ in true }, holds: { _ in true }, pauseBeforeRetry: {})
         return Fixture(root: root, coordinator: coordinator, project: project, readTask: readTask,
-            enrollments: enrollments, attempts: attempts, notesPerSession: notes)
+            enrollments: enrollments, attempts: attempts, notesPerSession: notes, reader: reader)
     }
 
     private func retire(_ fixture: Fixture) throws {
@@ -317,7 +354,7 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
             let periods = turns.compactMap { $0.1[activity] }
             print("CL-462 queue_activity=\(activity) count=\(periods.count) longest_ms=\(periods.max() ?? 0) sum_ms=\(periods.reduce(0, +))")
         }
-        print("CL-462 reads=\(samples.count) cadence_ms=250 lifecycle_events=30 boundary_reads=\(fixture.enrollments.count + 1) longest_read_ms=\(longest) longest_queue_wait_ms=\(queueWait) longest_read_lifecycle_ms=\(samples.map(\.lifecycleMS).max() ?? 0) read_errors=\(samples.compactMap(\.error))")
+        print("CL-462 reads=\(samples.count) fresh_bootstrap=true cadence_ms=250 lifecycle_events=30 boundary_reads=\(fixture.enrollments.count + 1) longest_read_ms=\(longest) longest_queue_wait_ms=\(queueWait) longest_read_lifecycle_ms=\(samples.map(\.lifecycleMS).max() ?? 0) read_errors=\(samples.compactMap(\.error))")
         XCTAssertTrue(errors.isEmpty, "Bootstrap failures: \(errors)")
         try router.dbQueue.read { db in
             for (index, old) in fixture.enrollments.enumerated() {
@@ -424,8 +461,13 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
                 } catch { results.failed(error) }
                 finished.signal()
             }
-            coordinator.nativeLifecycle.inspect = { _ in
-                .init(process: .gone, registry: .absent, detail: "Owned asynchronous closure fixture")
+            // Only this task's conversation closes. An unrelated closure can
+            // legitimately wake a general waiter before this task is released.
+            let target = fixture.enrollments[0].sessionID
+            coordinator.nativeLifecycle.inspect = { registration in
+                .init(process: registration.sessionID == target ? .gone : .running,
+                    registry: registration.sessionID == target ? .absent : .matching,
+                    detail: "Owned asynchronous closure fixture")
             }
             coordinator.observeNativeConversationLifecycles()
         }

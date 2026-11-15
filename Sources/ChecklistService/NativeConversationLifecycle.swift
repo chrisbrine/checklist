@@ -140,6 +140,19 @@ extension Coordinator {
         }
     }
 
+    /// The guarded bootstrap either returns current committed authority now or
+    /// asks for its complete, freshly verified retry in the state-changing FIFO.
+    /// Never convert an authentication failure into a registration retry.
+    func attemptCurrentNativeBootstrap<T>(_ attempt: () throws -> T,
+                                          retry: @escaping @Sendable () -> Void) throws -> T? {
+        requireCommandQueue()
+        do { return try attempt() }
+        catch is NativeBootstrapRequiresWrite {
+            enqueueNativeConnectionRequest(retry)
+            return nil
+        }
+    }
+
     /// Bootstrap requests arriving together must not all occupy the command
     /// queue ahead of the next app read. Admit them quickly, then run one per turn.
     func enqueueNativeConnectionRequest(_ work: @escaping @Sendable () -> Void) {

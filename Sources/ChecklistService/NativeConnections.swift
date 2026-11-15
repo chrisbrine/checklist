@@ -7,6 +7,10 @@ import ChecklistIPC
 import ChecklistProviders
 import ChecklistBridges
 
+/// Internal admission signal, never a public error or a prepared registration.
+/// The caller retries the complete bootstrap in the state-changing FIFO.
+struct NativeBootstrapRequiresWrite: Error {}
+
 // Automatic worker connections have a native process boundary. A thread ID is
 // host-exported context, not a cryptographically attested thread identity.
 extension Coordinator {
@@ -15,24 +19,28 @@ extension Coordinator {
     /// A new transport can reuse current committed authority during capture.
     /// Registration changes must never enqueue an owner write and then expose a
     /// prepared enrollment as committed; retry the complete bootstrap on admission.
-    private func bootstrapWrite<T>(_ body: () throws -> T) throws -> T {
+    private func bootstrapWrite<T>(currentConnectionOnly: Bool, _ body: () throws -> T) throws -> T {
+        guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
         guard let result = try router.withImmediateWriteAccess(body) else {
             throw CoreError("BACKUP_SERVICE_CALL_DEFERRED","Connection registration waits for the accepted backup write queue.")
         }
         return result
     }
-    func bootstrap(_ context:[String:Any], connection:NSXPCConnection) throws -> BootstrapResult {
+    func bootstrap(_ context:[String:Any], connection:NSXPCConnection, currentConnectionOnly: Bool = false) throws -> BootstrapResult {
         let native = try verifiedNativeWorkspace(context, connection: connection)
-        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read)
+        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read, currentConnectionOnly: currentConnectionOnly)
     }
 
     // Peer/process verification stays at the XPC boundary; this stage retains all grant checks.
     func bootstrapVerifiedWorkspace(_ context: [String: Any], native: VerifiedNativeWorkspace,
-                                    readCredential: (String) throws -> String?) throws -> BootstrapResult {
+                                    readCredential: (String) throws -> String?, currentConnectionOnly: Bool = false) throws -> BootstrapResult {
         let (provider, sid, process, executionDomain, workspace) = (native.provider, native.session, native.process, native.executionDomain, native.workspace)
         let plugin = ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)!
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
         let relay=context["mode"] as? String == "assistant_relay"
+        // Relay grants can rotate several project registrations; keep that mode
+        // on the state-changing lane even when its current grants happen to match.
+        if currentConnectionOnly && relay { throw NativeBootstrapRequiresWrite() }
         guard context["mode"] == nil || relay else { throw ChecklistError("INVALID_CONNECTION_MODE","Use worker or personal-assistant relay access.") }
         if relay && ProviderPluginRegistry.bundled.plugin(provider, requiring: .assistantRelay) == nil { throw ChecklistError("ADAPTER_UNAVAILABLE","The personal-assistant helper currently uses native Codex.") }
         let resolved=try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
@@ -45,6 +53,7 @@ extension Coordinator {
             projects.sort { ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "") }
         }
         if !relay && projects.isEmpty {
+            guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
             return BootstrapResult(reply:["data": ["connected": false, "state": "project_setup_required", "native_context_verified": true,
                               "workspace": workspace, "provider": provider, "session_id": sid]],changed:false)
         }
@@ -81,6 +90,8 @@ extension Coordinator {
         if let earlier = enrollments[installation], earlier.nativeExecutionDomain != executionDomain,
            earlier.ownerRevoked != true,
            !nativeLifecycle.reconciled.contains(earlier.installation + "/" + earlier.generation) {
+            // Reconciliation fences local authority and commits closure effects.
+            guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
             observeNativeConversationLifecycle(earlier)
         }
         if var existing=enrollments[installation] {
@@ -89,8 +100,15 @@ extension Coordinator {
                 guard session["owner_revoked"] as? Bool != true else {
                     throw ChecklistError("CONNECTION_REVOKED","The owner disconnected this conversation in Checklist. It stays refused until the owner selects Allow again on its ticket.")
                 }
+                // A concurrent transport can see the continuation's staged local
+                // generation while pooled reads still see the earlier ended one.
+                // Wait for that commit, then reverify the complete request in FIFO.
+                if currentConnectionOnly, nativeLifecycle.resumptionInFlight,
+                   session["installation"] as? String != existing.installation + "/" + existing.generation {
+                    throw NativeBootstrapRequiresWrite()
+                }
                 if session["owner_reconnect_allowed"] as? Bool == true {
-                    return try bootstrapWrite {
+                    return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
                         let resumed = try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner,ownerAllowed:true)
                         return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
                     }
@@ -98,9 +116,16 @@ extension Coordinator {
             }
             if existing.revoked == true || existing.nativeExecutionDomain != executionDomain {
                 // A host resumed this conversation in a new process; never borrow the old generation.
-                return try bootstrapWrite {
+                return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
                     let resumed=try reconnectNativeSession(existing,project:pid,executionDomain:executionDomain,binding:binding,process:process,endpoint:context["native_endpoint"] as? String,owner:owner)
                     return BootstrapResult(reply:connectionResult(resumed,project:pid),changed:true)
+                }
+            }
+            if currentConnectionOnly {
+                guard existing.automatic == true, existing.role == "worker", existing.assistantRelay != true,
+                      existing.ownerRevoked != true, (existing.nativeSessionID ?? existing.sessionID) == sid,
+                      existing.identityVerification == plugin.nativeHost?.identityVerification else {
+                    throw NativeBootstrapRequiresWrite()
                 }
             }
             guard existing.sessionID == boundSessionID,existing.workspace == binding,existing.provider == provider,relay || existing.projectIDs == [pid] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
@@ -112,14 +137,15 @@ extension Coordinator {
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
             }
             // A thread can connect before its rollout exists, and an older enrollment has no value.
-            if provider == "codex",!relay,existing.codexAppHostProven != true,
-               provesCodexAppRegistration(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain) {
-                storeCodexAppHostProof(installation:installation,generation:existing.generation)
-                existing.codexAppHostProven=true
+            if provider == "codex", !relay, existing.codexAppHostProven != true,
+               provesCodexAppRegistration(session: existing.nativeSessionID ?? existing.sessionID, domain: executionDomain) {
+                guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
+                storeCodexAppHostProof(installation: installation, generation: existing.generation)
+                existing.codexAppHostProven = true
             }
             let grantsChanged = relay && (existing.assistantGrants != grantMap || existing.relayPolicyRevisions != grantRevisions || existing.projectIDs != projectIDs)
             if session == nil || grantsChanged {
-                return try bootstrapWrite {
+                return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
                     // Repair only an interrupted initial registration. Existing generations stay intact.
                     if session == nil { _ = try registerAutomatic(existing,project:pid,caller:owner) }
                     if grantsChanged {
@@ -134,7 +160,7 @@ extension Coordinator {
             try requireCommittedRegistration(existing, project: pid, caller: owner)
             return BootstrapResult(reply:connectionResult(existing, project:pid),changed:false)
         }
-        return try bootstrapWrite {
+        return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
             guard try !router.connectionSessionExists(sessionID:boundSessionID,caller:owner) else { throw ChecklistError("SESSION_ID_CONFLICT","This reported session identifier already belongs to another connection. It cannot replace that connection.") }
             var bytes=[UInt8](repeating:0,count:32)
             guard SecRandomCopyBytes(kSecRandomDefault,bytes.count,&bytes)==errSecSuccess else { throw ChecklistError("RANDOM_FAILURE","Could not create the thread connection.") }

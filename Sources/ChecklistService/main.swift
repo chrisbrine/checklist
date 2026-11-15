@@ -357,8 +357,13 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     }
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
     /// A routed command needs only the router, which serializes its own writes.
-    func route(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
+    func route(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil,
+               currentConnectionOnly: Bool = false) throws -> Routed {
         let method = request["method"] as? String ?? ""
+        if currentConnectionOnly {
+            precondition(method == "connection_bootstrap")
+            return try routeNativeBootstrap(request, connection: connection, currentConnectionOnly: true)
+        }
         // Bootstrap checks an existing committed connection without the writer.
         // Its registration/repair branches acquire their own immediate admission.
         if ["connection_pair","connection_revoke"].contains(method) || (method == "project_create" && request["owner_channel"] as? Bool != true) {
@@ -369,14 +374,22 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         return try routeAdmitted(request,connection:connection,timing:timing)
     }
+    private func routeNativeBootstrap(_ request: [String: Any], connection: NSXPCConnection,
+                                      currentConnectionOnly: Bool = false) throws -> Routed {
+        requireCommandQueue()
+        let result = try queue.activity("connection_bootstrap") {
+            try bootstrap(request["params"] as? [String: Any] ?? [:], connection: connection,
+                          currentConnectionOnly: currentConnectionOnly)
+        }
+        var reply = result.reply
+        reply["write_admission"] = router.writeAdmissionStatus
+        return .done(reply, runHooks: result.changed)
+    }
     private func routeAdmitted(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Routed {
         requireCommandQueue()
         ServiceCallTiming.measure(timing,"route_lifecycle_ms") { observeNativeConversationLifecycles() }
         if request["method"] as? String == "connection_bootstrap" {
-            let result = try queue.activity("connection_bootstrap") { try bootstrap(request["params"] as? [String:Any] ?? [:], connection:connection) }
-            var reply = result.reply
-            reply["write_admission"] = router.writeAdmissionStatus
-            return .done(reply, runHooks:result.changed)
+            return try routeNativeBootstrap(request, connection: connection)
         }
         let method = request["method"] as? String ?? ""
         let params = request["params"] as? [String: Any] ?? [:]
@@ -753,15 +766,14 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             let isBootstrap = autoreleasepool {
                 ((try? JSONSerialization.jsonObject(with: request)) as? [String: Any])?["method"] as? String == "connection_bootstrap"
             }
-            if isBootstrap {
-                coordinator.enqueueNativeConnectionRequest { [self] in executeOnQueue(request, received: received, reply: reply) }
-            } else {
-                executeOnQueue(request, received: received, reply: reply)
-            }
+            // Reuse only fully checked committed authority on this turn. Any
+            // branch needing a write rejoins the existing native FIFO below.
+            executeOnQueue(request, received: received, reply: reply, currentConnectionOnly: isBootstrap)
         }
     }
 
-    private func executeOnQueue(_ request: Data, received: TimeInterval, reply: @escaping @Sendable (Data) -> Void) {
+    private func executeOnQueue(_ request: Data, received: TimeInterval, reply: @escaping @Sendable (Data) -> Void,
+                                currentConnectionOnly: Bool = false) {
         coordinator.requireCommandQueue()
         let dequeued = ProcessInfo.processInfo.systemUptime
         autoreleasepool {
@@ -811,9 +823,21 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             let routed: Coordinator.Routed
             do {
                 guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
-                routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") {
-                    try coordinator.withDeferredNativeResumption { try coordinator.route(object,connection:connection,timing:timing) }
+                let result: Coordinator.Routed? = try ServiceCallTiming.measure(timing, "bootstrap_verification_ms") {
+                    let attempt = { [self] in
+                        try coordinator.withDeferredNativeResumption {
+                            try coordinator.route(object, connection: connection, timing: timing, currentConnectionOnly: currentConnectionOnly)
+                        }
+                    }
+                    if currentConnectionOnly {
+                        return try coordinator.attemptCurrentNativeBootstrap(attempt, retry: { [self] in
+                            executeOnQueue(request, received: received, reply: reply)
+                        })
+                    }
+                    return try attempt()
                 }
+                guard let result else { return }
+                routed = result
             } catch let continuation as NativeBootstrapContinuation {
                 let started = ProcessInfo.processInfo.systemUptime
                 coordinator.startNativeBootstrapContinuation(continuation) { [self] outcome in
