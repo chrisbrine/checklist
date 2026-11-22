@@ -1,5 +1,7 @@
 """Replace Checklist and recover the previous bundle after a same-schema startup failure."""
 import argparse
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,8 @@ from verify_install import deadline_seconds, failure_guidance, process_executabl
 
 STARTUP_SECONDS = 60
 RESTORE_SECONDS = 180
+TERM_GRACE_SECONDS = 5
+KILL_GRACE_SECONDS = 5
 LSREGISTER = ('/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework'
               '/Versions/Current/Support/lsregister')
 INSTALL_ERRORS = (OSError, ValueError, KeyError, subprocess.SubprocessError)
@@ -69,9 +73,96 @@ def identity(path):
     return stat.st_dev, stat.st_ino
 
 
+class ProcessUsage(ctypes.Structure):
+    # Darwin's rusage_info_v0, selected by RUSAGE_INFO_V0 below.
+    _fields_ = [('uuid', ctypes.c_uint8 * 16), ('counters', ctypes.c_uint64 * 8),
+                ('start_abstime', ctypes.c_uint64), ('exit_abstime', ctypes.c_uint64)]
+
+
+def process_identity(pid):
+    """Read the executable path and kernel start time of one process instance."""
+    library = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    usage = ProcessUsage()
+
+    def unavailable():
+        error = ctypes.get_errno()
+        if error not in (errno.ESRCH, errno.ENOENT):
+            raise OSError(error, f'Could not inspect candidate PID {pid}: {os.strerror(error)}')
+
+    if library.proc_pid_rusage(pid, 0, ctypes.byref(usage)) != 0:
+        unavailable()
+        return None
+    started = usage.start_abstime
+    path = ctypes.create_string_buffer(4096)
+    if library.proc_pidpath(pid, path, len(path)) <= 0:
+        unavailable()
+        return None
+    # Do not bind a path from one PID instance to a start time from another.
+    if library.proc_pid_rusage(pid, 0, ctypes.byref(usage)) != 0:
+        unavailable()
+        return None
+    if usage.start_abstime == started:
+        return os.fsdecode(path.value), started
+    return None
+
+
+def stop_candidate(destination, bundle, deadline, runner, processes, clock, sleep, *,
+                   inspect=process_identity, send=os.kill):
+    """Quiesce only the failed installed bundle before swapping it out."""
+    executables = {str(destination / 'Contents/MacOS' / name) for name in ('ChecklistApp', 'ChecklistService')}
+
+    def targets():
+        found = {}
+        for pid, path in processes(runner, min(5, time_left(deadline, clock))):
+            if path in executables:
+                instance = inspect(pid)
+                if instance is not None and instance[0] == path:
+                    found[pid] = instance
+        return found
+
+    def send_to_current(pending, sig):
+        for pid, instance in pending.items():
+            time_left(deadline, clock)
+            if identity(destination) != bundle:
+                raise ValueError(f'Candidate bundle changed during shutdown at {destination}.')
+            if inspect(pid) == instance:
+                try:
+                    send(pid, sig)
+                except ProcessLookupError:
+                    pass
+                else:
+                    if sig == signal.SIGKILL:
+                        print(f'Sent SIGKILL to candidate PID {pid} ({instance[0]}) after the '
+                              f'{TERM_GRACE_SECONDS} s SIGTERM grace period.', file=sys.stderr, flush=True)
+
+    def wait_for_exit(pending, grace):
+        stop_by = min(deadline, clock() + grace)
+        while pending:
+            pending = {pid: instance for pid, instance in pending.items() if inspect(pid) == instance}
+            remaining = stop_by - clock()
+            if not pending or remaining <= 0:
+                break
+            sleep(min(0.05, remaining))
+        return pending
+
+    pending = targets()
+    send_to_current(pending, signal.SIGTERM)
+    pending = wait_for_exit(pending, TERM_GRACE_SECONDS)
+    if pending:
+        send_to_current(pending, signal.SIGKILL)
+        survivors = wait_for_exit(pending, KILL_GRACE_SECONDS)
+        if survivors:
+            details = ', '.join(f'PID {pid} ({path})' for pid, (path, _) in sorted(survivors.items()))
+            raise TimeoutError(f'Candidate processes survived SIGKILL after {KILL_GRACE_SECONDS} seconds: {details}. '
+                               'Candidate and previous bundles were kept in place.')
+    if restarted := targets():
+        raise ValueError('Candidate processes are running after shutdown: ' + ', '.join(map(str, sorted(restarted))) +
+                         '. Candidate and previous bundles were kept in place.')
+
+
 def install(root, destination, incoming, previous, rejected, preparation, install_started, *,
             replace_only=False, runner=subprocess.run, processes=process_executables, stop=stop_checklist,
-            clock=time.monotonic, sleep=time.sleep):
+            stop_replacement=stop_candidate, clock=time.monotonic, sleep=time.sleep):
     needs_upgrade = preparation.get('needs_upgrade') if isinstance(preparation, dict) else None
     if type(needs_upgrade) is not bool:
         raise ValueError('Invalid store-upgrade preparation receipt; the installed app is untouched.')
@@ -165,8 +256,8 @@ def install(root, destination, incoming, previous, rejected, preparation, instal
         if current != old:
             if current not in (None, new) or identity(previous) != old or identity(rejected) is not None:
                 raise ValueError('Bundle paths changed; refusing to overwrite them.')
-            if launch_attempted:
-                stop(None, destination, restore_deadline, runner, processes, clock, sleep)
+            if launch_attempted and current == new:
+                stop_replacement(destination, current, restore_deadline, runner, processes, clock, sleep)
             if identity(destination) != current or identity(previous) != old or identity(rejected) is not None:
                 raise ValueError('Bundle paths changed during the stop; refusing to overwrite them.')
             time_left(restore_deadline, clock)

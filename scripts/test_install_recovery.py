@@ -1,10 +1,12 @@
 """CL-513 install recovery checks using temporary bundles and a fake host."""
 from contextlib import redirect_stderr, redirect_stdout
+import ctypes
 import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,10 @@ class InstallRecoveryTests(unittest.TestCase):
         self.open_failure = False
         self.bad_signature = False
         self.restore_open_hangs = False
+        self.candidate = None
+        self.signals = []
+        self.survive_kill = False
+        self.replace_after_term = {}
         self.events = []
         self.output, self.errors = io.StringIO(), io.StringIO()
 
@@ -63,6 +69,8 @@ class InstallRecoveryTests(unittest.TestCase):
 
     def processes(self, runner, timeout):
         self.assertGreater(timeout, 0)
+        if self.candidate is not None and self.app_running and self.number(self.installed) == 331:
+            return [(pid, path) for pid, (path, _) in self.candidate.items()]
         return [(42, str(self.installed / 'Contents/MacOS/ChecklistApp'))] if self.app_running else []
 
     def stop(self, root, destination, deadline, runner, processes, clock, sleep):
@@ -70,6 +78,20 @@ class InstallRecoveryTests(unittest.TestCase):
         self.events.append(('stop', clock(), deadline, self.number(destination) if destination.exists() else None))
         self.app_running = False
         sleep(3)
+
+    def stop_replacement(self, destination, bundle, deadline, runner, processes, clock, sleep):
+        if self.candidate is None:
+            self.stop(None, destination, deadline, runner, processes, clock, sleep)
+        else:
+            recovery.stop_candidate(destination, bundle, deadline, runner, processes, clock, sleep,
+                                    inspect=self.candidate.get, send=self.send)
+
+    def send(self, pid, sig):
+        self.signals.append((pid, sig, self.now))
+        if sig == signal.SIGTERM and pid in self.replace_after_term:
+            self.candidate[pid] = self.replace_after_term[pid]
+        if sig == signal.SIGKILL and not self.survive_kill:
+            self.candidate.pop(pid)
 
     def runner(self, command, *, timeout, **kwargs):
         name = Path(command[0]).name
@@ -107,7 +129,8 @@ class InstallRecoveryTests(unittest.TestCase):
               patch.dict(os.environ, CHECKLIST_DATA_ROOT=str(self.root), CHECKLIST_VERIFY_DEADLINE_SECONDS='300')):
             return recovery.install(self.root, self.installed, self.incoming, self.previous, self.rejected,
                                     {'needs_upgrade': needs_upgrade}, 1000, runner=self.runner,
-                                    processes=self.processes, stop=self.stop, clock=self.clock, sleep=self.sleep)
+                                    processes=self.processes, stop=self.stop, stop_replacement=self.stop_replacement,
+                                    clock=self.clock, sleep=self.sleep)
 
     def test_unresponsive_stage_restores_previous_at_the_deadline(self):
         self.assertFalse(self.install())
@@ -183,6 +206,82 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.now, 1078)
         self.assertIn('Restore failed:', self.errors.getvalue())
         self.assertIn('timed out after 15', self.errors.getvalue())
+
+    def test_stubborn_candidate_is_killed_and_previous_bundle_is_verified(self):
+        self.candidate = {
+            42: (str(self.installed / 'Contents/MacOS/ChecklistApp'), 111),
+            43: (str(self.installed / 'Contents/MacOS/ChecklistService'), 112),
+        }
+        self.assertFalse(self.install())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060), (43, signal.SIGTERM, 1060),
+                                        (42, signal.SIGKILL, 1065), (43, signal.SIGKILL, 1065)])
+        self.assertEqual(self.number(self.installed), 328)
+        self.assertEqual(self.number(self.rejected), 331)
+        self.assertFalse(self.previous.exists())
+        self.assertIn('67.0 s (stop request to first healthy service answer from the restored build)',
+                      self.output.getvalue())
+        self.assertIn('Sent SIGKILL to candidate PID 43', self.errors.getvalue())
+        self.assertEqual([event[0] for event in self.events if event[1] >= 1065],
+                         ['lsregister', 'defaults', 'open', 'checklist'])
+
+    def test_other_bundle_and_pid_that_switches_executable_are_never_signalled_as_candidates(self):
+        unrelated = str(self.root / 'Other.app/Contents/MacOS/ChecklistService')
+        self.candidate = {
+            42: (str(self.installed / 'Contents/MacOS/ChecklistApp'), 111),
+            43: (unrelated, 112),
+        }
+        self.replace_after_term[42] = (unrelated, 111)
+        self.assertFalse(self.install())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060)])
+        self.assertEqual(self.number(self.installed), 328)
+        self.assertEqual(self.number(self.rejected), 331)
+
+    def test_reused_pid_at_same_path_is_never_sent_sigkill(self):
+        executable = str(self.installed / 'Contents/MacOS/ChecklistApp')
+        self.candidate = {42: (executable, 111)}
+        self.replace_after_term[42] = (executable, 222)
+        self.assertFalse(self.install())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060)])
+        self.assertIn('Candidate processes are running after shutdown: 42', self.errors.getvalue())
+        self.assertEqual(self.number(self.installed), 331)
+        self.assertEqual(self.number(self.previous), 328)
+        self.assertFalse(self.rejected.exists())
+
+    def test_candidate_surviving_sigkill_leaves_bundles_in_place_and_reports_failure(self):
+        executable = str(self.installed / 'Contents/MacOS/ChecklistApp')
+        self.candidate = {42: (executable, 111)}
+        self.survive_kill = True
+        self.assertFalse(self.install())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060), (42, signal.SIGKILL, 1065)])
+        self.assertEqual(self.now, 1070)
+        self.assertEqual(self.number(self.installed), 331)
+        self.assertEqual(self.number(self.previous), 328)
+        self.assertFalse(self.rejected.exists())
+        self.assertIn('Candidate processes survived SIGKILL after 5 seconds: PID 42', self.errors.getvalue())
+        self.assertIn(f'Check {self.installed}, {self.previous} and {self.rejected}.', self.errors.getvalue())
+        self.assertIn('at least 70.0 s (no healthy service answer observed)', self.errors.getvalue())
+        self.assertFalse(any(event[0] in {'lsregister', 'defaults'} for event in self.events))
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    def test_path_is_bound_to_the_same_kernel_start_time_on_both_sides(self):
+        class Library:
+            def __init__(self, starts):
+                self.starts = iter(starts)
+
+            def proc_pid_rusage(self, pid, flavor, buffer):
+                usage = ctypes.cast(buffer, ctypes.POINTER(recovery.ProcessUsage)).contents
+                usage.start_abstime = next(self.starts)
+                return 0
+
+            def proc_pidpath(self, pid, buffer, size):
+                buffer.value = b'/fixture/Checklist.app/Contents/MacOS/ChecklistApp'
+                return len(buffer.value)
+
+        for starts, expected in (((111, 111), ('/fixture/Checklist.app/Contents/MacOS/ChecklistApp', 111)),
+                                 ((111, 222), None)):
+            with self.subTest(starts=starts), patch.object(ctypes, 'CDLL', return_value=Library(starts)):
+                self.assertEqual(recovery.process_identity(42), expected)
 
 
 if __name__ == '__main__':
