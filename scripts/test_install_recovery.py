@@ -46,11 +46,15 @@ class InstallRecoveryTests(unittest.TestCase):
         self.now = 1000
         self.new_ready = None
         self.previous_ready = True
+        self.previous_ready_at = 0
         self.upgrading = False
         self.app_running = True
         self.open_failure = False
         self.bad_signature = False
         self.restore_open_hangs = False
+        self.restore_jobs = ('running',)
+        self.restore_opens = 0
+        self.restore_signals = []
         self.candidate = None
         self.signals = []
         self.survive_kill = False
@@ -71,7 +75,12 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertGreater(timeout, 0)
         if self.candidate is not None and self.app_running and self.number(self.installed) == 331:
             return [(pid, path) for pid, (path, _) in self.candidate.items()]
-        return [(42, str(self.installed / 'Contents/MacOS/ChecklistApp'))] if self.app_running else []
+        if not self.app_running:
+            return []
+        paths = [(42, str(self.installed / 'Contents/MacOS/ChecklistApp'))]
+        if self.restore_opens:
+            paths.append((44, str(self.installed / 'Contents/MacOS/ChecklistService')))
+        return paths
 
     def stop(self, root, destination, deadline, runner, processes, clock, sleep):
         self.assertEqual(destination, self.installed)
@@ -93,6 +102,19 @@ class InstallRecoveryTests(unittest.TestCase):
         if sig == signal.SIGKILL and not self.survive_kill:
             self.candidate.pop(pid)
 
+    def inspect_restored(self, pid):
+        return next(((path, 333) for number, path in self.processes(None, 5) if number == pid), None)
+
+    def send_restored(self, pid, sig):
+        self.assertEqual((pid, sig), (42, signal.SIGTERM))
+        self.assertEqual(self.number(self.installed), 328)
+        self.restore_signals.append((pid, sig, self.now))
+        self.events.append(('quit', self.now))
+        self.app_running = False
+
+    def restore_job(self):
+        return self.restore_jobs[min(self.restore_opens - 1, len(self.restore_jobs) - 1)]
+
     def runner(self, command, *, timeout, **kwargs):
         name = Path(command[0]).name
         self.assertGreater(timeout, 0)
@@ -104,13 +126,24 @@ class InstallRecoveryTests(unittest.TestCase):
                 self.sleep(timeout)
                 raise subprocess.TimeoutExpired(command, timeout)
             self.assertEqual(command[2], str(self.installed))
+            if command[1] == '-g':
+                self.restore_opens += 1
             self.app_running = True
+        elif name == 'launchctl':
+            self.assertEqual(command[1:], ['print', f'gui/{os.getuid()}/org.checklist.coordination'])
+            state = self.restore_job()
+            if state == 'absent':
+                return subprocess.CompletedProcess(command, 113, '', 'Could not find service')
+            return subprocess.CompletedProcess(command, 0, f'{command[2]} = {{\n\tstate = {state}\n}}\n', '')
         elif name == 'checklist':
             number = self.number(self.installed)
             self.assertTrue(self.app_running)
             if number == 331 and self.upgrading:
                 return subprocess.CompletedProcess(command, 1, '', 'Checklist: STORAGE_UPGRADING: pending')
-            ready = self.previous_ready if number == 328 else self.new_ready is not None and self.now >= self.new_ready
+            if number == 328:
+                ready = self.previous_ready and self.restore_job() == 'running' and self.now >= self.previous_ready_at
+            else:
+                ready = self.new_ready is not None and self.now >= self.new_ready
             if not ready:
                 self.sleep(timeout)
                 raise subprocess.TimeoutExpired(command, timeout)
@@ -126,7 +159,9 @@ class InstallRecoveryTests(unittest.TestCase):
 
     def install(self, needs_upgrade=False):
         with (redirect_stdout(self.output), redirect_stderr(self.errors),
-              patch.dict(os.environ, CHECKLIST_DATA_ROOT=str(self.root), CHECKLIST_VERIFY_DEADLINE_SECONDS='300')):
+              patch.dict(os.environ, CHECKLIST_DATA_ROOT=str(self.root), CHECKLIST_VERIFY_DEADLINE_SECONDS='300'),
+              patch.object(recovery, 'process_identity', self.inspect_restored),
+              patch.object(os, 'kill', self.send_restored)):
             return recovery.install(self.root, self.installed, self.incoming, self.previous, self.rejected,
                                     {'needs_upgrade': needs_upgrade}, 1000, runner=self.runner,
                                     processes=self.processes, stop=self.stop, stop_replacement=self.stop_replacement,
@@ -141,10 +176,50 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertEqual(stops, [('stop', 1000, 1060, 328), ('stop', 1060, 1240, 331)])
         recovery_events = [event for event in self.events if event[1] >= 1060]
         self.assertEqual([event[0] for event in recovery_events], ['stop', 'lsregister', 'defaults', 'open', 'checklist'])
-        self.assertEqual(recovery_events[2][3], ('write', 'org.checklist.app', 'registeredServiceBuild',
-                                                  '-string', 'installer-rollback'))
+        self.assertEqual(recovery_events[2][3][:-1], ('write', 'org.checklist.app', 'registeredServiceBuild', '-string'))
+        self.assertTrue(recovery_events[2][3][-1].startswith('installer-rollback-'))
         self.assertEqual(recovery_events[3][3][0], '-g')
         self.assertIn('65.0 s (stop request to first healthy service answer from the restored build)', self.output.getvalue())
+
+    def test_spawn_failure_after_first_reopen_recovers_on_second(self):
+        self.restore_jobs = ('spawn failed', 'running')
+        self.assertFalse(self.install())
+        self.assertEqual(self.restore_opens, 2)
+        self.assertEqual(self.restore_signals, [(42, signal.SIGTERM, 1083)])
+        recovery_events = [event for event in self.events if event[1] >= 1060]
+        self.assertEqual([event[0] for event in recovery_events],
+                         ['stop', 'lsregister', 'defaults', 'open', 'checklist', 'launchctl',
+                          'quit', 'lsregister', 'defaults', 'open', 'checklist'])
+        sentinels = [event[3][-1] for event in recovery_events if event[0] == 'defaults']
+        self.assertEqual(len(set(sentinels)), 2)
+        self.assertIn('spawn failed', self.errors.getvalue())
+        self.assertIn('verified its service', self.output.getvalue())
+        self.assertNotIn('Restore failed:', self.errors.getvalue())
+        self.assertEqual(self.number(self.installed), 328)
+        self.assertEqual(self.number(self.rejected), 331)
+
+    def test_nonrunning_job_exhausts_retries_inside_recovery_deadline(self):
+        self.restore_jobs = ('spawn failed',)
+        self.assertFalse(self.install())
+        self.assertEqual(self.restore_opens, 3)
+        self.assertEqual(len(self.restore_signals), 2)
+        self.assertEqual(self.now, 1240)
+        self.assertEqual(self.number(self.installed), 328)
+        self.assertEqual(self.number(self.rejected), 331)
+        self.assertEqual(self.errors.getvalue().count('state: spawn failed.'), 2)
+        self.assertIn('Restore failed:', self.errors.getvalue())
+        self.assertNotIn('verified its service', self.output.getvalue())
+
+    def test_absent_then_exited_job_can_start_after_final_reopen(self):
+        self.restore_jobs = ('absent', 'exited', 'running')
+        self.previous_ready_at = 1133
+        self.assertFalse(self.install())
+        self.assertEqual(self.restore_opens, 3)
+        self.assertEqual(self.restore_signals, [(42, signal.SIGTERM, 1083), (42, signal.SIGTERM, 1103)])
+        self.assertIn('state: absent.', self.errors.getvalue())
+        self.assertIn('state: exited.', self.errors.getvalue())
+        self.assertIn('verified its service', self.output.getvalue())
+        self.assertLess(self.now, 1240)
 
     def test_healthy_stage_within_limit_keeps_new_bundle(self):
         self.new_ready = 1020
@@ -181,6 +256,9 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.number(self.installed), 328)
         self.assertEqual(self.number(self.rejected), 331)
         self.assertEqual(self.now, 1240)
+        self.assertEqual(self.restore_opens, 1)
+        self.assertEqual(self.restore_signals, [])
+        self.assertIn('state: running.', self.errors.getvalue())
         self.assertIn('Restore failed:', self.errors.getvalue())
         self.assertIn('at least 240.0 s (no healthy service answer observed)', self.errors.getvalue())
 

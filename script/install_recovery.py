@@ -5,16 +5,21 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
-from verify_install import deadline_seconds, failure_guidance, process_executables, verify
+from verify_install import VerificationDeadlineExpired, deadline_seconds, failure_guidance, process_executables, verify
 
 
 STARTUP_SECONDS = 60
 RESTORE_SECONDS = 180
+REGISTRATION_GRACE_SECONDS = 20
+REGISTRATION_RETRIES = 2
+SERVICE_LABEL = 'org.checklist.coordination'
 TERM_GRACE_SECONDS = 5
 KILL_GRACE_SECONDS = 5
 LSREGISTER = ('/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework'
@@ -87,7 +92,7 @@ def process_identity(pid):
     def unavailable():
         error = ctypes.get_errno()
         if error not in (errno.ESRCH, errno.ENOENT):
-            raise OSError(error, f'Could not inspect candidate PID {pid}: {os.strerror(error)}')
+            raise OSError(error, f'Could not inspect PID {pid}: {os.strerror(error)}')
 
     if library.proc_pid_rusage(pid, 0, ctypes.byref(usage)) != 0:
         unavailable()
@@ -109,7 +114,13 @@ def process_identity(pid):
 def stop_candidate(destination, bundle, deadline, runner, processes, clock, sleep, *,
                    inspect=process_identity, send=os.kill):
     """Quiesce only the failed installed bundle before swapping it out."""
-    executables = {str(destination / 'Contents/MacOS' / name) for name in ('ChecklistApp', 'ChecklistService')}
+    _stop_bundle_processes(destination, bundle, deadline, runner, processes, clock, sleep,
+                           ('ChecklistApp', 'ChecklistService'), 'candidate', inspect, send)
+
+
+def _stop_bundle_processes(destination, bundle, deadline, runner, processes, clock, sleep, names, role, inspect, send):
+    """Stop processes at exact executable paths and guard against PID reuse."""
+    executables = {str(destination / 'Contents/MacOS' / name) for name in names}
 
     def targets():
         found = {}
@@ -124,7 +135,7 @@ def stop_candidate(destination, bundle, deadline, runner, processes, clock, slee
         for pid, instance in pending.items():
             time_left(deadline, clock)
             if identity(destination) != bundle:
-                raise ValueError(f'Candidate bundle changed during shutdown at {destination}.')
+                raise ValueError(f'{role.capitalize()} bundle changed during shutdown at {destination}.')
             if inspect(pid) == instance:
                 try:
                     send(pid, sig)
@@ -132,7 +143,7 @@ def stop_candidate(destination, bundle, deadline, runner, processes, clock, slee
                     pass
                 else:
                     if sig == signal.SIGKILL:
-                        print(f'Sent SIGKILL to candidate PID {pid} ({instance[0]}) after the '
+                        print(f'Sent SIGKILL to {role} PID {pid} ({instance[0]}) after the '
                               f'{TERM_GRACE_SECONDS} s SIGTERM grace period.', file=sys.stderr, flush=True)
 
     def wait_for_exit(pending, grace):
@@ -153,11 +164,26 @@ def stop_candidate(destination, bundle, deadline, runner, processes, clock, slee
         survivors = wait_for_exit(pending, KILL_GRACE_SECONDS)
         if survivors:
             details = ', '.join(f'PID {pid} ({path})' for pid, (path, _) in sorted(survivors.items()))
-            raise TimeoutError(f'Candidate processes survived SIGKILL after {KILL_GRACE_SECONDS} seconds: {details}. '
-                               'Candidate and previous bundles were kept in place.')
+            raise TimeoutError(f'{role.capitalize()} processes survived SIGKILL after {KILL_GRACE_SECONDS} seconds: '
+                               f'{details}. Bundles were kept in place.')
     if restarted := targets():
-        raise ValueError('Candidate processes are running after shutdown: ' + ', '.join(map(str, sorted(restarted))) +
-                         '. Candidate and previous bundles were kept in place.')
+        details = ', '.join(map(str, sorted(restarted)))
+        raise ValueError(f'{role.capitalize()} processes are running after shutdown: {details}. Bundles were kept in place.')
+
+
+def launch_job_state(deadline, runner, clock):
+    target = f'gui/{os.getuid()}/{SERVICE_LABEL}'
+    result = runner(['/bin/launchctl', 'print', target], text=True, capture_output=True,
+                    timeout=min(5, time_left(deadline, clock)))
+    if result.returncode:
+        detail = (result.stderr or result.stdout or '').strip()
+        if result.returncode == 113 or 'could not find service' in detail.lower():
+            return 'absent'
+        raise ValueError(f'launchctl print {target} exited {result.returncode}: {detail}')
+    match = re.search(r'(?m)^[ \t]+state = ([^\n]+)', result.stdout)
+    if match is None:
+        raise ValueError(f'launchctl print {target} did not report a job state.')
+    return match[1].strip()
 
 
 def install(root, destination, incoming, previous, rejected, preparation, install_started, *,
@@ -191,6 +217,56 @@ def install(root, destination, incoming, previous, rejected, preparation, instal
         if identity(destination) != expected:
             raise ValueError('Installed bundle changed during verification.')
         return result
+
+    def require_restored_bundle():
+        if identity(destination) != old:
+            raise ValueError(f'Restored bundle changed at {destination}.')
+
+    def reopen_restored(refresh_registration):
+        require_restored_bundle()
+        if refresh_registration:
+            # The restored native app owns SMAppService registration.
+            sentinel = f'installer-rollback-{uuid4().hex}'
+            for step, command in (
+                ('Refreshing Launch Services registration', [LSREGISTER, '-f', str(destination)]),
+                ('Writing a fresh service registration sentinel', ['/usr/bin/defaults', 'write', 'org.checklist.app',
+                                                                   'registeredServiceBuild', '-string', sentinel]),
+            ):
+                require_restored_bundle()
+                print(f'{step} for {destination}.', file=sys.stderr, flush=True)
+                try:
+                    run(command, restore_deadline)
+                except INSTALL_ERRORS as error:
+                    print(f'Warning: {step} failed: {error}', file=sys.stderr, flush=True)
+        require_restored_bundle()
+        print(f'Reopening restored app at {destination}.', file=sys.stderr, flush=True)
+        run(['/usr/bin/open', '-g', str(destination)], restore_deadline)
+
+    def verify_restored():
+        for retry in range(1, REGISTRATION_RETRIES + 1):
+            probe_deadline = min(restore_deadline, clock() + REGISTRATION_GRACE_SECONDS)
+            try:
+                # The health request also asks launchd to start this on-demand job.
+                healthy(old, probe_deadline)
+                return
+            except VerificationDeadlineExpired:
+                pass
+            try:
+                state = launch_job_state(restore_deadline, runner, clock)
+            except INSTALL_ERRORS as error:
+                print(f'Could not inspect restored service job: {error}', file=sys.stderr, flush=True)
+                break
+            print(f'Restored service job {SERVICE_LABEL} state: {state}.', file=sys.stderr, flush=True)
+            if state == 'running':
+                break
+            require_restored_bundle()
+            print(f'Registration retry {retry} of {REGISTRATION_RETRIES}: quitting restored app at {destination}.',
+                  file=sys.stderr, flush=True)
+            _stop_bundle_processes(destination, old, restore_deadline, runner, processes, clock, sleep,
+                                   ('ChecklistApp',), 'restored app', process_identity, os.kill)
+            reopen_restored(refresh_registration=True)
+        # Allow launchd's throttle interval and service startup after the last reopen.
+        healthy(old, restore_deadline)
 
     def measured(answer=None):
         elapsed = clock() - started
@@ -264,18 +340,8 @@ def install(root, destination, incoming, previous, rejected, preparation, instal
             if current == new:
                 destination.rename(rejected)
             previous.rename(destination)
-            # The restored native app owns SMAppService registration. Force its
-            # build-change check even if the unsuccessful launch left the old value.
-            for command in ([LSREGISTER, '-f', str(destination)],
-                            ['/usr/bin/defaults', 'write', 'org.checklist.app',
-                             'registeredServiceBuild', '-string', 'installer-rollback']):
-                try:
-                    run(command, restore_deadline)
-                except INSTALL_ERRORS as error:
-                    print('Warning: could not prepare restored app registration: ' + str(error),
-                          file=sys.stderr, flush=True)
-        run(['/usr/bin/open', '-g', str(destination)], restore_deadline)
-        healthy(old, restore_deadline)
+        reopen_restored(refresh_registration=current != old)
+        verify_restored()
     except INSTALL_ERRORS as error:
         print(f'Restore failed: {error}. Check {destination}, {previous} and {rejected}.',
               file=sys.stderr, flush=True)

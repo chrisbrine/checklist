@@ -17,6 +17,10 @@ SAFE_FAILURE_GUIDANCE = ('The installed bundle and the store were kept. Check ch
                          'not the previous bundle.')
 
 
+class VerificationDeadlineExpired(ValueError):
+    """The service did not answer in time."""
+
+
 def failure_guidance(install_started, data_root=None):
     """Name a recent completed generation without opening the store or its manifest."""
     guidance = SAFE_FAILURE_GUIDANCE
@@ -127,10 +131,10 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
     executable = destination / 'Contents/MacOS/ChecklistApp'
     if paths is not None and not callable(paths): paths = tuple(paths)
     progress = progress or (lambda line: print(line, file=sys.stderr, flush=True))
-    def fail(message):
+    def fail(message, error_type=ValueError):
         if include_failure_guidance:
             message += '\n' + failure_guidance(install_started)
-        raise ValueError(message)
+        raise error_type(message)
     started = clock()
     if deadline is None:
         deadline = started + deadline_seconds()
@@ -140,7 +144,7 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
     def expired():
         bound = max(0, deadline - started)
         fail(f'The installed Checklist service is still starting after {bound:g} seconds; verification deadline expired. '
-             'Last status: ' + last_status)
+             'Last status: ' + last_status, VerificationDeadlineExpired)
     def notify_upgrade():
         nonlocal deadline
         if on_upgrade is not None:

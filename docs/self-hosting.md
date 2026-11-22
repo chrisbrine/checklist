@@ -36,7 +36,9 @@ Before staging an install from a fresh workspace, including a hotfix made with `
 
 For a same-schema install, the new service has 60 seconds from the stop request to give a healthy answer. If it fails and a previous bundle exists, the installer gives recovery a separate 180 seconds. It gives the failed app and service up to five seconds to exit after SIGTERM. If the same processes remain, it sends SIGKILL and waits up to five more seconds. Before each signal it checks the executable path and the process start time. If a candidate process remains, the installer keeps both bundles in place and reports their paths.
 
-Once the candidate stops, the installer restores and reopens the previous bundle. The app refreshes its launch agent registration, and the installer verifies the restored build within the recovery budget. The installer exits non-zero even if recovery succeeds. It prints the measured outage when the restored service answers. If recovery fails, it reports the failed step, bundle paths and elapsed time without a healthy answer.
+Once the candidate stops, the installer restores and reopens the previous bundle. The app refreshes its launch agent registration. If the service has given no healthy answer after 20 seconds and launchd still reports no running job, the installer quits the restored app by its exact executable path, refreshes its Launch Services registration, writes a fresh registration sentinel and reopens it. It allows up to two retries within the 180-second recovery budget. A running job gets the rest of that budget to answer.
+
+The installer verifies the restored build and exits non-zero even if recovery succeeds. It prints the measured outage when the restored service answers. If recovery fails, it reports the failed step, bundle paths and elapsed time without a healthy answer.
 
 When a startup requires a store upgrade, the installer uses the existing upgrade verification wait. If that startup fails, it keeps the new bundle and directs recovery to the protected pre-upgrade generation. Follow [WAL, upgrades and recovery](database-storage.md#wal-upgrades-and-recovery) for store recovery.
 
