@@ -62,6 +62,12 @@ PATH_LIST_FIELDS = frozenset({'paths', 'additional_paths'})
 # These retained descriptor spellings may be relative; preserve their existing
 # absolute slot-containment check instead of inferring authority from all prose.
 ABSOLUTE_PATH_FIELDS = frozenset({'stored_path', 'capture_path', 'cache_path', 'declared_path', 'link_target', 'root'})
+ALL_PATH_FIELDS = PATH_FIELDS | PATH_LIST_FIELDS | ABSOLUTE_PATH_FIELDS
+CONTEXT_PATH_FIELDS = ALL_PATH_FIELDS | {'media_trash_source_root', 'trash_path', 'media_trash_directory',
+                                      'stored', 'relative', 'key_root', 'stage', 'final', 'target'}
+MANAGED_FAMILIES = frozenset({'objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache'})
+FILE_URL = re.compile(r'\bfile:', re.IGNORECASE)
+BARE_FILE_URL = re.compile(r'file:\S*', re.IGNORECASE)
 
 
 def slot_number(value):
@@ -114,9 +120,9 @@ def _canonical_path(path):
     return existing, tuple(reversed(missing)), identity
 
 
-def paths_overlap(a, b) -> bool:
+def paths_overlap(a, b, *, left=None) -> bool:
     """Physical equal/ancestor overlap, with NFD/case-folded component fallback on every volume."""
-    a_root, a_tail, a_identity = _canonical_path(a)
+    a_root, a_tail, a_identity = _canonical_path(a) if left is None else left
     b_root, b_tail, b_identity = _canonical_path(b)
     if not a_tail and not b_tail:
         if a_identity == b_identity: return True
@@ -139,8 +145,13 @@ def checklist_root_overlap(path, exclude=()) -> str | None:
         p = paths(number)
         roots.extend([(f'slot-{number}', p['data']), (f'slot-{number}', p['folder'])])
     roots.append(('test-base', BASE))
+    left = None
     for label, root in roots:
-        if label not in exclude and paths_overlap(path, root): return label
+        if label in exclude: continue
+        if left is None: left = _canonical_path(path)
+        if paths_overlap(path, root, left=left): return label
+    if left is not None and _canonical_path(path) != left:
+        raise ValueError('Instance path changed while checking overlap.')
     return None
 
 
@@ -356,12 +367,17 @@ def stage_selection(arguments):
 
 
 def relative_path(value):
-    path = PurePosixPath(value)
-    if not value or len(path.parts) < 2 or path.is_absolute() or '\0' in value or any(x in ['', '.', '..'] for x in value.split('/')):
+    managed_parts(value)
+    return PurePosixPath(value)
+
+
+def managed_parts(value):
+    parts = value.split('/')
+    if len(parts) < 2 or '\0' in value or any(part in ('', '.', '..') for part in parts):
         raise ValueError('Unsafe snapshot relative path: ' + value)
-    if path.parts[0] not in ['objects', 'source-captures', 'staging', 'icons', 'source-executions', 'source-build-cache']:
+    if parts[0] not in MANAGED_FAMILIES:
         raise ValueError('Unsupported snapshot managed family: ' + value)
-    return path
+    return parts
 
 
 def database_observation(database, immutable=True):
@@ -389,6 +405,104 @@ def latest_backup():
 
 def is_live_snapshot(source, source_root):
     return LIVE / 'backups' in source.parents and Path(source_root).absolute() == LIVE
+
+
+def file_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def open_seed_directory(root_descriptor, parts, create=False):
+    descriptor = os.dup(root_descriptor)
+    try:
+        for part in parts:
+            if create:
+                try: os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError: pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+class LocalPathChecks:
+    """Check local symlinks by directory so ordinary leaves need no stat."""
+
+    FALLBACK = object()
+    MAX_DIRECTORIES = 65_536
+
+    def __init__(self, root):
+        self.root = root
+        self.descriptor = None
+        self.directories = {}
+        self.reusable = True
+
+    def directory(self, relative):
+        if relative in self.directories:
+            return self.directories[relative]
+        if relative:
+            parent = self.directory(relative.rpartition('/')[0])
+            if parent is None or parent is self.FALLBACK:
+                return parent
+        else:
+            contained(self.root, self.root)
+        if len(self.directories) >= self.MAX_DIRECTORIES:
+            self.reusable = False
+            return self.FALLBACK
+
+        path = self.root / relative
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError('Symlink in local seed path.')
+            if stat.S_ISDIR(info.st_mode):
+                if self.descriptor is None:
+                    self.descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                descriptor = open_seed_directory(self.descriptor, relative.split('/') if relative else ())
+                try:
+                    before = file_stamp(info)
+                    if file_stamp(os.fstat(descriptor)) != before:
+                        raise ValueError('Local seed directory changed before inspection.')
+                    with os.scandir(descriptor) as children:
+                        has_links = any(child.is_symlink() for child in children)
+                    if file_stamp(os.fstat(descriptor)) != before:
+                        raise ValueError('Local seed directory changed during inspection.')
+                finally:
+                    os.close(descriptor)
+                observed = (before, has_links)
+            else:
+                observed = None
+        except (FileNotFoundError, NotADirectoryError):
+            observed = None
+        except OSError:
+            # A directory may permit lookup but deny enumeration. Retain the
+            # named no-symlink checks for it and its descendants.
+            self.reusable = False
+            observed = self.FALLBACK
+        self.directories[relative] = observed
+        return observed
+
+    def check(self, relative):
+        parent = self.directory(relative.rpartition('/')[0])
+        if parent is self.FALLBACK:
+            contained(self.root / relative, self.root)
+        elif parent is not None and parent[1] and (self.root / relative).is_symlink():
+            # Let the filesystem decide whether this spelling aliases a link.
+            raise ValueError('Symlink in local seed path.')
+
+    def finish(self):
+        observed = {name: entry[0] for name, entry in self.directories.items()
+                    if entry is not None and entry is not self.FALLBACK}
+        if observed: contained(self.root, self.root)
+        if any(file_stamp((self.root / name).lstat()) != stamp for name, stamp in observed.items()):
+            raise ValueError('Local seed directory changed during inspection.')
+        return observed
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
 
 
 class ManagedPathMapping:
@@ -490,13 +604,41 @@ class ExternalBindingOverlapCache:
                 raise ValueError('External binding named ancestry changed during release (' + location + ').')
 
 
+def receipt_trash_opacity(path, unbound):
+    """Check a nonlocal Trash spelling without following a link or reading bytes."""
+    parts = ManagedPathMapping.folded(path.parts)
+    roots = [LIVE, DEFAULT_LIVE, BASE]
+    for number in range(1, 5):
+        roots.extend([paths(number)['folder'], paths(number)['data']])
+    for root in roots:
+        other = ManagedPathMapping.folded(root.parts)
+        if parts[:len(other)] == other or other[:len(parts)] == parts:
+            raise ValueError('a Trash destination into a different Checklist data root')
+    for entry in reversed([path, *path.parents]):
+        try: mode = entry.lstat().st_mode
+        except (FileNotFoundError, NotADirectoryError): continue
+        except OSError as error:
+            if unbound and error.errno in {errno.EPERM, errno.EACCES}: return True
+            raise ValueError('a Trash destination whose ancestry cannot be inspected') from error
+        if stat.S_ISLNK(mode): raise ValueError('a Trash destination through a symlink')
+    try:
+        overlap = checklist_root_overlap(path.parent) or paths_overlap(path.parent, DEFAULT_LIVE)
+    except OSError as error:
+        if unbound and error.errno in {errno.EPERM, errno.EACCES}: return True
+        raise ValueError('a Trash destination whose ancestry cannot be safely compared') from error
+    except (RuntimeError, ValueError) as error:
+        raise ValueError('a Trash destination whose ancestry cannot be safely compared') from error
+    if overlap: raise ValueError('a Trash destination into a different Checklist data root')
+    return False
+
+
 # Core reads source bytes or selects attachment bytes through these manifest fields.
 # Keep this inventory with docs/test-instances.md when adding a Core consumer.
 MANIFEST_FILE_EVIDENCE_FIELDS = frozenset({'source_capture', 'artifact_refs', 'playtest_bundle', 'acceptance_evidence'})
 
 
 def require_local_paths(database, destination, immutable=True, source_root=None,
-                        summary_source_root=None, summary_source_paths=None):
+                        summary_source_root=None, summary_source_paths=None, proof=None):
     """Read-only seed inspection. Never open a stored managed absolute path.
 
     source_root is the verified snapshot manifest's origin or the stopped source
@@ -516,15 +658,19 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                            'capture_git_provenance'], 0)
     mapping = ManagedPathMapping()
     external_bindings = ExternalBindingOverlapCache()
+    local_paths = LocalPathChecks(database.parent)
+    binding_paths = {}
+    trash_paths = {}
+    binding_bytes = 0
     summary_source_root = Path(summary_source_root) if summary_source_root is not None else None
     source_summaries = {}
     non_json = set()
     refused_value = None
 
     def decoded_json(value):
-        # Most database leaves are field names, hashes and ordinary prose. Avoid
-        # raising the same parser exception twice for every such occurrence.
-        if value in non_json or value.lstrip()[:1] not in '"{[-0123456789tfnNI': return value
+        # Only containers and strings can reveal more path values. Numeric,
+        # boolean and null leaves have no paths after decoding.
+        if not value.lstrip().startswith(('"', '{', '[')) or value in non_json: return value
         try: return json.loads(value)
         except (ValueError, TypeError):
             if len(value) <= 512 and len(non_json) < 4096: non_json.add(value)
@@ -553,13 +699,23 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         except (OSError, RuntimeError, ValueError):
             refuse(location, 'a path whose filesystem ancestry cannot be safely compared')
 
+    def remember_binding(path):
+        nonlocal binding_bytes
+        if proof is not None and local_paths.reusable and path not in binding_paths:
+            binding_bytes += len(os.fsencode(path))
+            if len(binding_paths) >= 65_536 or binding_bytes > 4_194_304:
+                local_paths.reusable = False
+            else:
+                binding_paths[path] = None
+
     def unsafe_checklist_root(path, location, managed=False):
         # CL-169 owns overlap semantics. For managed descriptors inspect only
         # directory metadata; an outside file leaf is never filesystem authority.
         candidate = path.parent if managed else path
         try:
-            if not managed: return external_bindings.overlap(candidate, location)
-            return checklist_root_overlap(candidate) or paths_overlap(candidate, DEFAULT_LIVE)
+            result = (checklist_root_overlap(candidate) or paths_overlap(candidate, DEFAULT_LIVE)) if managed else external_bindings.overlap(candidate, location)
+            if not result: remember_binding(str(candidate))
+            return result
         except (OSError, RuntimeError, ValueError) as error:
             detail = f' [filesystem errno {error.errno}]' if isinstance(error, OSError) else ''
             refuse(location, 'a path whose filesystem ancestry cannot be safely compared' + detail, str(path))
@@ -572,7 +728,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     def check_local(relative, location):
         # During create the physical copy is .seed-data. Only inspect its local
         # entries; never stat the origin descriptor or an outside link target.
-        try: contained(database.parent / relative, database.parent)
+        try: local_paths.check(str(relative))
         except ValueError: refuse(location, 'a stored file path through a symlink')
 
     def check_slot_absolute(value, location):
@@ -597,35 +753,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             # Core anchors its root by resolving only the owned parent directory.
             anchored_destination = destination.parent.resolve() / destination.name
             unbound = record_body.get('media_trash_source_root') != str(anchored_destination)
-            def components(value):
-                return tuple(unicodedata.normalize('NFD', unicodedata.normalize('NFD', part).casefold()) for part in value.parts)
-            parts = components(path)
-            roots = [LIVE, DEFAULT_LIVE, BASE]
-            for number in range(1, 5):
-                roots.extend([paths(number)['folder'], paths(number)['data']])
-            for root in roots:
-                other = components(root)
-                if parts[:len(other)] == other or other[:len(parts)] == parts:
-                    refuse(location, 'a Trash destination into a different Checklist data root', value)
-            opaque = False
-            for entry in reversed([path, *path.parents]):
-                try: mode = entry.lstat().st_mode
-                except (FileNotFoundError, NotADirectoryError): continue
-                except OSError as error:
-                    if unbound and error.errno in {errno.EPERM, errno.EACCES}:
-                        opaque = True; break
-                    refuse(location, 'a Trash destination whose ancestry cannot be inspected', value)
-                if stat.S_ISLNK(mode): refuse(location, 'a Trash destination through a symlink', value)
-            if not opaque:
-                try:
-                    overlap = checklist_root_overlap(path.parent) or paths_overlap(path.parent, DEFAULT_LIVE)
-                except OSError as error:
-                    if unbound and error.errno in {errno.EPERM, errno.EACCES}: opaque = True
-                    else: refuse(location, 'a Trash destination whose ancestry cannot be safely compared', value)
-                except (RuntimeError, ValueError):
-                    refuse(location, 'a Trash destination whose ancestry cannot be safely compared', value)
-                else:
-                    if overlap: refuse(location, 'a Trash destination into a different Checklist data root', value)
+            try: opaque = receipt_trash_opacity(path, unbound)
+            except ValueError as error: refuse(location, str(error), value)
+            if proof is not None and local_paths.reusable:
+                if len(trash_paths) >= 65_536 or trash_paths.setdefault((str(path), unbound), opaque) != opaque:
+                    local_paths.reusable = False
             # Denied ancestry is unknown history, not a passed physical guard.
             # The v2 executor repeats this root mismatch before old-target access.
             # Current-root-bound authority still fails closed.
@@ -634,11 +766,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
 
     def check_managed(value, family, location):
         if not value.startswith('/'):
-            try: relative = relative_path(value)
+            try: parts = managed_parts(value)
             except ValueError: refuse(location, 'a malformed root-relative managed path')
-            if family is not None and relative.parts[0] != family:
+            if family is not None and parts[0] != family:
                 refuse(location, 'a managed path in the wrong family')
-            check_local(relative, location)
+            check_local(value, location)
             counts['managed_relative'] += 1
             return 'managed_relative'
         path = check_absolute(value, location)
@@ -684,6 +816,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         return record_kind == 'source_capture' or '.source_capture.' in location or location.endswith('.source_capture')
 
     def policy(key, parent, location, record_kind):
+        if key not in CONTEXT_PATH_FIELDS:
+            if key in {'body', 'brief', 'reason', 'summary'} or (record_kind is not None and record_kind not in
+                    {'capture_bindings', 'storage_summary', 'backup_historical_catalog', 'backup_retention_settings'}):
+                return ('text', None)
+            return (None, None)
         capture = capture_context(location, record_kind)
         if record_kind == 'storage_job' and record_body.get('kind') == 'ticket_object_delete':
             if location == 'records.data.objects[]' and key == 'stored_path': return ('receipt_stored', None)
@@ -763,8 +900,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
             for name, child in value.items(): inspect_evidence_data(child, name)
         elif isinstance(value, list):
             for child in value: inspect_evidence_data(child, key)
-        elif isinstance(value, str) and (key in PATH_FIELDS | PATH_LIST_FIELDS | ABSOLUTE_PATH_FIELDS
-                or value.startswith('/') or re.search(r'\bfile:', value, re.IGNORECASE)):
+        elif isinstance(value, str) and (key in ALL_PATH_FIELDS
+                or value.startswith('/') or (':' in value and FILE_URL.search(value))):
             counts['inert_history_path_occurrences'] += 1
 
     def inspect(value, location, record_kind=None, rule=(None, None), inert=False):
@@ -777,23 +914,31 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                     else:
                         inspect_evidence_data(child, key)
                 return
+            binding_keys = location.endswith('.path_sha256')
             for key, child in value.items():
-                key_rule = ('binding', None) if location.endswith('.path_sha256') else (None, None)
-                inspect(key, location, record_kind, key_rule, inert)
+                if binding_keys:
+                    inspect(key, location, record_kind, ('binding', None), inert)
+                elif ':' in key or key.lstrip().startswith(('/', '"', '{', '[')):
+                    inspect(key, location, record_kind, inert=inert)
                 inspect(child, location + '.' + key, record_kind, policy(key, value, location, record_kind), inert)
         elif isinstance(value, list):
-            for child in value: inspect(child, location + '[]', record_kind, rule, inert)
+            child_location = location + '[]'
+            for child in value: inspect(child, child_location, record_kind, rule, inert)
         elif isinstance(value, str):
             kind, family = rule
-            has_file_url = re.search(r'\bfile:', value, re.IGNORECASE) is not None
             decoded = decoded_json(value)
-            if has_file_url and kind not in {None, 'text'}: refuse(location, 'a stored file URL')
-            if kind in {None, 'text'}:
+            loose = kind is None or kind == 'text'
+            if loose and decoded is not value and decoded != value:
                 # Inspect serialized payloads at their leaves, not as quoted prose.
-                if decoded != value:
-                    inspect(decoded, location, record_kind, inert=inert)
+                inspect(decoded, location, record_kind, inert=inert)
+                return
+            has_file_url = (':' in value and ('file:' in value.lower() or not value.isascii())
+                            and FILE_URL.search(value) is not None)
+            if has_file_url and not loose: refuse(location, 'a stored file URL')
+            if loose:
+                if not has_file_url and not value.startswith('/'):
                     return
-                if re.fullmatch(r'file:\S*', value.strip(), re.IGNORECASE):
+                if has_file_url and BARE_FILE_URL.fullmatch(value.strip()):
                     try:
                         url = urlsplit(value.strip())
                         if url.netloc.lower() not in {'', 'localhost'} or url.query or url.fragment or re.search(r'%(?![0-9a-fA-F]{2})', url.path):
@@ -884,12 +1029,19 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         for table in tables:
             cursor = connection.execute('SELECT * FROM "' + table.replace('"', '""') + '"')
             columns = [column[0] for column in cursor.description]
+            indexes = {column: index for index, column in enumerate(columns)}
+            type_index = indexes.get('type') if table == 'records' else None
+            data_index = indexes.get('data') if table == 'records' else None
+            key_index = indexes.get('key') if table == 'metadata' else None
+            scan_columns = [(i, column, table + '.' + column,
+                             (table, column) in {('commands', 'result'), ('events', 'data')})
+                            for i, column in enumerate(columns)]
             for row in cursor:
-                record_kind = row[columns.index('type')] if table == 'records' and 'type' in columns else None
-                record_data = decoded_json(row[columns.index('data')]) if table == 'records' and 'data' in columns else None
+                record_kind = row[type_index] if type_index is not None else None
+                record_data = decoded_json(row[data_index]) if data_index is not None else None
                 record_body = record_data if isinstance(record_data, dict) else {}
                 refused_value = None
-                metadata_key = row[columns.index('key')] if table == 'metadata' and 'key' in columns else None
+                metadata_key = row[key_index] if key_index is not None else None
                 if metadata_key == 'managed-capture-paths-v3': record_kind = 'capture_bindings'
                 if metadata_key is not None and metadata_key.startswith('backup-historical-catalog:'):
                     record_kind = 'backup_historical_catalog'
@@ -898,12 +1050,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                 # top-level copy/source observations; other fields stay strict.
                 if metadata_key is not None and metadata_key.startswith('storage-last-verified-'):
                     record_kind = 'storage_summary'
-                for column, value in zip(columns, row):
-                    if table == 'records' and column == 'data': value = record_data
-                    inert = (table == 'commands' and column == 'result') or (table == 'events' and column == 'data')
+                for index, column, location, inert in scan_columns:
+                    value = record_data if index == data_index else row[index]
                     if column == 'value' and metadata_key is not None and (metadata_key in {'preupgrade_snapshot', 'backup-protected-history', 'backup-automatic-prune-last'} or metadata_key.startswith(('backup-pruned:', 'backup-generation:', 'backup-automatic-prune-fenced:'))):
                         inert = 'metadata'
-                    try: inspect(value, table + '.' + column, record_kind, policy(column, {}, table, record_kind), inert)
+                    try: inspect(value, location, record_kind, policy(column, {}, table, record_kind), inert)
                     except ValueError as error:
                         # CL-424: name the record kind, never the value, so that a refusal shows its cause.
                         if table != 'records' or record_kind is None: raise
@@ -934,10 +1085,18 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         try: external_bindings.revalidate()
         except (OSError, RuntimeError, ValueError) as error:
             refuse('external binding release', str(error))
+        try: checked_directories = local_paths.finish()
+        except (OSError, RuntimeError, ValueError):
+            refuse('local path release', 'a local directory that changed during inspection')
     except (UnicodeError, RecursionError) as error:
         raise ValueError('Seed values cannot be safely inspected. ' + RELOCATION_REQUIRED) from error
     finally:
+        local_paths.close()
         connection.close()
+    if proof is not None and local_paths.reusable:
+        proof.update(directories=checked_directories, bindings=list(binding_paths),
+                     aliases={str(path): parts for path, parts in mapping.directories.items()},
+                     trash=[(path, unbound, opaque) for (path, unbound), opaque in trash_paths.items()])
     if source_summaries: counts['source_summary_paths'] = source_summaries
     counts.update(external_overlap_cache_entries=len(external_bindings.entries),
                   external_overlap_cache_hits=external_bindings.hits,
@@ -945,6 +1104,153 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
                   external_overlap_cache_payload_bytes=external_bindings.payload_bytes,
                   external_bindings_changed_since_inspection=external_bindings.changed_since_inspection)
     return counts
+
+
+SEED_PATH_PROOF = 'seed-path-proof.json'
+MAX_SEED_PROOF_BYTES = 16 * 1024 * 1024
+
+
+def seed_store_files(database, *, hash_bytes=False):
+    """Fingerprint the exact named database and WAL without following a leaf link."""
+    journal = database.with_name(database.name + '-journal')
+    try: journal.lstat()
+    except FileNotFoundError: pass
+    else: raise ValueError('Seed has a rollback journal.')
+    files = {}
+    for suffix in ('', '-wal'):
+        path = database.with_name(database.name + suffix)
+        try: info = path.lstat()
+        except FileNotFoundError:
+            if not suffix: raise
+            files[suffix] = None
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('Seed database and WAL must be regular files.')
+        stamp = file_stamp(info)
+        entry = {'stamp': list(stamp)}
+        if hash_bytes:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            with os.fdopen(descriptor, 'rb') as source:
+                if file_stamp(os.fstat(descriptor)) != stamp:
+                    raise ValueError('Seed database or WAL changed before hashing.')
+                entry['sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
+                if file_stamp(os.fstat(descriptor)) != stamp or file_stamp(path.lstat()) != stamp:
+                    raise ValueError('Seed database or WAL changed while hashing.')
+        files[suffix] = entry
+    if hash_bytes and seed_store_files(database) != seed_file_stamps(files):
+        raise ValueError('Seed database or WAL changed while hashing.')
+    return files
+
+
+def seed_file_stamps(files):
+    return {suffix: None if entry is None else {'stamp': entry['stamp']} for suffix, entry in files.items()}
+
+
+def inspect_seed_database(database, destination, *, proof=None, immutable=True, source_root=None,
+                          summary_source_root=None):
+    # A stopped slot copy may retain a cold rollback journal. Leave its
+    # interpretation to SQLite and use a full scan on subsequent starts.
+    if proof is not None and not immutable and os.path.lexists(database.with_name(database.name + '-journal')):
+        proof = None
+    before = seed_store_files(database) if proof is not None else None
+    if before is not None and immutable and before['-wal'] is not None:
+        raise ValueError('An immutable seed must have no WAL.')
+    inspection = require_local_paths(database, destination, immutable=immutable, source_root=source_root,
+                                     summary_source_root=summary_source_root, proof=proof)
+    if proof:
+        files = seed_store_files(database, hash_bytes=True)
+        if before != seed_file_stamps(files):
+            raise ValueError('Seed database or WAL changed during path inspection.')
+        proof['files'] = files
+    return inspection
+
+
+def seed_proof_context(p, metadata, summary_source_root):
+    seed = metadata['seed']
+    return {'format': 1, 'destination': str(p['data']), 'live': str(LIVE), 'default_live': str(DEFAULT_LIVE),
+            'base': str(BASE), 'build': metadata['source_fingerprint'], 'source_root': seed.get('source_root'),
+            'summary_source_root': summary_source_root, 'source_summary_paths': seed.get('source_summary_paths', {}),
+            'inspection': seed['path_inspection']}
+
+
+def record_seed_path_proof(p, metadata, proof, session):
+    # Publishing .seed-data as data changes the directory's ctime, not its
+    # contents. Bind the final name only if it still names the inspected tree.
+    root = p['data']
+    directories = proof['directories']
+    for name, stamp in directories.items():
+        current = file_stamp((root / name).lstat())
+        if (current if name else current[:-1]) != (stamp if name else stamp[:-1]):
+            return
+    if '' in directories:
+        directories[''] = file_stamp(root.lstat())
+    if seed_store_files(root / 'checklist.sqlite') != seed_file_stamps(proof['files']):
+        return
+    seed = metadata['seed']
+    summary_source_root = seed.get('source_root') if seed.get('live_snapshot') else None
+    proof.update(context=seed_proof_context(p, metadata, summary_source_root), session=session)
+    raw = json.dumps(proof, separators=(',', ':')).encode()
+    if len(raw) > MAX_SEED_PROOF_BYTES:
+        return
+    target = contained(p['folder'] / SEED_PATH_PROOF, p['folder'])
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(raw)
+    metadata['seed_path_proof_sha256'] = hashlib.sha256(raw).hexdigest()
+
+
+def revalidate_seed_paths(root, proof):
+    mapping = ManagedPathMapping()
+    if any(list(mapping.components(path)) != parts for path, parts in proof['aliases'].items()):
+        return False
+    bindings = ExternalBindingOverlapCache()
+    for value in proof['bindings']:
+        path = Path(value)
+        before = bindings.named_identity(path)
+        if bindings.full_overlap(path) or bindings.named_identity(path) != before:
+            return False
+    for path, unbound, opaque in proof['trash']:
+        if receipt_trash_opacity(Path(path), unbound) != opaque:
+            return False
+    contained(root, root)
+    return all(list(file_stamp((root / name).lstat())) == stamp for name, stamp in proof['directories'].items())
+
+
+def reusable_seed_inspection(p, metadata, summary_source_root):
+    expected = metadata.get('seed_path_proof_sha256')
+    if not expected or metadata['mode'] != 'stopped':
+        return None
+    try:
+        session = caller_session()
+        marker = read_marker(p['folder'])
+        if (not marker or marker['released'] or marker['session_id'] != session
+                or marker.get('source_fingerprint') != metadata['source_fingerprint']):
+            return None
+        stopped(p)
+        target = contained(p['folder'] / SEED_PATH_PROOF, p['folder'])
+        descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return None
+            raw = source.read(MAX_SEED_PROOF_BYTES + 1)
+        if len(raw) > MAX_SEED_PROOF_BYTES or hashlib.sha256(raw).hexdigest() != expected:
+            return None
+        proof = json.loads(raw)
+        if proof['session'] != session or proof['context'] != seed_proof_context(p, metadata, summary_source_root):
+            return None
+        root = contained(p['data'], p['folder'])
+        database = root / 'checklist.sqlite'
+        stamps = seed_file_stamps(proof['files'])
+        if seed_store_files(database) != stamps:
+            return None
+        if seed_store_files(database, hash_bytes=True) != proof['files']:
+            return None
+        if not revalidate_seed_paths(root, proof) or seed_store_files(database) != stamps:
+            return None
+        stopped(p)
+    except (OSError, RuntimeError, TypeError, KeyError, ValueError, subprocess.SubprocessError):
+        return None
+    return metadata['seed']['path_inspection']
 
 
 def snapshot_objects(manifest):
@@ -1029,21 +1335,10 @@ class SeedFileTree:
             os.close(self.descriptor)
 
     def directory(self, parts, create=False):
-        descriptor = os.dup(self.descriptor)
         try:
-            for part in parts:
-                if create:
-                    try: os.mkdir(part, mode=0o700, dir_fd=descriptor)
-                    except FileExistsError: pass
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                                dir_fd=descriptor)
-                os.close(descriptor); descriptor = child
-            return descriptor
-        except BaseException as error:
-            os.close(descriptor)
-            if isinstance(error, OSError):
-                raise ValueError('Seed directory is unavailable or redirects through a link: ' + '/'.join(parts)) from error
-            raise
+            return open_seed_directory(self.descriptor, parts, create)
+        except OSError as error:
+            raise ValueError('Seed directory is unavailable or redirects through a link: ' + '/'.join(parts)) from error
 
     def parent(self, relative, create=False):
         path = PurePosixPath(relative)
@@ -1158,7 +1453,13 @@ def copy_snapshot_files(source, destination, entries):
         seed_file_work(entries, copy)
 
 
-def snapshot_seed(source, destination, destination_root=None, current_schema=None):
+def private_seed_copy(destination):
+    # A refused copy remains in its caller's owned scratch. Publish into the
+    # requested (empty) destination with one rename after all checks pass.
+    return Path(tempfile.mkdtemp(prefix='.inspecting-seed-', dir=destination.parent))
+
+
+def snapshot_seed(source, destination, destination_root=None, current_schema=None, *, proof=None):
     """current_schema is the staged build's (create passes it); the default reads this source tree."""
     if current_schema is None: current_schema = storage_schema(REPO / SCHEMA_SOURCE)
     timing = PhaseTimings('snapshot_seed')
@@ -1247,32 +1548,31 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
             raise ValueError('Snapshot canonical family counts mismatch.')
     if 'tableRows' in manifest and manifest['tableRows'] != observation['table_rows']:
         raise ValueError('Snapshot table counts mismatch.')
-    timing.start('source_path_inspection')
     live_snapshot = is_live_snapshot(source, manifest['sourceRoot'])
     summary_source_root = manifest['sourceRoot'] if live_snapshot else None
-    inspection = require_local_paths(source / 'database.sqlite', destination_root or destination,
-                                     source_root=manifest['sourceRoot'], summary_source_root=summary_source_root)
-    source_summary_paths = inspection.pop('source_summary_paths', {})
-    # Verification finishes before any source byte is used in the new store.
+    # Only verified bytes enter the unpublished copy. Check path authority there
+    # after materializing managed links, where the service will actually use it.
     timing.start('materialization_and_verification')
-    copy_snapshot_files(source, destination, regular)
+    working = private_seed_copy(destination)
+    copy_snapshot_files(source, working, regular)
     for name, digest, size, descriptor in entries[1:]:
         if descriptor['kind'] != 'symlink': continue
-        target = destination / descriptor['relativePath']
-        contained(target.parent, destination)
+        target = working / descriptor['relativePath']
+        contained(target.parent, working)
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if descriptor['kind'] == 'symlink':
             target.symlink_to(descriptor['linkTarget'])
-    timing.start('destination_path_inspection')
-    require_local_paths(destination / 'checklist.sqlite', destination_root or destination,
-                        source_root=manifest['sourceRoot'], summary_source_root=summary_source_root,
-                        summary_source_paths=source_summary_paths)
     if observation['schema'] > 0:
         identity = observation['identity']
         if not identity or identity['logical_store_id'] != manifest['storeID'] or identity['state'] != 'ready':
             raise ValueError('Snapshot database identity mismatch.')
-        (destination / 'checklist-store.identity.json').write_text(json.dumps(identity, sort_keys=True) + '\n')
-        (destination / 'checklist-store.identity.json').chmod(0o600)
+        (working / 'checklist-store.identity.json').write_text(json.dumps(identity, sort_keys=True) + '\n')
+        (working / 'checklist-store.identity.json').chmod(0o600)
+    timing.start('destination_path_inspection')
+    inspection = inspect_seed_database(working / 'checklist.sqlite', destination_root or destination, proof=proof,
+                                       source_root=manifest['sourceRoot'], summary_source_root=summary_source_root)
+    source_summary_paths = inspection.pop('source_summary_paths', {})
+    working.rename(destination)
     age = max(0, time.time() - manifest_file.stat().st_mtime)
     print(f'Snapshot age: {age / 86400:.2f} days; schema {observation["schema"]}; quick_check {observation["quick_check"]}')
     return {'kind': 'backup', 'source': str(source), 'source_hash': hashlib.sha256(raw).hexdigest(),
@@ -1360,7 +1660,7 @@ def restored_source_manifest(source, receipt, schema):
     return None, str(source)  # Preserve strict admission for self-contained legacy candidates.
 
 
-def restored_seed(source, destination, destination_root=None, current_schema=None):
+def restored_seed(source, destination, destination_root=None, current_schema=None, *, proof=None):
     """current_schema is the staged build's (create passes it); the default reads this source tree."""
     if current_schema is None: current_schema = storage_schema(REPO / SCHEMA_SOURCE)
     source = source.expanduser().absolute()
@@ -1411,14 +1711,14 @@ def restored_seed(source, destination, destination_root=None, current_schema=Non
     # Display-only summaries get the backup: seed's exception only from a live-origin snapshot.
     live_snapshot = source_manifest is not None and is_live_snapshot(source_manifest.parent, source_root)
     summary_source_root = source_root if live_snapshot else None
-    inspection = require_local_paths(database, destination_root or destination, source_root=source_root,
-                                     summary_source_root=summary_source_root)
-    source_summary_paths = inspection.pop('source_summary_paths', {})
-    shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
-    if restored_inventory(destination) != before or restored_inventory(source) != before:
+    working = private_seed_copy(destination)
+    shutil.copytree(source, working, symlinks=True, dirs_exist_ok=True)
+    if restored_inventory(working) != before or restored_inventory(source) != before:
         raise ValueError('Restored root copy verification failed or source changed.')
-    require_local_paths(destination / 'checklist.sqlite', destination_root or destination, source_root=source_root,
-                        summary_source_root=summary_source_root, summary_source_paths=source_summary_paths)
+    inspection = inspect_seed_database(working / 'checklist.sqlite', destination_root or destination, proof=proof,
+                                       source_root=source_root, summary_source_root=summary_source_root)
+    source_summary_paths = inspection.pop('source_summary_paths', {})
+    working.rename(destination)
     return {'kind': 'restored', 'source': str(source), 'source_root': source_root,
             'source_manifest': str(source_manifest) if source_manifest is not None else None, 'live_snapshot': live_snapshot,
             'source_summary_paths': source_summary_paths,
@@ -1430,7 +1730,7 @@ def restored_seed(source, destination, destination_root=None, current_schema=Non
             'current_schema_no_migration': observation['schema'] == current_schema}
 
 
-def slot_seed(other, destination, destination_root=None):
+def slot_seed(other, destination, destination_root=None, *, proof=None):
     stopped(other)
     metadata = load(other)
     source = contained(other['data'], other['folder'])
@@ -1447,7 +1747,8 @@ def slot_seed(other, destination, destination_root=None):
                 raise ValueError('Source slot contains a special file.')
     shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True,
                     ignore=lambda folder, names: {'connections.json', 'OwnerPrivate'} if Path(folder) == source else set())
-    inspection = require_local_paths(destination / 'checklist.sqlite', destination_root or destination, immutable=False, source_root=source)
+    inspection = inspect_seed_database(destination / 'checklist.sqlite', destination_root or destination, proof=proof,
+                                       immutable=False, source_root=source)
     inventory = [(str(file.relative_to(destination)), os.readlink(file) if file.is_symlink() else sha(file))
                  for file in sorted(destination.rglob('*')) if file.is_file() or file.is_symlink()]
     return {'kind': 'slot', 'slot': metadata['slot'], 'source_build_id': metadata['build_id'],
@@ -1511,13 +1812,14 @@ def create(arguments, p):
     validate_fingerprint(manifest['source_fingerprint'])
     with ExitStack() as preparation:
         prepared = None
+        path_proof = {}
         if arguments.seed.startswith('restored:'):
             current_schema = require_managed_path_support(capture, manifest)
             # Keep the verified copy outside the replaced folder. Its source may
             # be that slot's own restore/ candidate; replacement must happen last.
             temporary = preparation.enter_context(tempfile.TemporaryDirectory(prefix='.restored-seed-', dir=BASE))
             prepared = Path(temporary) / 'data'; prepared.mkdir(mode=0o700)
-            restored = restored_seed(Path(arguments.seed[9:]), prepared, p['data'], current_schema)
+            restored = restored_seed(Path(arguments.seed[9:]), prepared, p['data'], current_schema, proof=path_proof)
         if p['folder'].exists(): destroy(p)
         p['folder'].mkdir(mode=0o700)
         mark_qualification(p['folder'], manifest['source_fingerprint'],
@@ -1536,11 +1838,11 @@ def create(arguments, p):
             if prepared is not None:
                 seed = restored
             elif arguments.seed == 'latest-backup':
-                seed = snapshot_seed(latest_backup(), pending, p['data'], current_schema)
+                seed = snapshot_seed(latest_backup(), pending, p['data'], current_schema, proof=path_proof)
             elif arguments.seed.startswith('backup:'):
-                seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'], current_schema)
+                seed = snapshot_seed(Path(arguments.seed[7:]), pending, p['data'], current_schema, proof=path_proof)
             elif arguments.seed.startswith('slot:'):
-                seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'])
+                seed = slot_seed(checked(slot_number(arguments.seed[5:])), pending, p['data'], proof=path_proof)
             elif arguments.seed != 'empty': raise ValueError('Seed must be empty, latest-backup, backup:PATH, restored:PATH or slot:M.')
             require_receipt_path_support(capture, manifest, seed.get('path_inspection', {}))
         except (ValueError, OSError, sqlite3.Error) as error:
@@ -1548,8 +1850,12 @@ def create(arguments, p):
             save(p, metadata)
             raise
         # Neither the service root nor an executable app is published for a refused seed.
-        timing.start('bundle_copy_and_sign')
         pending.rename(p['data'])
+        metadata['seed'] = seed
+        if path_proof:
+            timing.start('record_seed_path_proof')
+            record_seed_path_proof(p, metadata, path_proof, session)
+        timing.start('bundle_copy_and_sign')
         run(['ditto', capture / 'Checklist.app', p['bundle']])
         info_file = p['bundle'] / 'Contents/Info.plist'
         info_file.write_bytes(plistlib.dumps(rewrite_info(plistlib.loads(info_file.read_bytes()), arguments.slot)))
@@ -1747,8 +2053,15 @@ def start(arguments, p):
             seed['kind'] == 'restored' and seed.get('source_manifest') is not None
             and is_live_snapshot(Path(seed['source_manifest']).parent, seed.get('source_root')))
         summary_source_root = seed.get('source_root') if source_summaries else None
-        inspection = require_local_paths(p['data'] / 'checklist.sqlite', p['data'], immutable=False, source_root=seed.get('source_root'),
-                                         summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
+        timing.start('seed_path_preflight')
+        database = contained(p['data'] / 'checklist.sqlite', p['folder'])
+        for suffix in ('-wal', '-shm', '-journal'):
+            contained(database.with_name(database.name + suffix), p['folder'])
+        inspection = reusable_seed_inspection(p, metadata, summary_source_root)
+        metadata['start_path_inspection'] = 'reused' if inspection is not None else 'full'
+        if inspection is None:
+            inspection = require_local_paths(database, p['data'], immutable=False, source_root=seed.get('source_root'),
+                                             summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
         require_receipt_path_support(Path(metadata['stage_path']), manifest, inspection)
     logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)
     plist = contained(p['folder'] / 'service.plist', p['folder'])

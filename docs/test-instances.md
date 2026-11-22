@@ -41,21 +41,47 @@ Ignored files stay until a later save replaces them. Deleting one does not undo 
 
 The harness resolves the live root from nonempty `CHECKLIST_DATA_ROOT`, otherwise `~/Library/Application Support/Checklist`, for backup lookup, read restrictions and provenance. Test roots remain fixed. Every slot command refuses if that effective live root canonically equals, contains or lies inside the slot folder or data root; all involved slots are admitted before any action, including replacement, slot-copy seeds and promotion evidence. Comparisons resolve symlinks and use whole path components, so sibling names remain distinct. The runtime also refuses test startup when its data root overlaps the effective live root, and refuses a live `CHECKLIST_DATA_ROOT` that equals, contains or lies inside the reserved test tree. Default live values remain unchanged. Only verified snapshots in that live root’s published `backups/` directory count toward promotion.
 
-A single seed/start path-inspection pass may reuse an exact external binding's
-successful filesystem-overlap check. Every occurrence still runs its lexical and
-field-policy checks and increments its original count. The cache holds at most
-2,048 entries and 1 MiB of encoded path/location/digest payload; larger inputs
-use the original guard. Python entry overhead is separately bounded by the entry
-limit. Before returning, the pass reads each cached path's named device/inode,
-file type and lexical/canonical ancestor identities, repeats both full overlap
-guards against the current Checklist roots, and reads identity again. An overlap,
-or an identity change between those two readings, refuses the pass. An identity
-that differs from the inspection-time reading does not refuse: an external binding
-names a file of another, active project, an editor save replaces its inode, and a
-seed inspection can take 50 minutes at high load (21 Nov 2026). The pass reports
-those paths as `external_bindings_changed_since_inspection`. Managed paths and file
-checks are never cached this way. Source, destination and later startup each use a
-separate cache.
+Create runs one read-only path inspection on the unpublished destination.
+Snapshot and restored seeds verify their inventories and copied bytes first.
+The pass checks the actual local tree after materializing managed links. A
+refusal leaves the requested destination and app unpublished. The pass batches
+local no-symlink checks by directory and validates the directory observations
+before returning. Inert history that carries no file authority needs no
+filesystem lookup. Standalone file URLs still require the slot-containment check.
+
+The external-binding cache holds up to 2,048 exact paths and 1 MiB of encoded
+path, location and digest data. Every occurrence still runs the lexical and
+field-policy checks. Before releasing a cached path, the pass reads its named
+identity, repeats both overlap guards against the current Checklist roots and
+reads the identity again. An overlap or a change during those guards refuses.
+A stable replacement such as an editor save passes the same guards and counts
+toward `external_bindings_changed_since_inspection`.
+
+The stopped slot's owner can reuse the create inspection at start. Create saves
+the database and WAL's device, inode, size, timestamps and SHA-256, including
+whether the WAL was absent. The proof also records checked local directories
+and the alias, binding and Trash checks that depend on the current filesystem.
+It lives in a private file and `slot.json` records its digest. Start checks the
+active owner marker, confirms no slot job or process exists, revalidates those
+filesystem checks and matches the database and WAL fingerprints. If any check
+fails, the usual full inspection runs before launch. Older slots, starts
+from another session and copies with a retained rollback journal also run the
+full inspection. `slot.json` records
+`start_path_inspection` as `reused` or `full` after a successful start.
+
+The 21 Nov 2026 live-backup check took 2 h 35 min at load 500–850. The source,
+destination and start inspections took 2,647 s, 2,693 s and 3,815 s. On 22 Nov
+the old inspector scanned the 2.88 GB slot 3 database in 2,589 s at one-minute
+load 670 to 616. The new inspector scanned it in 266 s at load 650 to 693.
+Both counted 3,054,388 managed
+relative paths and 14,962 external binding occurrences. Revalidating its
+filesystem proof took 44 s. Hashing the database took 5.5 s per read
+(one-minute load 693–708 during the latter measurements). Adding the one scan,
+proof revalidation and two hash reads to the earlier three minutes of copy,
+verification, launch and check work gives an estimated 8 min 22 s for a
+current-schema seed. The new measurements used the stopped database read-only
+with SQLite's immutable mode. An exact-stage slot run measures the full
+create, start and check sequence.
 
 The shared Python helpers are `paths_overlap(a, b) -> bool` and `checklist_root_overlap(path, exclude=()) -> str | None`. Root lookup checks `live`, each `slot-N` data root and folder in numerical order, then `test-base`, returning the first non-excluded label. Slot admission excludes its own label and `test-base`; a live or another-slot overlap refuses. Swift uses the same path rule: existing equal/ancestor paths are identified by `(st_dev, st_ino)`; remaining comparisons use the deepest existing ancestor's canonical on-disk spelling (`F_GETPATH` on macOS), with symlinks resolved even for missing tails. Components are NFD-normalized and case-folded, treating every volume as case-insensitive to fail closed. Comparisons never use string prefixes. The shared vectors in `Tests/Fixtures/path-overlap-vectors.json` cover filesystem aliases and missing paths in both languages.
 

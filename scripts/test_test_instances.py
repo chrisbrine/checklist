@@ -729,24 +729,38 @@ class ExternalBindingOverlapCacheTests(unittest.TestCase):
             self.assertEqual(counts['external_overlap_filesystem_checks'], 2)
             self.assertEqual(check.call_count, 2)
 
-    def test_late_binding_replacement_refuses_and_new_invocation_has_no_cache(self):
+    def test_late_binding_replacement_is_rechecked_and_new_invocation_has_no_cache(self):
         with self.fixture() as (base, external):
             cached = harness.ExternalBindingOverlapCache();self.assertFalse(cached.overlap(external, 'fixture'))
             external.rename(external.with_name('previous'));external.mkdir()
             self.assertFalse(cached.overlap(external, 'fixture'))
-            with self.assertRaisesRegex(ValueError, 'named ancestry changed'): cached.revalidate()
+            cached.revalidate()
+            self.assertEqual(cached.changed_since_inspection, 1)
             fresh = harness.ExternalBindingOverlapCache()
             self.assertFalse(fresh.overlap(external, 'new invocation'));fresh.revalidate()
             self.assertEqual(fresh.filesystem_checks, 2)
 
-    def test_late_ancestor_replacement_refuses_even_when_leaf_inode_is_preserved(self):
+    def test_late_ancestor_replacement_is_rechecked_even_when_leaf_inode_is_preserved(self):
         with self.fixture() as (base, external):
             cached = harness.ExternalBindingOverlapCache();cached.overlap(external, 'fixture')
             leaf_identity = external.stat().st_ino
             parent = external.parent;previous = parent.with_name('previous-projects')
             parent.rename(previous);parent.mkdir();(previous / external.name).rename(external)
             self.assertEqual(external.stat().st_ino, leaf_identity)
-            with self.assertRaisesRegex(ValueError, 'named ancestry changed'): cached.revalidate()
+            cached.revalidate()
+            self.assertEqual(cached.changed_since_inspection, 1)
+
+    def test_binding_that_changes_during_release_refuses(self):
+        with self.fixture() as (_, external):
+            cached = harness.ExternalBindingOverlapCache();cached.overlap(external, 'fixture')
+            def replace_during_check(path):
+                result = full_overlap(path)
+                external.rename(external.with_name('previous'));external.mkdir()
+                return result
+            full_overlap = cached.full_overlap
+            with patch.object(cached, 'full_overlap', side_effect=replace_during_check), \
+                 self.assertRaisesRegex(ValueError, 'named ancestry changed during release'):
+                cached.revalidate()
 
     def test_changed_checklist_roots_are_rechecked_at_release_and_in_new_invocations(self):
         with self.fixture() as (base, external):
@@ -780,6 +794,107 @@ class ExternalBindingOverlapCacheTests(unittest.TestCase):
                 counts = harness.require_local_paths(database, base / 'destination')
             self.assertEqual(counts['managed_unavailable_absolute'], 2)
             self.assertEqual(counts['external_overlap_cache_entries'], 0)
+
+
+@unittest.skipUnless(os.environ.get('CHECKLIST_TEST_INSPECTION_BASE'),
+                     'set CHECKLIST_TEST_INSPECTION_BASE to the pre-CL-515 test_instances.py')
+class SeedInspectionDifferentialTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = Path(os.environ['CHECKLIST_TEST_INSPECTION_BASE'])
+        baseline = importlib.util.spec_from_file_location('baseline_test_instances', path)
+        cls.baseline = importlib.util.module_from_spec(baseline)
+        baseline.loader.exec_module(cls.baseline)
+
+    def decision(self, implementation, database, destination, live, slots):
+        with patch.multiple(implementation, LIVE=live, DEFAULT_LIVE=live, BASE=slots):
+            try:
+                return 'allowed', implementation.require_local_paths(database, destination, source_root=live)
+            except ValueError as error:
+                return 'refused', str(error)
+
+    def test_seed_decisions_and_exact_counts(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            live, slots, external = base / 'Café', base / 'slots', base / 'projects'
+            destination, other = slots / 'slot-1/data', slots / 'slot-2/data'
+            for path in [live / 'objects', other / 'objects', destination / 'objects', external]:
+                path.mkdir(parents=True)
+            (destination / 'objects/leaf').symlink_to(live / 'objects/missing')
+            (destination / 'objects/répertoire').symlink_to(live / 'objects')
+            (external / 'redirect').symlink_to(other)
+            normalized = Path(unicodedata.normalize('NFD', str(live)))
+            variants = [destination, other / 'objects/missing', live, live.parent, normalized,
+                        live.with_name(live.name.upper()), external / 'redirect/missing', external / 'ordinary']
+            firmlink = Path('/System/Volumes/Data' + str(live))
+            if sys.platform == 'darwin' and firmlink.exists():
+                variants.append(firmlink / 'objects/missing')
+            cases = []
+            for path in variants:
+                cases.extend([
+                    ('binding', [('project', {'id': 'project', 'root_path': str(path)})]),
+                    ('managed absolute', [('attachment', attachment(path))]),
+                    ('file URL', [('task', {'id': 'task', 'body': path.as_uri()})]),
+                ])
+            for value in ['objects/file', 'objects/missing/deep/file', 'objects/leaf', 'objects/LEAF',
+                          'objects/' + unicodedata.normalize('NFD', 'répertoire') + '/file',
+                          'objects/../outside', 'objects//file', 'icons/file', 'file:///outside/x',
+                          'objects/contains-file:name', 'objects/contains-FİLE:name']:
+                cases.append(('managed relative', [('attachment', attachment(value))]))
+            for value in ['folder/file', '../escape', 'file:///outside/x', 'name//file']:
+                cases.append(('capture', [('source_capture', {'id': 'capture', 'files': [{'path': value}]})]))
+            cases.extend([
+                ('inert manifest evidence', [('manifest', {'id': 'evidence', 'evidence': {
+                    'notes': {'path': str(live), 'body': live.as_uri()}}})]),
+                ('encoded path', [('task', {'id': 'task', 'body': json.dumps({'path': str(other)})})]),
+                ('mixed accepted counts', [('attachment', attachment('objects/file')),
+                    ('attachment', dict(attachment('objects/missing'), id='second')),
+                    ('task', {'id': 'task', 'body': 'prefix FILE:///outside for display'}),
+                    ('source_capture', {'id': 'capture', 'files': [{'path': 'folder/file'}]}),
+                    ('project', {'id': 'first-project', 'root_path': str(external)}),
+                    ('project', {'id': 'second-project', 'root_path': str(external)})]),
+            ])
+            decisions = set()
+            for number, (label, records) in enumerate(cases):
+                with self.subTest(label=label, number=number):
+                    database = destination / f'fixture-{number}.sqlite'
+                    store_fixture(database, 2, records)
+                    with closing(sqlite3.connect(database)) as db, db:
+                        db.create_collation('checklist_storage_v2', lambda a, b: (a > b) - (a < b))
+                        db.execute('INSERT INTO commands VALUES (?, ?, ?, ?)',
+                                   ('fixture', 'fixture', 'fixture', json.dumps({'path': str(live)})))
+                    expected = self.decision(self.baseline, database, destination, live, slots)
+                    decisions.add(expected[0])
+                    self.assertEqual(self.decision(harness, database, destination, live, slots), expected)
+            self.assertEqual(decisions, {'allowed', 'refused'})
+
+    def test_replaced_leaf_is_rechecked_at_release(self):
+        for redirects in [False, True]:
+            with self.subTest(redirects=redirects), test_directory() as directory:
+                base = Path(directory).resolve()
+                live, slots = base / 'live', base / 'slots'
+                live.mkdir()
+                decisions = []
+                project = base / 'external'
+                for number, implementation in enumerate([self.baseline, harness]):
+                    project.mkdir()
+                    leaf = project / 'current'
+                    leaf.write_text('before')
+                    database = project / 'fixture.sqlite'
+                    records = [('project', {'id': 'project-' + str(i), 'root_path': str(leaf)}) for i in range(3)]
+                    store_fixture(database, 2, records)
+                    release = implementation.ExternalBindingOverlapCache.revalidate
+                    def replace(cache):
+                        leaf.rename(leaf.with_name('previous'))
+                        if redirects: leaf.symlink_to(live)
+                        else: leaf.write_text('after')
+                        release(cache)
+                    with patch.object(implementation.ExternalBindingOverlapCache, 'revalidate', replace):
+                        decisions.append(self.decision(implementation, database, slots / 'slot-1/data', live, slots))
+                    project.rename(base / f'inspected-{number}')
+                self.assertEqual(*decisions)
+                if redirects: self.assertEqual(decisions[0][0], 'refused')
+                else: self.assertEqual(decisions[0][1]['external_bindings_changed_since_inspection'], 1)
 
 
 class SnapshotLogicTests(unittest.TestCase):
@@ -1315,10 +1430,12 @@ class RestoredSeedTests(unittest.TestCase):
             copytree = harness.shutil.copytree
             def corrupt(*args, **kwargs):
                 result = copytree(*args, **kwargs)
-                (destination / 'objects/file').write_bytes(b'changed')
+                managed = Path(result) / 'objects/file'
+                if managed.is_file(): managed.write_bytes(b'changed')
                 return result
             with patch.object(harness.shutil, 'copytree', side_effect=corrupt):
                 with self.assertRaisesRegex(ValueError, 'copy verification'): harness.restored_seed(source, destination)
+            self.assertEqual(list(destination.iterdir()), [])
 
     def test_existing_path_checks_still_apply(self):
         with test_directory() as directory:
@@ -2969,6 +3086,147 @@ class SlotRelayTests(unittest.TestCase):
                     value = json.loads(output.getvalue())[0] if options else json.loads(output.getvalue().removeprefix('Slot 4: '))
                     self.assertEqual(value['slot_relays'], mode)
                     self.assertEqual(value['allow_synthetic_relays'], mode == 'synthetic')
+
+
+class SeedPathReuseTests(unittest.TestCase):
+    @contextmanager
+    def created_slot(self, retained=None):
+        with test_directory() as directory, ExitStack() as stack:
+            base = Path(directory).resolve()
+            slots, live, external = base / 'slots', base / 'live', base / 'external'
+            slots.mkdir();live.mkdir();external.write_text('outside')
+            records = [('attachment', attachment('objects/file')),
+                       ('project', {'id': 'project', 'root_path': str(external)})]
+            if retained:
+                source_data = slots / 'slot-2/data'
+                (source_data / 'objects').mkdir(parents=True)
+                (source_data / 'objects/file').write_text('managed')
+                source = source_data / 'checklist.sqlite'
+                store_fixture(source, 2, records)
+                writer = stack.enter_context(closing(sqlite3.connect(source)))
+                writer.create_collation('checklist_storage_v2', lambda a, b: (a > b) - (a < b))
+                if retained == 'wal':
+                    writer.execute('PRAGMA journal_mode=WAL')
+                    writer.execute('PRAGMA wal_autocheckpoint=0')
+                else:
+                    writer.execute('PRAGMA journal_mode=PERSIST')
+                with writer:
+                    writer.execute('INSERT INTO metadata VALUES (?, ?)', ('retained', retained))
+                seed = 'slot:2'
+            else:
+                source, _, _ = SnapshotLogicTests().fixture(base, schema=2, records=records)
+                seed = 'backup:' + str(source)
+            stage = base / 'stage'
+            manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64, 'signing_profile': 'ad-hoc'}
+            launch = {'registered': False}
+            commands = []
+            def run(command, **kwargs):
+                commands.append(command)
+                if command[0] == 'ditto':
+                    contents = command[2] / 'Contents'
+                    contents.mkdir(parents=True)
+                    (contents / 'Info.plist').write_bytes(plistlib.dumps({}))
+                return subprocess.CompletedProcess(command, 0, '', '')
+            for context in [patch.multiple(harness, BASE=slots, LIVE=live, DEFAULT_LIVE=live),
+                            patch.dict(os.environ, CODEX_THREAD_ID='slot-fixture'),
+                            patch.object(harness, 'stage_selection', return_value=(stage, manifest)),
+                            patch.object(harness, 'sign_identity', return_value='-'),
+                            patch.object(harness, 'require_managed_path_support', return_value=4),
+                            patch.object(harness, 'bundle_check', return_value=manifest),
+                            patch.object(harness, 'signing_teams'), patch.object(harness, 'service_status'),
+                            patch.object(harness, 'launch_state', return_value=launch),
+                            patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}),
+                            patch.object(harness, 'run', side_effect=run), redirect_stdout(io.StringIO())]:
+                stack.enter_context(context)
+            scan = stack.enter_context(patch.object(harness, 'require_local_paths', wraps=harness.require_local_paths))
+            p = harness.checked(1)
+            if retained: harness.save(harness.checked(2), {'slot': 2, 'build_id': 'fixture'})
+            create = SimpleNamespace(slot=1, replace=False, seed=seed)
+            harness.create(create, p)
+            self.assertEqual(scan.call_count, 1)
+            proof_file = p['folder'] / harness.SEED_PATH_PROOF
+            if retained == 'journal':
+                self.assertTrue((p['data'] / 'checklist.sqlite-journal').is_file())
+                self.assertFalse(proof_file.exists())
+            else:
+                proof = json.loads(proof_file.read_text())
+                self.assertEqual(proof['files']['']['sha256'], harness.sha(p['data'] / 'checklist.sqlite'))
+                wal = p['data'] / 'checklist.sqlite-wal'
+                if retained == 'wal': self.assertEqual(proof['files']['-wal']['sha256'], harness.sha(wal))
+                else: self.assertIsNone(proof['files']['-wal'])
+            yield p, scan, external, live, launch, commands
+
+    def test_owned_stopped_slot_reuses_create_inspection(self):
+        with self.created_slot() as (p, scan, *_):
+            harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(harness.load(p)['start_path_inspection'], 'reused')
+
+    def test_retained_wal_is_reused_only_while_unchanged(self):
+        with self.created_slot(retained='wal') as (p, scan, *_):
+            harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(harness.load(p)['start_path_inspection'], 'reused')
+        with self.created_slot(retained='wal') as (p, scan, *_):
+            database = p['data'] / 'checklist.sqlite'
+            original = harness.sha(database)
+            with closing(sqlite3.connect(database)) as writer:
+                writer.create_collation('checklist_storage_v2', lambda a, b: (a > b) - (a < b))
+                writer.execute('PRAGMA wal_autocheckpoint=0')
+                with writer:
+                    writer.execute('INSERT INTO metadata VALUES (?, ?)', ('changed', 'only in WAL'))
+                self.assertEqual(harness.sha(database), original)
+                harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 2)
+            self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
+
+    def test_cold_rollback_journal_keeps_full_inspection(self):
+        with self.created_slot(retained='journal') as (p, scan, *_):
+            harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 2)
+            self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
+
+    def test_changed_database_wal_owner_or_job_repeats_inspection(self):
+        for change in ['database', 'wal', 'hash', 'owner', 'registered', 'proof checksum']:
+            with self.subTest(change=change), self.created_slot() as (p, scan, _, _, launch, _), ExitStack() as stack:
+                database = p['data'] / 'checklist.sqlite'
+                if change == 'database':
+                    with closing(sqlite3.connect(database)) as db, db:
+                        db.create_collation('checklist_storage_v2', lambda a, b: (a > b) - (a < b))
+                        db.execute('INSERT INTO metadata VALUES (?, ?)', ('changed', 'fixture'))
+                if change == 'wal':
+                    database.with_name('checklist.sqlite-wal').write_bytes(b'')
+                if change == 'hash':
+                    do_fingerprint = harness.seed_store_files
+                    def different_digest(path, *, hash_bytes=False):
+                        files = do_fingerprint(path, hash_bytes=hash_bytes)
+                        if hash_bytes: files['']['sha256'] = '0' * 64
+                        return files
+                    stack.enter_context(patch.object(harness, 'seed_store_files', side_effect=different_digest))
+                if change == 'owner':
+                    stack.enter_context(patch.dict(os.environ, CODEX_THREAD_ID='another-fixture'))
+                if change == 'registered':
+                    launch['registered'] = True
+                if change == 'proof checksum':
+                    (p['folder'] / harness.SEED_PATH_PROOF).write_bytes(b'{}')
+                harness.start(SimpleNamespace(slot=1, gui=False), p)
+                self.assertEqual(scan.call_count, 2)
+                self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
+
+    def test_changed_local_or_external_alias_still_refuses(self):
+        for change in ['managed leaf', 'external binding']:
+            with self.subTest(change=change), self.created_slot() as (p, scan, external, live, _, commands):
+                if change == 'managed leaf':
+                    leaf = p['data'] / 'objects/file'
+                    leaf.rename(leaf.with_name('previous'))
+                    leaf.symlink_to(live / 'objects/file')
+                else:
+                    external.rename(external.with_name('previous'))
+                    external.symlink_to(live)
+                with self.assertRaisesRegex(ValueError, 'symlink|into a Checklist data root'):
+                    harness.start(SimpleNamespace(slot=1, gui=False), p)
+                self.assertEqual(scan.call_count, 2)
+                self.assertFalse(any(command[0] == 'launchctl' for command in commands))
 
 
 class SlotStartupTests(unittest.TestCase):
