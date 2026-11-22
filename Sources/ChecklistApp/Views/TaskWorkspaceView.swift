@@ -98,7 +98,9 @@ private struct ProjectTicketContent: View {
                 HStack { Text("List updates are waiting while you interact.").checklistFont(.micro).foregroundStyle(Color.checklistSecondaryText); Spacer(); Button("Apply updates") { stability.apply(freshRows) }.buttonStyle(.link) }.padding(.horizontal, Spacing.page).padding(.bottom, Spacing.small).checklistActionScroll()
             }
             if !store.connected {
-                Label(store.storageUpgradeStatus == nil ? "Showing saved state. Drafts stay on this Mac until the service reconnects." : "Showing saved state. " + store.connectionBannerMessage, systemImage: "wifi.slash").checklistFont(.callout).foregroundStyle(.orange).padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row)
+                let message = store.serviceReachable ? "Showing saved state while Checklist refreshes." :
+                    (store.storageUpgradeStatus == nil ? "Showing saved state. Drafts stay on this Mac until the service reconnects." : "Showing saved state. " + store.connectionBannerMessage)
+                Label(message, systemImage: store.serviceReachable ? "arrow.clockwise" : "wifi.slash").checklistFont(.callout).foregroundStyle(.orange).padding(.horizontal, Spacing.page).padding(.bottom, Spacing.row)
             }
             if store.loading && !prepared.hasTasks { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
             else if stability.rows(freshRows, visibleRecordIDs: visibleTicketIDs).isEmpty && list.triages.isEmpty && overviewRequests.isEmpty {

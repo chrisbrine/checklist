@@ -13,6 +13,7 @@ final class LocalPlatformServicesTests: XCTestCase {
         var credential: String? = "fixture-credential"
         var registrationError: Error?
         var failures: [Error] = []
+        var reply: [String: Any] = ["data": ["fixture": true]]
 
         var services: LocalPlatformServices {
             LocalPlatformServices(transport: self, lifecycle: self, credentials: self,
@@ -32,7 +33,7 @@ final class LocalPlatformServicesTests: XCTestCase {
             requests.append(bytes)
             timeouts.append(replyTimeout)
             if !failures.isEmpty { throw failures.removeFirst() }
-            return ["data": ["fixture": true]]
+            return reply
         }
         func envelope(_ index: Int = 0) throws -> [String: Any] {
             try XCTUnwrap(JSONSerialization.jsonObject(with: requests[index]) as? [String: Any])
@@ -98,6 +99,37 @@ final class LocalPlatformServicesTests: XCTestCase {
         XCTAssertEqual(request["owner_channel"] as? Bool, true)
         XCTAssertNil(request["credential"])
         XCTAssertNil(request["native_context"])
+    }
+
+    @MainActor func testOwnerReadinessProbeMakesOneBoundedReadWithoutLifecycleOrCredentials() async throws {
+        let fake = FakePlatform()
+        fake.reply = ["data": ["role": "owner", "store_incarnation": "fixture"]]
+        try await ChecklistClient.probeOwnerService(replyTimeout: 1.25, platformServices: fake.services)
+        let request = try fake.envelope()
+        XCTAssertEqual(request["method"] as? String, "service_info")
+        XCTAssertEqual(request["owner_channel"] as? Bool, true)
+        XCTAssertTrue(try XCTUnwrap(request["params"] as? [String: Any]).isEmpty)
+        XCTAssertEqual(fake.timeouts, [1.25])
+        XCTAssertEqual(fake.preparations, 0)
+        XCTAssertEqual(fake.registrations, 0)
+        XCTAssertTrue(fake.credentialAccounts.isEmpty)
+        XCTAssertTrue(fake.startupLimits.isEmpty)
+    }
+
+    @MainActor func testOwnerReadinessProbeRejectsUnavailableAndUnconfirmedOwnerReplies() async {
+        let fake = FakePlatform()
+        fake.failures = [ChecklistError("SERVICE_UNAVAILABLE", "fixture")]
+        fake.reply = ["data": ["role": "worker", "store_incarnation": "fixture"]]
+        for expected in ["SERVICE_UNAVAILABLE", "INVALID_RESPONSE"] {
+            do {
+                try await ChecklistClient.probeOwnerService(replyTimeout: 1.25, platformServices: fake.services)
+                XCTFail("Probe should have rejected the reply")
+            } catch {
+                XCTAssertEqual((error as? ChecklistError)?.code, expected)
+            }
+        }
+        XCTAssertEqual(fake.requests.count, 2)
+        XCTAssertTrue(fake.startupLimits.isEmpty)
     }
 
     func testUnenrolledRequestDoesNotReadCredential() throws {

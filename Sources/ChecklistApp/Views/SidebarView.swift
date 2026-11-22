@@ -54,7 +54,7 @@ struct SidebarView: View {
             VStack(spacing: Spacing.control) {
                 Divider()
                 HStack(spacing: Spacing.small) {
-                    Circle().fill(store.connected ? Color.checklistAccentText : .orange).frame(width: 7, height: 7)
+                    Circle().fill(store.serviceReachable ? Color.checklistAccentText : .orange).frame(width: 7, height: 7)
                     Text(store.serviceConnectionFooter).checklistFont(.caption)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)

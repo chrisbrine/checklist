@@ -78,6 +78,173 @@ import ChecklistIPC
         XCTAssertNil(store.error)
         XCTAssertNil(store.lastServiceFailure, "Accepted reads clear the technical outage")
     }
+
+    func testReadinessClearsOfflineDuringAHeldReadAndBackoffStopsAtTwoSeconds() async throws {
+        let clock = ReconnectClock()
+        var releasePage: CheckedContinuation<[String: Any], any Error>?
+        var probeTimes: [Duration] = []
+        let ready = FixtureState(false)
+        let journal = LocalDraftJournal(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let store = ChecklistStore(draftJournal: journal, preferences: isolatedDefaults("Readiness").preferences, restorePendingCommand: false,
+                                   desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
+                                   requestTransport: { _, _ in
+                                       try await withCheckedThrowingContinuation { releasePage = $0 }
+                                   }, serviceProbe: {
+                                       probeTimes.append(clock.now)
+                                       if !ready.value { throw Down() }
+                                   })
+        store.reconnectSleep = { try await clock.sleep(for: $0) }
+        let live = Task { await store.startLiveUpdates() }
+        defer {
+            live.cancel()
+            store.stopWindowReads()
+            clock.cancel()
+            releasePage?.resume(throwing: CancellationError())
+        }
+
+        let pauses: [Duration] = [.milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2), .seconds(2)]
+        for (index, expected) in pauses.enumerated() {
+            try await until { clock.deadline != nil && releasePage != nil }
+            XCTAssertEqual(clock.deadline.map { $0 - clock.now }, expected)
+            clock.advance(by: expected - .milliseconds(1))
+            XCTAssertEqual(probeTimes.count, index)
+            clock.advance(by: .milliseconds(1))
+        }
+        try await until { clock.deadline != nil }
+        XCTAssertTrue(store.showsOfflineBanner)
+        XCTAssertEqual(store.serviceConnectionFooter, "Service disconnected")
+        XCTAssertEqual(probeTimes, [.milliseconds(250), .milliseconds(750), .milliseconds(1750), .milliseconds(3750), .milliseconds(5750)])
+        ready.value = true
+        clock.advance(by: .seconds(2))
+        try await until { store.serviceReachable }
+        XCTAssertFalse(store.showsOfflineBanner)
+        XCTAssertEqual(store.serviceConnectionFooter, "Service connected")
+        XCTAssertFalse(store.connected, "A held page cannot yet authorize writes")
+        XCTAssertNotNil(releasePage)
+        XCTAssertNil(clock.deadline)
+        XCTAssertEqual(probeTimes.last, .milliseconds(7750))
+    }
+
+    func testAnEstablishedWindowProbesAgainWhenItsSubscriptionFails() async throws {
+        let clock = ReconnectClock()
+        let preferences = isolatedDefaults("ReadinessAfterOutage").preferences
+        preferences.set(Page.epics.rawValue, forKey: "lastPage")
+        let journal = LocalDraftJournal(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        var releaseWait: CheckedContinuation<[String: Any], any Error>?
+        var probes = 0
+        let store = ChecklistStore(draftJournal: journal, preferences: preferences, restorePendingCommand: false,
+                                   desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
+                                   requestTransport: { method, params in
+                                       if method == "changes_wait" {
+                                           return try await withCheckedThrowingContinuation { releaseWait = $0 }
+                                       }
+                                       return ["workspace_version": 1, "surface": params["surface"] ?? "epics", "record_id": "",
+                                               "rows": [], "total": 0, "needs_you_count": 0, "has_more": false,
+                                               "next_cursor": NSNull(), "previous_cursor": NSNull(), "projects": [],
+                                               "service": ["store_incarnation": "reconnect-fixture"], "content_cursor": "ready"]
+                                   }, serviceProbe: { probes += 1 })
+        await store.refresh()
+        XCTAssertTrue(store.connected)
+        store.reconnectSleep = { try await clock.sleep(for: $0) }
+        let live = Task { await store.startLiveUpdates() }
+        defer {
+            live.cancel()
+            store.stopWindowReads()
+            clock.cancel()
+            releaseWait?.resume(throwing: CancellationError())
+        }
+        try await until { releaseWait != nil }
+        XCTAssertNil(clock.deadline, "A healthy window does not schedule probes")
+        XCTAssertEqual(probes, 0)
+        releaseWait?.resume(throwing: Down())
+        releaseWait = nil
+
+        try await until { store.showsOfflineBanner && clock.deadline != nil }
+        XCTAssertEqual(clock.deadline, .milliseconds(250))
+        clock.advance(by: .milliseconds(250))
+        try await until { store.serviceReachable }
+        XCTAssertFalse(store.showsOfflineBanner)
+        XCTAssertEqual(probes, 1)
+        XCTAssertNil(clock.deadline)
+    }
+
+    func testClosingWindowDiscardsInFlightReadinessReply() async throws {
+        let clock = ReconnectClock()
+        var releasePage: CheckedContinuation<[String: Any], any Error>?
+        var releaseProbe: CheckedContinuation<Void, any Error>?
+        let journal = LocalDraftJournal(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        let store = ChecklistStore(draftJournal: journal, preferences: isolatedDefaults("ReadinessCancellation").preferences, restorePendingCommand: false,
+                                   desktopAlerts: DesktopAlertCoordinator(sink: OfflineAlertSink()),
+                                   requestTransport: { _, _ in
+                                       try await withCheckedThrowingContinuation { releasePage = $0 }
+                                   }, serviceProbe: {
+                                       try await withCheckedThrowingContinuation { releaseProbe = $0 }
+                                   })
+        store.reconnectSleep = { try await clock.sleep(for: $0) }
+        let live = Task { await store.startLiveUpdates() }
+        defer {
+            live.cancel()
+            store.stopWindowReads()
+            clock.cancel()
+            releasePage?.resume(throwing: CancellationError())
+            releaseProbe?.resume(throwing: CancellationError())
+        }
+        try await until { clock.deadline != nil && releasePage != nil }
+        clock.advance(by: .milliseconds(250))
+        try await until { releaseProbe != nil }
+
+        live.cancel()
+        store.stopWindowReads()
+        releaseProbe?.resume()
+        releaseProbe = nil
+        releasePage?.resume(throwing: CancellationError())
+        releasePage = nil
+        await live.value
+        XCTAssertFalse(store.serviceReachable)
+        XCTAssertFalse(store.connectionAttempted)
+        XCTAssertNil(clock.deadline)
+    }
+
+    private func until(_ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while !condition() {
+            guard clock.now < deadline else { throw ReconnectTestTimeout() }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
+    private struct ReconnectTestTimeout: Error {}
+}
+
+@MainActor private final class ReconnectClock {
+    private(set) var now: Duration = .zero
+    private(set) var deadline: Duration?
+    private var sleeper: CheckedContinuation<Void, any Error>?
+
+    func sleep(for delay: Duration) async throws {
+        try Task.checkCancellation()
+        try await withCheckedThrowingContinuation { continuation in
+            deadline = now + delay
+            sleeper = continuation
+        }
+    }
+
+    func advance(by delay: Duration) {
+        now += delay
+        guard let deadline, now >= deadline else { return }
+        self.deadline = nil
+        let pending = sleeper
+        sleeper = nil
+        pending?.resume()
+    }
+
+    func cancel() {
+        let pending = sleeper
+        deadline = nil
+        sleeper = nil
+        pending?.resume(throwing: CancellationError())
+    }
 }
 
 @MainActor private final class OfflineAlertSink: DesktopAlertSink {

@@ -89,4 +89,20 @@ public final class ChecklistClient: @unchecked Sendable {
     public static func startService(timeLimit: TimeInterval = 8) throws {
         try LocalPlatformServices.macOS.lifecycle.startService(timeLimit: timeLimit)
     }
+
+    /// Probe the existing owner channel once. Normal app requests own service
+    /// registration. The probe has no startup retry or credential work.
+    public static func probeOwnerService(replyTimeout: TimeInterval, platformServices: LocalPlatformServices = .macOS) async throws {
+        try Task.checkCancellation()
+        try await offloadBlockingCall {
+            let bytes = try JSONSerialization.data(withJSONObject: [
+                "method": "service_info", "params": [:], "installation": "default", "owner_channel": true
+            ] as [String: Any])
+            let reply = try platformServices.transport.request(bytes, replyTimeout: replyTimeout)
+            guard let info = reply["data"] as? [String: Any], info["role"] as? String == "owner",
+                  let incarnation = info["store_incarnation"] as? String, !incarnation.isEmpty else {
+                throw ChecklistError("INVALID_RESPONSE", "The Checklist service did not confirm the owner channel.")
+            }
+        }
+    }
 }

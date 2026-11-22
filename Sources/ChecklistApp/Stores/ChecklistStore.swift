@@ -87,16 +87,20 @@ final class ChecklistStore: ObservableObject {
     @Published private(set) var connectionAttempted = false
     @Published private(set) var lastServiceFailure: String?
     @Published private(set) var storageUpgradeStatus: StorageUpgradeStatus?
-    var showsOfflineBanner: Bool { connectionAttempted && !connected }
+    @Published private var probeConfirmedReachability = false
+    var serviceReachable: Bool { connected || probeConfirmedReachability }
+    var showsOfflineBanner: Bool { connectionAttempted && !serviceReachable }
     var serviceConnectionLabel: String {
         if let upgrade = storageUpgradeStatus { return "Upgrading. " + upgrade.summary }
-        return connected ? "Connected" : "Disconnected"
+        return serviceReachable ? "Connected" : "Disconnected"
     }
     var serviceConnectionFooter: String {
         if let upgrade = storageUpgradeStatus { return "Service upgrading. " + upgrade.summary }
-        return connected ? "Service connected" : "Service disconnected"
+        return serviceReachable ? "Service connected" : "Service disconnected"
     }
-    var serviceUnavailableReason: String { DisabledReasons.offline(upgrade: storageUpgradeStatus) }
+    var serviceUnavailableReason: String {
+        serviceReachable ? "Checklist is refreshing. Changes can be sent after it loads current data." : DisabledReasons.offline(upgrade: storageUpgradeStatus)
+    }
     var connectionBannerTitle: String { storageUpgradeStatus == nil ? "Checklist is offline" : "Checklist is upgrading" }
     var connectionBannerMessage: String {
         if let upgrade = storageUpgradeStatus { return upgrade.summary + " Your drafts stay on this Mac. Checklist reconnects automatically when the upgrade finishes." }
@@ -218,6 +222,10 @@ final class ChecklistStore: ObservableObject {
     private var liveSurfaceScope: LiveSurfaceScope?
     private var liveSurfaceReadID = UUID(), liveSurfaceEpoch = UUID()
     private var freshnessWatchdog: Task<Void,Never>?
+    private let serviceProbe: (@MainActor () async throws -> Void)?
+    private var serviceProbeWindow: UUID?
+    private var serviceProbeTask: Task<Void, Never>?
+    var reconnectSleep: @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     // Injectable monotonic time: tests advance idle/lag without elapsed-time gates.
     var liveNow: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     private var visibleRetryAfter: TimeInterval = 0, selectedRetryAfter: TimeInterval = 0
@@ -425,9 +433,10 @@ final class ChecklistStore: ObservableObject {
     var groupTaskLoading: Bool {groupTasksObservation.loading}
     var groupTaskError: String? {groupTasksObservation.error}
 
-    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .ownerFile, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil) {
+    init(draftJournal: LocalDraftJournal = LocalDraftJournal(), preferences: UserDefaults = .standard, restorePendingCommand: Bool = true, desktopAlerts: DesktopAlertCoordinator? = nil, requestTransport: (@MainActor (String,[String:Any]) async throws -> [String:Any])? = nil, navigationMemory: DetailItemNavigationMemory? = nil, pendingCommandKey:String = WorkspaceWindowIdentity.primary.pendingCommandKey, pendingCommandPersistence:PendingCommandPersistence = .ownerFile, pendingCommandServiceIdentity: String = ChecklistInstance.current.machServiceName, qualificationFaults: QualificationFaults? = nil, serviceProbe: (@MainActor () async throws -> Void)? = nil) {
         let navigationMemory = navigationMemory ?? .shared
         self.qualificationFaults = qualificationFaults ?? .shared
+        self.serviceProbe = serviceProbe ?? (requestTransport == nil ? NativeServiceTransport.probeReadiness : nil)
         self.draftJournal = draftJournal; self.preferences = preferences; self.desktopAlerts = desktopAlerts ?? .shared;self.requestTransport = requestTransport;self.navigationMemory = navigationMemory;self.pendingCommandKey=pendingCommandKey;self.pendingCommandPersistence=pendingCommandPersistence;self.pendingCommandServiceIdentity=pendingCommandServiceIdentity
         if restorePendingCommand { restoreSavedCommand() }
         if let bytes = preferences.data(forKey: "lastDetail") {
@@ -1799,8 +1808,49 @@ final class ChecklistStore: ObservableObject {
         reconcileRecoveredCommand()
     }
     private func recordServiceOutage(_ error: Error) {
-        connected = false; connectionAttempted = true; lastServiceFailure = error.localizedDescription
-        storageUpgradeStatus = StorageUpgradeStatus(error:error)
+        probeConfirmedReachability = false
+        connected = false
+        recordServiceFailure(error)
+        startServiceProbe()
+    }
+    private func recordServiceFailure(_ error: Error) {
+        let message = error.localizedDescription
+        let upgrade = StorageUpgradeStatus(error:error)
+        if lastServiceFailure != message { lastServiceFailure = message }
+        if storageUpgradeStatus != upgrade { storageUpgradeStatus = upgrade }
+        if !connectionAttempted { connectionAttempted = true }
+    }
+
+    private func startServiceProbe() {
+        guard !serviceReachable, serviceProbeTask == nil, let window = serviceProbeWindow, let serviceProbe else { return }
+        serviceProbeTask = Task {
+            defer { if serviceProbeWindow == window { serviceProbeTask = nil } }
+            // Give a normal startup read a chance to finish. During an outage
+            // issue one probe at a time, with a short ceiling on the idle pause.
+            var pause: Duration = .milliseconds(250)
+            while !Task.isCancelled && !serviceReachable {
+                do { try await reconnectSleep(pause) } catch { return }
+                guard !Task.isCancelled, !serviceReachable else { return }
+                do {
+                    try await serviceProbe()
+                    guard !Task.isCancelled, !serviceReachable else { return }
+                    probeConfirmedReachability = true
+                    connectionAttempted = true; lastServiceFailure = nil; storageUpgradeStatus = nil
+                    Self.liveLogger.notice("connection path=owner_probe_reachable")
+                    return
+                } catch {
+                    guard !isReadCancellation(error), !serviceReachable else { return }
+                    recordServiceFailure(error)
+                }
+                pause = min(pause * 2, .seconds(2))
+            }
+        }
+    }
+
+    private func stopServiceProbes() {
+        serviceProbeWindow = nil
+        serviceProbeTask?.cancel()
+        serviceProbeTask = nil
     }
 
     func refresh(quiet: Bool = false) async {
@@ -2249,6 +2299,7 @@ final class ChecklistStore: ObservableObject {
     }
 
     func stopWindowReads() {
+        stopServiceProbes()
         for surface in ScreenTiming.Surface.allCases {screenTiming.cancel(surface)}
         nextDigestRead?.cancel();nextDigestRead = nil
         coverageStatusFloors = [:];coverageStatusIncarnation = nil
@@ -2301,6 +2352,11 @@ final class ChecklistStore: ObservableObject {
 
     func startLiveUpdates() async {
         startedLiveUpdates = true
+        stopServiceProbes()
+        let probeWindow = UUID()
+        serviceProbeWindow = probeWindow
+        startServiceProbe()
+        defer { if serviceProbeWindow == probeWindow { stopServiceProbes() } }
         // A live window promises prompt external status changes even behind Finder.
         // Keep App Nap/timer deferral from suspending that subscription, while
         // allowing normal system idle sleep. The token ends with this window task.
