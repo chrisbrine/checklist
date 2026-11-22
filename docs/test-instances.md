@@ -46,11 +46,16 @@ successful filesystem-overlap check. Every occurrence still runs its lexical and
 field-policy checks and increments its original count. The cache holds at most
 2,048 entries and 1 MiB of encoded path/location/digest payload; larger inputs
 use the original guard. Python entry overhead is separately bounded by the entry
-limit. Before returning, the pass rechecks each cached path's named device/inode,
+limit. Before returning, the pass reads each cached path's named device/inode,
 file type and lexical/canonical ancestor identities, repeats both full overlap
-guards against the current Checklist roots, and rechecks identity again. A named
-path or ancestor change refuses the pass. Managed paths and file checks are never
-cached this way. Source, destination and later startup each use a separate cache.
+guards against the current Checklist roots, and reads identity again. An overlap,
+or an identity change between those two readings, refuses the pass. An identity
+that differs from the inspection-time reading does not refuse: an external binding
+names a file of another, active project, an editor save replaces its inode, and a
+seed inspection can take 50 minutes at high load (21 Nov 2026). The pass reports
+those paths as `external_bindings_changed_since_inspection`. Managed paths and file
+checks are never cached this way. Source, destination and later startup each use a
+separate cache.
 
 The shared Python helpers are `paths_overlap(a, b) -> bool` and `checklist_root_overlap(path, exclude=()) -> str | None`. Root lookup checks `live`, each `slot-N` data root and folder in numerical order, then `test-base`, returning the first non-excluded label. Slot admission excludes its own label and `test-base`; a live or another-slot overlap refuses. Swift uses the same path rule: existing equal/ancestor paths are identified by `(st_dev, st_ino)`; remaining comparisons use the deepest existing ancestor's canonical on-disk spelling (`F_GETPATH` on macOS), with symlinks resolved even for missing tails. Components are NFD-normalized and case-folded, treating every volume as case-insensitive to fail closed. Comparisons never use string prefixes. The shared vectors in `Tests/Fixtures/path-overlap-vectors.json` cover filesystem aliases and missing paths in both languages.
 

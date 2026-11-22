@@ -374,6 +374,9 @@ if [ -e "$INCOMING" ] || [ -e "$PREVIOUS" ]; then echo "Install paths already ex
 if [ -e "$DEST" ]; then
   IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
   if [ "$IDENTIFIER" != org.checklist.app ]; then echo "Refusing to replace an unrelated application at $DEST." >&2; exit 1; fi
+  # CL-513: refuse a signer change before anything stops (21 Nov 2026: an ad hoc stage over the
+  # Developer ID installation; launchd refused the new service for about 10.5 minutes).
+  python3 -I "$ROOT_DIR/script/install_signer_guard.py" "$DEST" "$STAGE" || exit 1
 fi
 ditto "$STAGE" "$INCOMING"
 codesign --verify --deep --strict "$INCOMING"

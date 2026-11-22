@@ -434,7 +434,7 @@ class ExternalBindingOverlapCache:
     def __init__(self, maximum_entries=2048, maximum_bytes=1_048_576):
         self.maximum_entries, self.maximum_bytes = maximum_entries, maximum_bytes
         self.entries = {}
-        self.payload_bytes = self.hits = self.filesystem_checks = 0
+        self.payload_bytes = self.hits = self.filesystem_checks = self.changed_since_inspection = 0
 
     @staticmethod
     def named_identity(path):
@@ -474,13 +474,19 @@ class ExternalBindingOverlapCache:
         return False
 
     def revalidate(self):
+        # An external binding names a file of another, active project. An editor save there
+        # replaces the leaf inode, and a seed inspection takes 50 min at high load (21 Nov 2026),
+        # so the inspection-time identity is not required at release. The release repeats the
+        # inspection's guard on the current path: a full overlap check between two equal
+        # identity readings. A path that overlaps a Checklist data root, or that changes during
+        # this check, is still refused.
         for key, (identity, location) in self.entries.items():
             path = Path(key)
-            if self.named_identity(path) != identity:
-                raise ValueError('External binding named ancestry changed during inspection (' + location + ').')
+            current = self.named_identity(path)
+            if current != identity: self.changed_since_inspection += 1
             if self.full_overlap(path):
                 raise ValueError('External binding now overlaps a Checklist data root (' + location + ').')
-            if self.named_identity(path) != identity:
+            if self.named_identity(path) != current:
                 raise ValueError('External binding named ancestry changed during release (' + location + ').')
 
 
@@ -936,7 +942,8 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     counts.update(external_overlap_cache_entries=len(external_bindings.entries),
                   external_overlap_cache_hits=external_bindings.hits,
                   external_overlap_filesystem_checks=external_bindings.filesystem_checks,
-                  external_overlap_cache_payload_bytes=external_bindings.payload_bytes)
+                  external_overlap_cache_payload_bytes=external_bindings.payload_bytes,
+                  external_bindings_changed_since_inspection=external_bindings.changed_since_inspection)
     return counts
 
 

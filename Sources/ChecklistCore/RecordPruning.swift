@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import SQLite3
 import CryptoKit
 
 /// CL-72: an opaque cursor that needs no stored row. It seals the event sequence and its
@@ -70,8 +71,13 @@ extension CommandRouter {
     /// Cursor rows are deleted by rowid with no JSON work, so a larger batch stays short.
     static let cursorPruneBatch = 20_000
     static let prunedResult = "{\"pruned\":true,\"retention_days\":30}"
+    /// Routine pruning runs on the writer inside a command's storage gate, so every other
+    /// command waits while it runs. Each prune step is one short transaction that SQLite
+    /// stops and rolls back at this limit; the step runs again at the next pass.
+    static let routinePruneStepBudget: TimeInterval = 0.5
 
-    struct PruneCounts: Equatable { var cursors = 0, commandResults = 0, cleanupPreviews = 0, attachmentReadResults = 0 }
+    /// `budgetStops` counts steps that SQLite stopped at the time limit (no change kept).
+    struct PruneCounts: Equatable { var cursors = 0, commandResults = 0, cleanupPreviews = 0, attachmentReadResults = 0, budgetStops = 0 }
 
     /// Runs when the interval passed; returns nil when it did not run.
     func pruneRoutineRecordsIfDue(_ db: Database, now: Date = Date()) -> PruneCounts? {
@@ -80,28 +86,55 @@ extension CommandRouter {
         return try? pruneRoutineRecords(db, now: now)
     }
 
+    /// Old command results that pruning may replace with the tombstone. A result stays when
+    /// it carries a policy or a connection registration, when a storage job names its command
+    /// as parent, or when any storage job has unreadable data (then nothing is pruned).
+    ///
+    /// The protected (command, principal) pairs are one uncorrelated subquery, so SQLite reads
+    /// each storage job once per statement. The earlier correlated form read every storage job
+    /// again for each candidate command: 500 candidates and 23,637 jobs held the writer and the
+    /// command queue for minutes on 21 Nov 2026. `testCommandResultPruneMatchesTheCorrelatedForm`
+    /// keeps both forms equal.
+    static let prunableCommandResultsSQL = """
+        SELECT c.rowid FROM commands c WHERE c.rowid <= ? AND c.result <> ?
+          AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.policy') IS NULL AND json_type(c.result,'$._connection_registration') IS NULL ELSE 0 END
+          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.type='storage_job' AND CASE WHEN json_valid(r.data) THEN 0 ELSE 1 END)
+          AND (c.command_id,c.principal) NOT IN (SELECT json_extract(r.data,'$.parent_command_id'),json_extract(r.data,'$.parent_principal') FROM records r
+               WHERE r.type='storage_job' AND json_valid(r.data)
+                 AND json_extract(r.data,'$.parent_command_id') IS NOT NULL AND json_extract(r.data,'$.parent_principal') IS NOT NULL)
+          ORDER BY c.rowid
+        """
+
     @discardableResult
-    func pruneRoutineRecords(_ db: Database, now: Date = Date()) throws -> PruneCounts {
+    func pruneRoutineRecords(_ db: Database, now: Date = Date(), stepBudget: TimeInterval = CommandRouter.routinePruneStepBudget) throws -> PruneCounts {
         guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Prune records after the semantic transaction commits.") }
         var counts = PruneCounts()
         let time = now.timeIntervalSince1970
-        try db.inTransaction {
+        /// One step: one transaction under the time limit. A stopped step keeps no change.
+        func step(_ body: () throws -> Int) throws -> Int {
+            let changed: Int? = try Self.withPruneStepBudget(db, seconds: stepBudget) {
+                var count = 0
+                try db.inTransaction { count = try body(); return .commit }
+                return count
+            }
+            if changed == nil { counts.budgetStops += 1 }
+            return changed ?? 0
+        }
+        counts.cursors = try step {
             try db.execute(sql: "DELETE FROM cursors WHERE rowid IN (SELECT rowid FROM cursors WHERE created_at < ? LIMIT ?)", arguments: [time - Self.cursorRowRetention, Self.cursorPruneBatch])
-            counts.cursors = db.changesCount
-            return .commit
+            return db.changesCount
         }
-        try db.inTransaction {
-            guard let cutoff = try commandRetentionCutoff(db, now: time) else { return .commit }
-            try db.execute(sql: """
-                UPDATE commands SET result=? WHERE rowid IN (SELECT c.rowid FROM commands c WHERE c.rowid <= ? AND c.result <> ?
-                  AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.policy') IS NULL AND json_type(c.result,'$._connection_registration') IS NULL ELSE 0 END
-                  AND NOT EXISTS (SELECT 1 FROM records r WHERE r.type='storage_job' AND CASE WHEN json_valid(r.data) THEN json_extract(r.data,'$.parent_command_id')=c.command_id AND json_extract(r.data,'$.parent_principal')=c.principal ELSE 1 END)
-                  ORDER BY c.rowid LIMIT ?)
-                """, arguments: [Self.prunedResult, cutoff, Self.prunedResult, Self.pruneBatch])
-            counts.commandResults = db.changesCount
-            return .commit
+        // The retention mark is its own short write, so a stopped prune step never loses it.
+        var cutoff: Int64?
+        try db.inTransaction { cutoff = try commandRetentionCutoff(db, now: time); return .commit }
+        if let cutoff {
+            counts.commandResults = try step {
+                try db.execute(sql: "UPDATE commands SET result=? WHERE rowid IN (\(Self.prunableCommandResultsSQL) LIMIT ?)",
+                               arguments: [Self.prunedResult, cutoff, Self.prunedResult, Self.pruneBatch])
+                return db.changesCount
+            }
         }
-        try db.inTransaction {
+        counts.cleanupPreviews = try step {
             let cutoff = StoredClock.shared.string(from: now.addingTimeInterval(-Self.cleanupPreviewRetention))
             try db.execute(sql: """
                 DELETE FROM records WHERE rowid IN (SELECT p.rowid FROM records p LEFT JOIN records t ON t.type='task' AND t.id=CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.task_id') END
@@ -110,14 +143,26 @@ extension CommandRouter {
                        OR COALESCE(json_extract(p.data,'$.created_at'),'9999') < ?)
                   LIMIT ?)
                 """, arguments: [cutoff, Self.pruneBatch])
-            counts.cleanupPreviews = db.changesCount
-            return .commit
+            return db.changesCount
         }
-        try db.inTransaction {
-            counts.attachmentReadResults = try pruneAttachmentReadResults(db)
-            return .commit
-        }
+        counts.attachmentReadResults = try step { try pruneAttachmentReadResults(db) }
         return counts
+    }
+
+    /// Runs `body` while SQLite stops any statement that runs past `seconds`; returns nil when
+    /// SQLite stopped it (the open transaction rolls back). Same mechanism as
+    /// `EpicReferenceIndex.withBudget`, without its Epic-specific error.
+    static func withPruneStepBudget<T>(_ db: Database, seconds: TimeInterval, _ body: () throws -> T) throws -> T? {
+        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(max(seconds, 0) * 1_000_000_000)
+        let box = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
+        box.initialize(to: deadline)
+        sqlite3_progress_handler(db.sqliteConnection, 1000, { context in
+            guard let context else { return 1 }
+            return DispatchTime.now().uptimeNanoseconds >= context.assumingMemoryBound(to: UInt64.self).pointee ? 1 : 0
+        }, box)
+        defer { sqlite3_progress_handler(db.sqliteConnection, 0, nil, nil); box.deinitialize(count: 1); box.deallocate() }
+        do { return try body() }
+        catch let error as DatabaseError where error.resultCode == .SQLITE_INTERRUPT { return nil }
     }
 
     /// The commands table has no timestamp. Each pass records (time, highest rowid) at most
