@@ -225,7 +225,7 @@ class InstallSkillTests(unittest.TestCase):
     def test_install_script_calls_skill_install_after_installed_verification_and_never_fails(self):
         script = (REPO / 'script/build_and_run.sh').read_text()
         call = script.index('script/install_skill.py')
-        self.assertLess(script.index('script/verify_install.py" "$DEST"'), call)
+        self.assertLess(script.index('script/install_recovery.py" "$ROOT_DIR" "$DEST"'), call)
         self.assertLess(script.index('echo "Installed $DEST"'), call)
         self.assertGreater(call, script.index('case "$MODE" in --stage|--rebuild-stage|--clean-stage) echo "Staged'))
         line = script[script.rindex('\n', 0, call):script.index('\n', call)]

@@ -36,9 +36,23 @@ def refusal(installed_app, stage_app, allow=False):
             "the installed bundle is untouched. CHECKLIST_ALLOW_SIGNER_CHANGE=1 permits a deliberate change.")
 
 
+def stage_warning(installed_app):
+    installed_app = Path(installed_app)
+    if installed_app.is_dir() and team(installed_app) != UNSIGNED_TEAM:
+        return ('Warning: this install-scope stage uses ad hoc signing but the installed Checklist app '
+                'is team-signed. Set .local/build/signing-identity to the installation’s signing selection '
+                'and stage again before installing.')
+    return None
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit(__doc__.splitlines()[0])
+    if sys.argv[1] == '--warn-stage':
+        message = stage_warning(sys.argv[2])
+        if message:
+            print(message, file=sys.stderr)
+        return
     message = refusal(sys.argv[1], sys.argv[2], os.environ.get('CHECKLIST_ALLOW_SIGNER_CHANGE') == '1')
     if message:
         raise SystemExit(message)

@@ -1,74 +1,109 @@
 #!/usr/bin/env python3
-"""CL-513: the installer refuses a signer change before it stops the live service.
-Run: python3 -I script/test_install_signer_guard.py
-The team-signed case copies the installed ChecklistService when that copy is team-signed; it is skipped otherwise.
-No case reads the Keychain: ad hoc signing needs no identity.
-"""
+"""CL-513 signer guard and stage warning with fake codesign results only."""
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import os
-import shutil
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import install_signer_guard as guard  # noqa: E402
-
-INSTALLED = Path('/Applications/Checklist.app/Contents/MacOS/ChecklistService')
-
-
-def app(root, name, source, ad_hoc):
-    executable = Path(root) / name / 'Contents/MacOS/ChecklistService'
-    executable.parent.mkdir(parents=True)
-    shutil.copy2(source, executable)
-    if ad_hoc:
-        subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', str(executable)], check=True, capture_output=True)
-    return executable.parents[2]
+import install_signer_guard as guard
 
 
 class InstallSignerGuardTests(unittest.TestCase):
     def setUp(self):
-        self.folder = tempfile.TemporaryDirectory()
-        self.root = self.folder.name
-        self.source = sys.executable if not INSTALLED.exists() else INSTALLED
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.installed = root / 'Installed.app'
+        self.stage = root / 'Stage.app'
+        self.teams = {}
+        self.codesign = patch.object(guard.subprocess, 'run', side_effect=self.fake_codesign)
+        self.codesign.start()
+        self.addCleanup(self.codesign.stop)
 
-    def tearDown(self):
-        self.folder.cleanup()
+    def bundle(self, path, team):
+        service = path / 'Contents/MacOS/ChecklistService'
+        service.parent.mkdir(parents=True)
+        service.write_bytes(b'fake service')
+        self.teams[str(path)] = self.teams[str(service)] = team
+        return service
+
+    def fake_codesign(self, command, **kwargs):
+        self.assertEqual(command[:3], ['codesign', '-d', '--verbose=4'])
+        return subprocess.CompletedProcess(command, 0, '', f'TeamIdentifier={self.teams[command[-1]]}\n')
 
     def test_missing_installation_passes(self):
-        stage = app(self.root, 'Stage.app', self.source, ad_hoc=True)
-        self.assertIsNone(guard.refusal(Path(self.root) / 'Missing.app', stage))
+        self.bundle(self.stage, team=guard.UNSIGNED_TEAM)
+        self.assertIsNone(guard.refusal(self.installed, self.stage))
 
     def test_equal_ad_hoc_teams_pass(self):
-        installed = app(self.root, 'Installed.app', self.source, ad_hoc=True)
-        stage = app(self.root, 'Stage.app', self.source, ad_hoc=True)
-        self.assertIsNone(guard.refusal(installed, stage))
+        self.bundle(self.installed, team=guard.UNSIGNED_TEAM)
+        self.bundle(self.stage, team=guard.UNSIGNED_TEAM)
+        self.assertIsNone(guard.refusal(self.installed, self.stage))
 
-    @unittest.skipUnless(INSTALLED.exists() and guard.team(INSTALLED) != guard.UNSIGNED_TEAM, 'no team-signed installation to copy')
     def test_ad_hoc_stage_over_team_installation_is_refused_and_untouched(self):
-        installed = app(self.root, 'Installed.app', INSTALLED, ad_hoc=False)
-        stage = app(self.root, 'Stage.app', INSTALLED, ad_hoc=True)
-        before = (installed / 'Contents/MacOS/ChecklistService').read_bytes()
-        message = guard.refusal(installed, stage)
+        installed = self.bundle(self.installed, team='TESTTEAM')
+        self.bundle(self.stage, team=guard.UNSIGNED_TEAM)
+        before = installed.read_bytes()
+        message = guard.refusal(self.installed, self.stage)
         self.assertIn('Refusing to install', message)
         self.assertIn("'not set'", message)
-        self.assertEqual((installed / 'Contents/MacOS/ChecklistService').read_bytes(), before)
-        self.assertIsNone(guard.refusal(installed, stage, allow=True), 'a deliberate signer change is allowed')
+        self.assertEqual(installed.read_bytes(), before)
+        self.assertIsNone(guard.refusal(self.installed, self.stage, allow=True))
 
-    @unittest.skipUnless(INSTALLED.exists() and guard.team(INSTALLED) != guard.UNSIGNED_TEAM, 'no team-signed installation to copy')
     def test_equal_team_passes(self):
-        installed = app(self.root, 'Installed.app', INSTALLED, ad_hoc=False)
-        stage = app(self.root, 'Stage.app', INSTALLED, ad_hoc=False)
-        self.assertIsNone(guard.refusal(installed, stage))
+        self.bundle(self.installed, team='TESTTEAM')
+        self.bundle(self.stage, team='TESTTEAM')
+        self.assertIsNone(guard.refusal(self.installed, self.stage))
 
-    def test_command_line_exit_status(self):
-        installed = app(self.root, 'Installed.app', self.source, ad_hoc=True)
-        stage = app(self.root, 'Stage.app', self.source, ad_hoc=True)
-        script = Path(__file__).resolve().parent / 'install_signer_guard.py'
-        result = subprocess.run([sys.executable, '-I', str(script), str(installed), str(stage)], capture_output=True, text=True,
-                                env=dict(os.environ, CHECKLIST_ALLOW_SIGNER_CHANGE=''))
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_command_line_accepts_equal_teams(self):
+        self.bundle(self.installed, team='TESTTEAM')
+        self.bundle(self.stage, team='TESTTEAM')
+        output = io.StringIO()
+        with (patch.object(sys, 'argv', ['install_signer_guard.py', str(self.installed), str(self.stage)]),
+              patch.dict(os.environ, CHECKLIST_ALLOW_SIGNER_CHANGE=''), redirect_stdout(output)):
+            guard.main()
+        self.assertIn('Signing team matches', output.getvalue())
+
+    def test_stage_warning_names_private_signing_selection(self):
+        self.bundle(self.installed, team='TESTTEAM')
+        errors = io.StringIO()
+        with (patch.object(sys, 'argv', ['install_signer_guard.py', '--warn-stage', str(self.installed)]),
+              redirect_stderr(errors)):
+            guard.main()
+        self.assertIn('Warning:', errors.getvalue())
+        self.assertIn('.local/build/signing-identity', errors.getvalue())
+
+    def test_stage_warning_is_silent_for_missing_or_ad_hoc_installation(self):
+        self.assertIsNone(guard.stage_warning(self.installed))
+        self.bundle(self.installed, team=guard.UNSIGNED_TEAM)
+        self.assertIsNone(guard.stage_warning(self.installed))
+
+
+class StageWarningRoutingTests(unittest.TestCase):
+    def test_only_ad_hoc_install_stages_check_for_warning(self):
+        script = Path(__file__).with_name('build_and_run.sh').read_text()
+        start = script.index('export CHECKLIST_SIGN_IDENTITY="$SIGN_IDENTITY"')
+        end = script.index('if [ "$MODE" = --install-stage ]', start)
+        fake = 'set -euo pipefail\npython3() { printf "%s\\n" "$@"; }\n'
+        cases = [(mode, 'install', '-', True) for mode in ('--stage', '--rebuild-stage', '--clean-stage')]
+        cases += [('--stage', 'test', '-', False), ('--stage', 'private-copy', '-', False),
+                  ('--stage', 'install', 'fixture selection', False), ('--verify', 'install', '-', False)]
+        for mode, scope, selection, warns in cases:
+            with self.subTest(mode=mode, scope=scope, warns=warns):
+                result = subprocess.run(['bash', '-c', fake + script[start:end]], capture_output=True, text=True,
+                                        env=dict(os.environ, MODE=mode, BUILD_SCOPE=scope, SIGN_IDENTITY=selection,
+                                                 ROOT_DIR='/temporary fixture', DEST='/temporary installed app'),
+                                        timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 ['-I', '/temporary fixture/script/install_signer_guard.py', '--warn-stage',
+                                  '/temporary installed app'] if warns else [])
 
 
 if __name__ == '__main__':

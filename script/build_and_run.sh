@@ -3,6 +3,7 @@
 set -euo pipefail
 MODE="${1:-run}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST="/Applications/Checklist.app"
 case "$MODE" in run|--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry) ;; *) echo "usage: $0 [--verify|--install|--install-stage|--stage|--rebuild-stage|--clean-stage|--debug|--logs|--telemetry]" >&2; exit 2;; esac
 BUILD_SCOPE="${CHECKLIST_BUILD_SCOPE:-install}"
 case "$BUILD_SCOPE" in install|measurement|test|private-copy) ;; *) echo "CHECKLIST_BUILD_SCOPE must be install, measurement, test or private-copy." >&2; exit 2;; esac
@@ -47,16 +48,12 @@ INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
 VERIFICATION_RECEIPT=""
-OFFLINE_STARTED=""
 # Only generated output is made writable; never pass the immutable source here.
 remove_generated() { chmod -R u+w "$1" && rm -rf "$1"; }
 cleanup() {
   local status=$? cleanup_failed=0
   trap - EXIT
   trap '' HUP INT TERM
-  if [ -n "$OFFLINE_STARTED" ]; then
-    echo "Measured service offline window: at least $(( $(date +%s) - OFFLINE_STARTED )) s (no healthy service answer observed before installer exit)." >&2
-  fi
   if [ -n "$STAGE_ASSEMBLY" ] && [ -d "$STAGE_ASSEMBLY" ]; then
     remove_generated "$STAGE_ASSEMBLY" || { echo "Cleanup failed for generated stage: $STAGE_ASSEMBLY" >&2; cleanup_failed=1; }
   fi
@@ -111,6 +108,11 @@ else
   SIGN_IDENTITY="-"
 fi
 export CHECKLIST_SIGN_IDENTITY="$SIGN_IDENTITY"
+case "$MODE" in --stage|--rebuild-stage|--clean-stage)
+  if [ "$BUILD_SCOPE" = install ] && [ "$SIGN_IDENTITY" = - ]; then
+    python3 -I "$ROOT_DIR/script/install_signer_guard.py" --warn-stage "$DEST"
+  fi;;
+esac
 if [ "$MODE" = --install-stage ]; then
   if [ "$#" = 4 ] && [ "$3" = --offline-measurement ]; then OFFLINE_MEASUREMENT="$4";
   elif [ "$#" != 2 ]; then echo "usage: $0 --install-stage CAPTURE_DIR [--offline-measurement FILE]" >&2; exit 2; fi
@@ -365,11 +367,12 @@ PYTIMING
 save_timing
 case "$MODE" in --stage|--rebuild-stage|--clean-stage) echo "Staged $STAGE"; exit 0;; esac
 phase start install
-DEST="/Applications/Checklist.app"
 INSTALL_STARTED="$(date +%s)"
 INSTALL_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 INCOMING="/Applications/.Checklist-incoming-$INSTALL_ID.app"
 PREVIOUS="/Applications/.Checklist-previous-$INSTALL_ID.app"
+REJECTED="/Applications/.Checklist-rejected-$INSTALL_ID.app"
+HAD_PREVIOUS=0
 if [ -e "$INCOMING" ] || [ -e "$PREVIOUS" ]; then echo "Install paths already exist; reconcile them before retrying." >&2; exit 1; fi
 if [ -e "$DEST" ]; then
   IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
@@ -377,6 +380,7 @@ if [ -e "$DEST" ]; then
   # CL-513: refuse a signer change before anything stops (21 Nov 2026: an ad hoc stage over the
   # Developer ID installation; launchd refused the new service for about 10.5 minutes).
   python3 -I "$ROOT_DIR/script/install_signer_guard.py" "$DEST" "$STAGE" || exit 1
+  HAD_PREVIOUS=1
 fi
 ditto "$STAGE" "$INCOMING"
 codesign --verify --deep --strict "$INCOMING"
@@ -384,57 +388,13 @@ codesign --verify --deep --strict "$INCOMING"
 # Startup revalidates this preparation after the old writer has stopped.
 UPGRADE_PREPARATION="$("$INCOMING/Contents/MacOS/ChecklistService" --prepare-upgrade)"
 python3 "$SOURCE/script/upgrade_offline.py" "$UPGRADE_PREPARATION" "$CAPTURE_DIR" "$INCOMING/Contents/MacOS/ChecklistService" "$OFFLINE_MEASUREMENT"
-# Quiesce only this UI and the process holding this installation's service lock.
-# Data remains in Application Support. This does not claim or create a database backup.
-OFFLINE_STARTED="$(date +%s)"
-python3 - "$ROOT_DIR" "$DEST" <<'PY'
-import ctypes,os,signal,subprocess,sys,time
-from pathlib import Path
-root,dest=map(Path,sys.argv[1:]);targets=[]
-test_root=Path.home()/'Library/Application Support/Checklist Test Instances'
-libproc=ctypes.CDLL('/usr/lib/libproc.dylib')
-def actual_path(pid):
- buffer=ctypes.create_string_buffer(4096)
- return os.fsdecode(buffer.value) if libproc.proc_pidpath(pid,buffer,len(buffer))>0 else ''
-def test_process(path):return path.startswith(str(test_root)+os.sep)
-for line in subprocess.check_output(['ps','-axo','pid=,comm='],text=True).splitlines():
- parts=line.strip().split(None,1)
- if len(parts)!=2:continue
- pid=int(parts[0]);path=actual_path(pid)
- if test_process(path):continue
- if path==str(dest/'Contents/MacOS/ChecklistApp') or (path.startswith(str(root)+os.sep) and path.endswith('/ChecklistApp')):targets.append(pid)
-data=Path(os.environ.get('CHECKLIST_DATA_ROOT',str(Path.home()/'Library/Application Support/Checklist')))
-lock=data/'service.lock'
-if lock.exists():
- result=subprocess.run(['lsof','-t',str(lock)],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
- for pid_text in result.stdout.split():
-  pid=int(pid_text);path=actual_path(pid)
-  if not test_process(path) and path.endswith('/ChecklistService'):targets.append(pid)
-for pid in set(targets):
- try:os.kill(pid,signal.SIGTERM)
- except ProcessLookupError:pass
-for pid in set(targets):
- deadline=time.monotonic()+5
- while time.monotonic()<deadline:
-  try:os.kill(pid,0)
-  except ProcessLookupError:break
-  time.sleep(.05)
- else:raise SystemExit('Checklist process did not stop within five seconds; installed bundle preserved. PID '+str(pid))
-PY
-HAD_PREVIOUS=0
-if [ -e "$DEST" ]; then mv "$DEST" "$PREVIOUS"; HAD_PREVIOUS=1; fi
-if ! mv "$INCOMING" "$DEST"; then
-  if [ "$HAD_PREVIOUS" = 1 ] && [ ! -e "$DEST" ]; then mv "$PREVIOUS" "$DEST"; fi
-  echo "Install failed; previous bundle restored where possible. Data was retained." >&2
-  exit 1
-fi
+# Installed verification is mandatory for the ordinary installation routes.
+# Interactive modes retain their debugger/log launch behavior.
+RECOVERY_ARGS=()
+case "$MODE" in --debug|--logs|--telemetry) RECOVERY_ARGS+=(--replace-only);; esac
+python3 "$ROOT_DIR/script/install_recovery.py" "$ROOT_DIR" "$DEST" "$INCOMING" "$PREVIOUS" "$REJECTED" \
+  "$UPGRADE_PREPARATION" "$INSTALL_STARTED" ${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}
 INCOMING=""
-if ! codesign --verify --deep --strict "$DEST"; then
-  mv "$DEST" "/Applications/.Checklist-rejected-$INSTALL_ID.app"
-  if [ "$HAD_PREVIOUS" = 1 ]; then mv "$PREVIOUS" "$DEST"; fi
-  echo "Installed signature failed; previous bundle restored. Data was retained." >&2
-  exit 1
-fi
 phase stop install
 phase finish
 save_timing
@@ -446,30 +406,6 @@ record['verification']=json.loads((Path(sys.argv[5])/'build-verification.json').
 record['timing']=record['verification']['timing']
 (build/'last-install.json').write_text(json.dumps(record,indent=2)+'\n')
 PY
-case "$MODE" in
-  --debug|--logs|--telemetry) ;;
-  *) open -n "$DEST" ;;
-esac
-# Installed verification is mandatory for both verified installation routes.
-case "$MODE" in
-  --verify|--install-stage)
-  sleep 2
-  if ! python3 "$ROOT_DIR/script/verify_install.py" "$DEST" --install-started "$INSTALL_STARTED"; then
-    echo "Installed verification failed." >&2
-    if ! python3 "$ROOT_DIR/script/verify_install.py" --failure-guidance --install-started "$INSTALL_STARTED" >&2; then
-      echo "The installed bundle and the store were kept. Check checklist service status and the service log. If the first start upgraded the store, a rollback is a restore of its protected pre-upgrade generation, not the previous bundle." >&2
-    fi
-    if [ "$HAD_PREVIOUS" = 1 ]; then
-      echo "Previous bundle kept at $PREVIOUS; it does not restore the store." >&2
-    fi
-    exit 1
-  fi
-  if [ -n "${OFFLINE_STARTED:-}" ]; then
-    echo "Measured service offline window: $(( $(date +%s) - OFFLINE_STARTED )) s (stop request to first healthy service answer)."
-    OFFLINE_STARTED=""
-  fi
-  ;;
-esac
 echo "Installed $DEST"
 if [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained at $PREVIOUS; it does not restore the store."; fi
 if [ "$HAD_PREVIOUS" != 1 ]; then PREVIOUS=""; fi

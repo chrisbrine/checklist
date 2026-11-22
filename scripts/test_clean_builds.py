@@ -772,7 +772,7 @@ class CleanupTests(unittest.TestCase):
     def test_post_install_hook_is_after_checks_and_only_changes_post_install_tail(self):
         source=(ROOT/'script/build_and_run.sh').read_text()
         hook=source.index('post_install_cleanup()')
-        self.assertGreater(hook,source.index('Installed verification failed.'))
+        self.assertGreater(hook,source.index('script/install_recovery.py" "$ROOT_DIR" "$DEST"'))
         self.assertGreater(hook,source.index('echo "Installed $DEST"'))
         self.assertIn('post_install_cleanup\n',source[hook:])
         self.assertNotIn('rm -',source[hook:])

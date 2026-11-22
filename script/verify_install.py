@@ -106,31 +106,52 @@ def describe_status(result, limit=1000):
     return f'exit {result.returncode}; stdout {text(result.stdout)}; stderr {text(result.stderr)}'
 
 
-def executable_paths():
+def process_executables(runner=subprocess.run, timeout=5):
     library = ctypes.CDLL('/usr/lib/libproc.dylib')
-    for line in subprocess.check_output(['ps', '-axo', 'pid='], text=True).splitlines():
+    listing = runner(['ps', '-axo', 'pid='], text=True, capture_output=True, check=True, timeout=timeout)
+    for line in listing.stdout.splitlines():
+        pid = int(line.strip())
         buffer = ctypes.create_string_buffer(4096)
-        if library.proc_pidpath(int(line.strip()), buffer, len(buffer)) > 0:
-            yield os.fsdecode(buffer.value)
+        if library.proc_pidpath(pid, buffer, len(buffer)) > 0:
+            yield pid, os.fsdecode(buffer.value)
+
+
+def executable_paths():
+    return (path for _, path in process_executables())
 
 
 def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monotonic, sleep=time.sleep,
-           progress=None, install_started=None):
+           progress=None, install_started=None, deadline=None, include_failure_guidance=True, on_upgrade=None):
     destination = Path(destination)
     require_installable(verify_bundle(destination))
     executable = destination / 'Contents/MacOS/ChecklistApp'
-    if paths is not None: paths = tuple(paths)
+    if paths is not None and not callable(paths): paths = tuple(paths)
     progress = progress or (lambda line: print(line, file=sys.stderr, flush=True))
     def fail(message):
-        raise ValueError(message + '\n' + failure_guidance(install_started))
-    bound = deadline_seconds();started = clock();deadline = started + bound;next_progress = started + 60
+        if include_failure_guidance:
+            message += '\n' + failure_guidance(install_started)
+        raise ValueError(message)
+    started = clock()
+    if deadline is None:
+        deadline = started + deadline_seconds()
+    next_progress = started + 60
     last_upgrade = None;last_status = 'no status call finished'
     command = [str(destination / 'Contents/MacOS/checklist'), 'service', 'status']
     def expired():
+        bound = max(0, deadline - started)
         fail(f'The installed Checklist service is still starting after {bound:g} seconds; verification deadline expired. '
              'Last status: ' + last_status)
+    def notify_upgrade():
+        nonlocal deadline
+        if on_upgrade is not None:
+            upgrade_deadline = on_upgrade()
+            if upgrade_deadline is not None:
+                deadline = max(deadline, upgrade_deadline)
     while True:
-        if str(executable) not in (executable_paths() if paths is None else paths):
+        remaining = deadline - clock()
+        if remaining <= 0: expired()
+        running = executable_paths() if paths is None else paths(remaining) if callable(paths) else paths
+        if str(executable) not in running:
             fail('The exact installed Checklist app process is not running.')
         remaining = deadline - clock()
         if remaining <= 0: expired()
@@ -142,6 +163,8 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
             last_status = describe_status(result)
             try: payload = json.loads(result.stdout)
             except (ValueError, TypeError):
+                if re.match(r'\s*Checklist: STORAGE_UPGRADING:', result.stderr or ''):
+                    notify_upgrade()
                 if not status_still_starting(result):
                     fail('The installed Checklist service returned invalid status: ' + last_status)
             else:
@@ -157,6 +180,7 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
                     fail('The installed Checklist service returned an error status.')
                 upgrade = upgrading_status(payload)
                 if upgrade is not None:
+                    notify_upgrade()
                     message = upgrading_message(upgrade)
                     if message != last_upgrade:
                         progress('Installed Checklist service ' + message + '.')
@@ -167,6 +191,7 @@ def verify(destination, paths=None, runner=subprocess.run, *, clock=time.monoton
                     identity = verify_bundle(destination)
                     for key in ['version', 'build_id', 'build_number']:
                         if body.get(key) != identity[key]: fail('Running service differs from installed bundle: ' + key)
+                    if clock() > deadline: expired()
                     return {'installed_app': str(executable), 'service_state': 'healthy'}
         now = clock()
         if now >= deadline: expired()

@@ -91,9 +91,12 @@ class BuildScriptTests(unittest.TestCase):
         for folder in ['script', 'Sources', 'Resources', 'tools']:
             (self.root / folder).mkdir()
         for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py', 'verify_stage.py',
-                     'evidence_folder.py', 'clean_scratch.py', 'retire_old_bundles.py']:
+                     'evidence_folder.py', 'clean_scratch.py', 'retire_old_bundles.py', 'install_signer_guard.py']:
             shutil.copyfile(ROOT / 'script' / name, self.root / 'script' / name)
-        (self.root / 'script/build_and_run.sh').chmod(0o755)
+        script = self.root / 'script/build_and_run.sh'
+        script.write_text(script.read_text().replace('DEST="/Applications/Checklist.app"',
+                                                   'DEST="$ROOT_DIR/installed-fixture.app"'))
+        script.chmod(0o755)
         (self.root / 'VERSION').write_text('0.0.1\n')
         (self.root / 'Package.swift').write_text('// fixture\n')
         (self.root / 'Package.resolved').write_text('{}\n')

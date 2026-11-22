@@ -32,7 +32,7 @@ import uuid
 from clean_scratch import caller_session, mark_qualification, read_marker, requested_tickets, validate_fingerprint
 from test_instance_restage import FRESH_COPY, backup_completion, reuse_proof
 from verify_stage import sha, signing_teams, verify as verify_stage
-from verify_install import describe_status, failure_guidance, status_still_starting, upgrading_message, upgrading_status
+from verify_install import describe_status, status_still_starting, upgrading_message, upgrading_status
 
 REPO = Path(__file__).resolve().parent.parent
 BASE = Path.home() / 'Library/Application Support/Checklist Test Instances'
@@ -2009,11 +2009,10 @@ def promote(arguments, p):
     if not all(gates.values()): raise ValueError('Promotion refused: all gates must pass, including a live-backup-seeded check of this build. ' + RELOCATION_REQUIRED)
     if not arguments.dry_run:
         print('Promotion: installer will print the expected offline window before stopping the service and the measured window after its first healthy answer.', flush=True)
-        install_started = time.time()
         try:
             subprocess.run(command, check=True)
         except subprocess.CalledProcessError as error:
-            raise ValueError('Promotion: install ran; installed verification failed.\n' + failure_guidance(install_started)) from error
+            raise ValueError('Promotion failed. See the installer output for the verification and recovery outcome.') from error
         print('Promoted build ' + selected['build_id'] + '; installed app and service verification passed.')
 
 

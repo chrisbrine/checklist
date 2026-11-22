@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 
@@ -194,7 +193,9 @@ class RetireOldBundlesTests(unittest.TestCase):
     def test_installer_hook_runs_after_verification_and_failure_only_warns(self):
         # Execute the bounded tail with stubbed Python, never the installer itself.
         script = (REPO / 'script/build_and_run.sh').read_text()
-        block = script[script.index('# Installed verification is mandatory'):script.index('# Interactive modes can wait')]
+        start = script.index('# Installed verification is mandatory')
+        recovery = script[start:script.index('phase stop install', start)]
+        hooks = script[script.index('echo "Installed $DEST"'):script.index('# Interactive modes can wait')]
         hook = script.index('if ! python3 "$ROOT_DIR/script/retire_old_bundles.py"')
         self.assertLess(hook, script.index('lldb --'))
         self.assertLess(hook, script.index('/usr/bin/log stream'))
@@ -202,8 +203,10 @@ class RetireOldBundlesTests(unittest.TestCase):
         stub = binary / 'python3'
         stub.write_text('#!' + sys.executable + '\n' + """import json,os,sys
 with open(os.environ['TRACE'], 'a') as output: output.write(json.dumps(sys.argv[1:]) + '\\n')
-if sys.argv[1].endswith('verify_install.py'):
+if sys.argv[1].endswith('install_recovery.py'):
     exit_code = os.environ['VERIFY_EXIT']
+elif sys.argv[1].endswith('install_skill.py'):
+    exit_code = '0'
 elif sys.argv[1].endswith('retire_old_bundles.py'):
     exit_code = os.environ['RETIRE_EXIT']
 elif sys.argv[1] == '-':
@@ -218,52 +221,40 @@ raise SystemExit(int(exit_code))
 """)
         stub.chmod(0o755)
         previous = self.bundle('.Checklist-previous-20261020T010000Z-20.app')
-        capture = self.root / 'capture with spaces';capture.mkdir()
-        build = self.root / 'build';build.mkdir()
-        cases = [(mode, verify, retire, cleanup, had_previous)
-                 for mode in ['--verify', '--install-stage', '--install', 'run', '--debug', '--logs', '--telemetry']
-                 for verify, retire, cleanup, had_previous in [
-                     (0, 0, 0, '1'), (0, 1, 0, '0'), (0, 0, 1, '1'),
-                     (0, 1, 1, '1'), (1, 0, 0, '1')]]
-        for mode, verify, retire, cleanup, had_previous in cases:
-            with self.subTest(mode=mode, verify=verify, retire=retire, cleanup=cleanup, previous=had_previous):
+        cases = [(0, 0, 0, '1'), (0, 1, 0, '0'), (0, 0, 1, '1'), (0, 1, 1, '1'), (1, 0, 0, '1')]
+        for index, (verify, retire, cleanup, had_previous) in enumerate(cases):
+            with self.subTest(verify=verify, retire=retire, cleanup=cleanup, previous=had_previous):
                 trace.write_text('')
-                (capture/'post-install-cleanup.jsonl').unlink(missing_ok=True)
-                (build/'.build-lock').mkdir(exist_ok=True)
-                environment = dict(self.environment, MODE=mode, ROOT_DIR=str(REPO), DEST=str(self.applications / 'Checklist.app'),
+                capture = self.root / f'capture with spaces {index}';capture.mkdir()
+                build = self.root / f'build-{index}';(build/'.build-lock').mkdir(parents=True)
+                environment = dict(self.environment, MODE='--install-stage', ROOT_DIR=str(REPO), DEST=str(self.applications / 'Checklist.app'),
                                    BUILD_ROOT=str(build), BUILD_LOCK_OWNED='1', CAPTURE_DIR=str(capture), HAD_PREVIOUS=had_previous, PREVIOUS=str(previous), INSTALL_STARTED='1234', TRACE=str(trace),
+                                   INCOMING=str(self.applications / '.incoming.app'), REJECTED=str(self.applications / '.rejected.app'),
+                                   UPGRADE_PREPARATION='{"needs_upgrade":false}',
                                    VERIFY_EXIT=str(verify), RETIRE_EXIT=str(retire), CLEANUP_EXIT=str(cleanup),
                                    PATH=str(binary) + os.pathsep + os.environ['PATH'])
-                result = subprocess.run(['bash', '-c', 'set -euo pipefail\nsleep() { :; }\n' + block],
-                                        env=environment, capture_output=True, text=True)
-                failed_verify = mode in ['--verify', '--install-stage'] and verify
-                if not failed_verify:
-                    log=capture/'post-install-cleanup.jsonl'
-                    deadline=time.monotonic()+3
-                    while time.monotonic()<deadline and (not log.exists() or 'fixture cleanup exit ' not in log.read_text()):
-                        time.sleep(0.01)
-                    self.assertIn('fixture cleanup exit '+str(cleanup),log.read_text())
-                    self.assertFalse((build/'.build-lock').exists())
-                if not failed_verify:
-                    # CL-372: the release is in the foreground and the build cleanup in the background, in either order.
-                    deadline=time.monotonic()+3
-                    while time.monotonic()<deadline and trace.read_text().count('"-"')<2:
-                        time.sleep(0.01)
+                setup = 'set -euo pipefail\nrmdir() { mv "$1" "$BUILD_ROOT/released-lock"; }\n'
+                result = subprocess.run(['bash', '-c', setup + recovery + hooks + '\nwait'],
+                                        env=environment, capture_output=True, text=True, timeout=15)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
-                if mode in ['--verify', '--install-stage'] and verify:
+                self.assertEqual(calls[0], [str(REPO / 'script/install_recovery.py'), str(REPO),
+                                           environment['DEST'], environment['INCOMING'], str(previous),
+                                           environment['REJECTED'], environment['UPGRADE_PREPARATION'], '1234'])
+                if verify:
                     self.assertEqual(result.returncode, 1)
-                    self.assertEqual(calls, [
-                        [str(REPO / 'script/verify_install.py'), environment['DEST'], '--install-started', '1234'],
-                        [str(REPO / 'script/verify_install.py'), '--failure-guidance', '--install-started', '1234']])
+                    self.assertEqual(len(calls), 1)
                     self.assertNotIn('Warning:', result.stderr)
                     self.assertNotIn('After the installed checks pass', result.stdout)
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    expected = []
-                    if mode in ['--verify', '--install-stage']:
-                        expected.append([str(REPO / 'script/verify_install.py'), environment['DEST'], '--install-started', '1234'])
-                    expected.append([str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''])
-                    self.assertEqual(calls[:-2], expected)
+                    self.assertIn('fixture cleanup exit '+str(cleanup), (capture/'post-install-cleanup.jsonl').read_text())
+                    self.assertFalse((build/'.build-lock').exists())
+                    self.assertEqual(calls[1:-2], [
+                        [str(REPO / 'script/install_skill.py'), '--apply', '--source',
+                         str(Path(environment['DEST']) / 'Contents/Resources/skills/checklist')],
+                        [str(SCRIPT), '--after-install', '--keep', str(previous) if had_previous == '1' else ''],
+                    ])
+                    # CL-372: the release is in the foreground and the build cleanup in the background, in either order.
                     self.assertCountEqual(calls[-2:], [['-', str(REPO), str(capture)], ['-', str(REPO)]])
                     self.assertIn('Build cleanup started in background', result.stdout)
                     self.assertEqual('Warning: old Checklist bundles' in result.stderr, bool(retire))

@@ -3212,8 +3212,8 @@ class UpgradeInstallScriptTests(unittest.TestCase):
     def test_preparation_finishes_before_stop_and_failure_never_reaches_stop(self):
         script = (harness.REPO / 'script/build_and_run.sh').read_text()
         start = script.index('# Complete the protected copy and rehearsal')
-        end = script.index('# Quiesce only this UI', start)
-        self.assertLess(end, script.index('os.kill(pid,signal.SIGTERM)', end))
+        end = script.index('# Installed verification is mandatory', start)
+        self.assertLess(end, script.index('script/install_recovery.py', end))
         block = script[start:end]
         with test_directory() as directory:
             base = Path(directory).resolve();incoming = base / 'incoming.app'
@@ -3244,7 +3244,7 @@ raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
     def test_upgrade_measurement_is_printed_before_stop_and_missing_measurement_refuses(self):
         script = (harness.REPO / 'script/build_and_run.sh').read_text()
         start = script.index('# Complete the protected copy and rehearsal')
-        block = script[start:script.index('# Quiesce only this UI', start)]
+        block = script[start:script.index('# Installed verification is mandatory', start)]
         with test_directory() as directory:
             base = Path(directory).resolve();service = base / 'incoming.app/Contents/MacOS/ChecklistService'
             service.parent.mkdir(parents=True)
@@ -3268,21 +3268,28 @@ raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
                     self.assertIn('about 50 s', result.stdout)
                 else: self.assertNotIn('\nstop', result.stdout)
 
-    def test_install_measurement_names_healthy_answer_and_failure_is_only_lower_bound(self):
+    def test_install_modes_dispatch_recovery_before_install_receipts_and_hooks(self):
         script = (harness.REPO / 'script/build_and_run.sh').read_text()
         start = script.index('# Installed verification is mandatory')
-        end = script.index('\nif [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained', start)
-        result = subprocess.run(['bash', '-c', 'set -euo pipefail\npython3() { :; }\nsleep() { :; }\ndate() { echo 109; }\n' + script[start:end]],
-                                env=dict(os.environ, MODE='--install-stage', ROOT_DIR='/fixture', DEST='/fixture/app',
-                                         INSTALL_STARTED='100', OFFLINE_STARTED='100'), text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Measured service offline window: 9 s (stop request to first healthy service answer)', result.stdout)
-        cleanup = script[script.index('cleanup() {'):script.index('\ntrap cleanup EXIT')]
-        result = subprocess.run(['bash', '-c', 'set -euo pipefail\ndate() { echo 109; }\n' + cleanup + '\ncleanup'],
-                                env=dict(os.environ, OFFLINE_STARTED='100', STAGE_ASSEMBLY='', VERIFICATION_RECEIPT='',
-                                         BUILD_LOCK_OWNED='0', INCOMING=''), text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('at least 9 s (no healthy service answer observed', result.stderr)
+        end = script.index('phase stop install', start)
+        for later in ('last-install.json', 'script/install_skill.py', 'script/retire_old_bundles.py'):
+            self.assertLess(end, script.index(later, end))
+        fake = 'set -euo pipefail\npython3() { printf "%s\\n" "$@"; return "$RESULT"; }\n'
+        for mode in ('--install-stage', '--verify', '--install', 'run', '--debug', '--logs', '--telemetry'):
+            for exit_code in (0, 1):
+                with self.subTest(mode=mode, exit_code=exit_code):
+                    result = subprocess.run(['bash', '-c', fake + script[start:end] + 'echo publish'],
+                                            env=dict(os.environ, MODE=mode, ROOT_DIR='/fixture root', DEST='/fixture/app',
+                                                     INCOMING='/fixture/new', PREVIOUS='/fixture/previous', REJECTED='/fixture/rejected',
+                                                     INSTALL_STARTED='100', UPGRADE_PREPARATION='{"needs_upgrade": false}',
+                                                     RESULT=str(exit_code)), text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    output = result.stdout.splitlines()
+                    self.assertEqual(output[:8], ['/fixture root/script/install_recovery.py', '/fixture root',
+                                                  '/fixture/app', '/fixture/new', '/fixture/previous', '/fixture/rejected',
+                                                  '{"needs_upgrade": false}', '100'])
+                    self.assertEqual('--replace-only' in output, mode in ('--debug', '--logs', '--telemetry'))
+                    self.assertEqual('publish' in output, exit_code == 0)
 
 
 class InstalledVerificationTests(unittest.TestCase):
@@ -3448,63 +3455,16 @@ class InstalledVerificationTests(unittest.TestCase):
         result = verify_install.verify(target, [str(target / 'Contents/MacOS/ChecklistApp')], lambda *a, **k: response)
         self.assertEqual(result['service_state'], 'healthy')
 
-    def test_actual_installer_dispatch_preserves_previous_bundle_and_propagates_failure(self):
-        # Execute only the actual read-only verification tail, never install/quiesce.
-        script = (harness.REPO / 'script/build_and_run.sh').read_text()
-        start = script.index('# Installed verification is mandatory')
-        end = script.index('\nif [ "$HAD_PREVIOUS" = 1 ]; then echo "Previous bundle retained', start)
-        block = script[start:end]
-        with test_directory() as directory:
-            base = Path(directory).resolve();binary = base / 'bin';binary.mkdir()
-            stub = binary / 'python3'
-            stub.write_text('#!' + sys.executable + '\n' + """import json,os,sys
-with open(os.environ['VERIFY_TRACE'],'a') as trace: trace.write(json.dumps(sys.argv[1:])+'\\n')
-raise SystemExit(int(os.environ['VERIFY_EXIT']))
-""")
-            stub.chmod(0o755);sleep = binary / 'sleep';sleep.write_text('#!/bin/sh\nexit 0\n');sleep.chmod(0o755)
-            previous = base / 'previous.app';previous.mkdir();trace = base / 'trace.jsonl'
-            for mode, code in [('--verify', 0), ('--install-stage', 0), ('--verify', 1), ('--install-stage', 1), ('--install', 1)]:
-                trace.write_text('')
-                environment = dict(os.environ, MODE=mode, ROOT_DIR=str(harness.REPO), DEST=str(base / 'installed.app'),
-                                   HAD_PREVIOUS='1', PREVIOUS=str(previous), INSTALL_STARTED='1234', VERIFY_TRACE=str(trace), VERIFY_EXIT=str(code), PATH=str(binary) + os.pathsep + os.environ['PATH'])
-                result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=environment, text=True, capture_output=True)
-                self.assertTrue(previous.is_dir())
-                calls = trace.read_text().splitlines()
-                self.assertEqual(len(calls), 0 if mode == '--install' else (2 if code else 1))
-                if mode != '--install' and code:
-                    self.assertEqual(result.returncode, 1);self.assertIn(str(previous), result.stderr)
-                    self.assert_safe_guidance(result.stderr)
-                    self.assertNotIn('Installed ' + str(base / 'installed.app'), result.stdout)
-                else: self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_verifier_invocation_failure_is_fatal_in_both_required_modes(self):
-        script = (harness.REPO / 'script/build_and_run.sh').read_text()
-        block = script[script.index('# Installed verification is mandatory'):]
-        with test_directory() as directory:
-            base = Path(directory).resolve();previous = base / 'previous.app';previous.mkdir()
-            for mode in ['--verify', '--install-stage']:
-                with self.subTest(mode=mode):
-                    environment = dict(os.environ, MODE=mode, ROOT_DIR=str(harness.REPO), DEST=str(base / 'installed.app'),
-                                       HAD_PREVIOUS='1', PREVIOUS=str(previous), INSTALL_STARTED='1234')
-                    code = 'set -euo pipefail\npython3() { return 70; }\nsleep() { :; }\n' + block
-                    result = subprocess.run(['bash', '-c', code], env=environment, text=True, capture_output=True)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertTrue(previous.is_dir());self.assertIn(str(previous), result.stderr)
-                    self.assert_safe_guidance(result.stderr)
-                    self.assertNotIn('Installed ' + str(base / 'installed.app'), result.stdout)
-
     def test_promotion_never_reports_success_after_installed_verification_failure(self):
         selected = {'build_id': 'build', 'source_fingerprint': 'fingerprint', 'stage_path': '/synthetic/stage', 'seed': {'kind': 'empty'}}
         with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()), \
              patch.object(harness, 'load', return_value=selected), patch.object(harness, 'bundle_check'), \
              patch.object(harness, 'promotion_gates', return_value={'selected_build_check': True, 'live_snapshot_check_same_build': True}), \
-             patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')), \
-             patch.object(harness, 'failure_guidance', return_value=verify_install.failure_guidance(None)):
+             patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')):
             output = io.StringIO()
             with redirect_stdout(output), self.assertRaises(ValueError) as error:
                 harness.promote(SimpleNamespace(dry_run=False), harness.checked(1))
-            self.assertIn('install ran; installed verification failed', str(error.exception))
-            self.assert_safe_guidance(str(error.exception))
+            self.assertIn('installer output for the verification and recovery outcome', str(error.exception))
             self.assertNotIn('Promoted build', output.getvalue())
 
 
