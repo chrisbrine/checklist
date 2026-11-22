@@ -868,6 +868,44 @@ class SeedInspectionDifferentialTests(unittest.TestCase):
                     self.assertEqual(self.decision(harness, database, destination, live, slots), expected)
             self.assertEqual(decisions, {'allowed', 'refused'})
 
+    def test_snapshot_entry_point_checks_both_physical_layouts(self):
+        captured = Path('source-captures/repo/capture/source')
+        for prefix, leaf in itertools.product(['managed', ''], ['link', 'target']):
+            with self.subTest(prefix=prefix, leaf=leaf), test_directory() as directory:
+                outcomes = []
+                for implementation in [self.baseline, harness]:
+                    root = Path(directory).resolve() / implementation.__name__
+                    root.mkdir()
+                    value = root / 'data' / prefix / captured / leaf
+                    records = [('task', {'id': 'task', 'output_path': str(value)})]
+                    source, destination, manifest = SnapshotLogicTests().fixture(root, schema=2, records=records)
+                    tree = source / 'managed' / captured
+                    tree.mkdir(parents=True)
+                    (tree / 'target').write_bytes(b'payload')
+                    (tree / 'link').symlink_to('target')
+                    for name, kind in [('target', 'file'), ('link', 'symlink')]:
+                        payload = b'payload' if kind == 'file' else b'target'
+                        descriptor = {'kind': kind, 'relativePath': str(captured / name), 'executable': False}
+                        if kind == 'symlink':
+                            descriptor['linkTarget'] = 'target'
+                        manifest['objects'].append({
+                            'sha256': harness.hashlib.sha256(payload).hexdigest(),
+                            'size': len(payload), 'descriptor': descriptor})
+                    (source / 'manifest.json').write_text(json.dumps(manifest))
+                    try:
+                        result = implementation.snapshot_seed(source, destination, current_schema=4)
+                    except ValueError as error:
+                        outcomes.append(('refused', str(error)))
+                        if implementation is harness or prefix == 'managed':
+                            self.assertFalse(any(destination.iterdir()))
+                    else:
+                        outcomes.append(('allowed', result['path_inspection']))
+                        self.assertTrue((destination / captured / 'link').is_symlink())
+                self.assertEqual(*outcomes)
+                self.assertEqual(outcomes[0][0], 'refused' if leaf == 'link' else 'allowed')
+                if leaf == 'link':
+                    self.assertIn('stored file path through a symlink', outcomes[0][1])
+
     def test_replaced_leaf_is_rechecked_at_release(self):
         for redirects in [False, True]:
             with self.subTest(redirects=redirects), test_directory() as directory:
@@ -3158,7 +3196,9 @@ class SeedPathReuseTests(unittest.TestCase):
 
     def test_owned_stopped_slot_reuses_create_inspection(self):
         with self.created_slot() as (p, scan, *_):
-            harness.start(SimpleNamespace(slot=1, gui=False), p)
+            with patch.object(harness.hashlib, 'file_digest', wraps=harness.hashlib.file_digest) as digest:
+                harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(digest.call_count, 1)
             self.assertEqual(scan.call_count, 1)
             self.assertEqual(harness.load(p)['start_path_inspection'], 'reused')
 
@@ -3180,6 +3220,69 @@ class SeedPathReuseTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 2)
             self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
 
+    def test_database_or_wal_change_at_startup_handoff_rechecks_before_access(self):
+        for suffix, boundary in itertools.product(['', '-wal'], ['plist', 'bootstrap']):
+            with self.subTest(suffix=suffix, boundary=boundary), self.created_slot(retained='wal') as (p, scan, *_):
+                file = p['data'] / ('checklist.sqlite' + suffix)
+                def change_stamp():
+                    info = file.stat()
+                    os.utime(file, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+
+                original_write = Path.write_bytes
+                original_run = harness.run
+                def write_bytes(path, data):
+                    result = original_write(path, data)
+                    if boundary == 'plist' and path == p['folder'] / 'service.plist':
+                        change_stamp()
+                    return result
+
+                def run(command, **kwargs):
+                    result = original_run(command, **kwargs)
+                    if command[:2] == ['launchctl', 'bootstrap']:
+                        if boundary == 'plist':
+                            self.assertEqual(scan.call_count, 2, 'inspection must precede bootstrap')
+                        else:
+                            change_stamp()
+                    return result
+
+                def service_status(*args, **kwargs):
+                    self.assertEqual(scan.call_count, 2, 'inspection must precede activation')
+
+                with patch.object(Path, 'write_bytes', write_bytes), patch.object(harness, 'run', side_effect=run), \
+                     patch.object(harness, 'service_status', side_effect=service_status):
+                    harness.start(SimpleNamespace(slot=1, gui=False), p)
+                self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
+
+    def test_late_unsafe_seed_does_not_activate_the_new_job(self):
+        for change in ['database', 'managed leaf']:
+            with self.subTest(change=change), self.created_slot() as (p, scan, _, live, _, commands):
+                original_run = harness.run
+                def run(command, **kwargs):
+                    result = original_run(command, **kwargs)
+                    if command[:2] != ['launchctl', 'bootstrap']:
+                        return result
+                    if change == 'managed leaf':
+                        leaf = p['data'] / 'objects/file'
+                        leaf.rename(leaf.with_name('previous'))
+                        leaf.symlink_to(live / 'objects/file')
+                    else:
+                        with closing(sqlite3.connect(p['data'] / 'checklist.sqlite')) as db, db:
+                            db.create_collation('checklist_storage_v2', lambda a, b: (a > b) - (a < b))
+                            record = {'id': 'unsafe', 'output_path': str(live / 'objects/file')}
+                            db.execute('INSERT INTO records VALUES (?, ?, ?, ?, ?)',
+                                       ('unsafe', None, 'task', 1, json.dumps(record)))
+                    return result
+
+                with patch.object(harness, 'run', side_effect=run), \
+                     self.assertRaisesRegex(ValueError, 'absolute path outside the destination slot root|through a symlink'):
+                    harness.start(SimpleNamespace(slot=1, gui=False), p)
+                harness.service_status.assert_not_called()
+                self.assertEqual(scan.call_count, 2)
+                self.assertEqual([cmd[1] for cmd in commands if cmd[0] == 'launchctl'], ['bootstrap', 'bootout'])
+                metadata = harness.load(p)
+                self.assertEqual(metadata['mode'], 'stopped')
+                self.assertNotIn('start_path_inspection', metadata)
+
     def test_cold_rollback_journal_keeps_full_inspection(self):
         with self.created_slot(retained='journal') as (p, scan, *_):
             harness.start(SimpleNamespace(slot=1, gui=False), p)
@@ -3198,8 +3301,8 @@ class SeedPathReuseTests(unittest.TestCase):
                     database.with_name('checklist.sqlite-wal').write_bytes(b'')
                 if change == 'hash':
                     do_fingerprint = harness.seed_store_files
-                    def different_digest(path, *, hash_bytes=False):
-                        files = do_fingerprint(path, hash_bytes=hash_bytes)
+                    def different_digest(path, *, hash_bytes=False, allow_journal=False):
+                        files = do_fingerprint(path, hash_bytes=hash_bytes, allow_journal=allow_journal)
                         if hash_bytes: files['']['sha256'] = '0' * 64
                         return files
                     stack.enter_context(patch.object(harness, 'seed_store_files', side_effect=different_digest))

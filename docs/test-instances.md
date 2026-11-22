@@ -43,9 +43,10 @@ The harness resolves the live root from nonempty `CHECKLIST_DATA_ROOT`, otherwis
 
 Create runs one read-only path inspection on the unpublished destination.
 Snapshot and restored seeds verify their inventories and copied bytes first.
-The pass checks the actual local tree after materializing managed links. A
-refusal leaves the requested destination and app unpublished. The pass batches
-local no-symlink checks by directory and validates the directory observations
+The pass checks local path spellings in the materialized copy. For a backup it
+also checks those spellings against the verified snapshot layout in the same
+pass. A refusal leaves the requested destination and app unpublished. The pass
+batches local no-symlink checks by directory and validates the observations
 before returning. Inert history that carries no file authority needs no
 filesystem lookup. Standalone file URLs still require the slot-containment check.
 
@@ -63,19 +64,22 @@ whether the WAL was absent. The proof also records checked local directories
 and the alias, binding and Trash checks that depend on the current filesystem.
 It lives in a private file and `slot.json` records its digest. Start checks the
 active owner marker, confirms no slot job or process exists, revalidates those
-filesystem checks and matches the database and WAL fingerprints. If any check
-fails, the usual full inspection runs before launch. Older slots, starts
-from another session and copies with a retained rollback journal also run the
-full inspection. `slot.json` records
-`start_path_inspection` as `reused` or `full` after a successful start.
+filesystem checks and matches the database and WAL fingerprints. Start checks
+the file and local directory stamps again just before launchd registration and
+before the first service health call. A change discards reuse and triggers a
+full inspection. If the database, WAL or journal changes again during or after
+that inspection, start refuses. Older proofs, starts from another session and
+copies with a retained rollback journal also run the full inspection.
+`slot.json` records `start_path_inspection` as `reused` or `full` after a
+successful start.
 
 The 21 Nov 2026 live-backup check took 2 h 35 min at load 500–850. The source,
 destination and start inspections took 2,647 s, 2,693 s and 3,815 s. On 22 Nov
 the old inspector scanned the 2.88 GB slot 3 database in 2,589 s at one-minute
 load 670 to 616. The new inspector scanned it in 266 s at load 650 to 693.
-Both counted 3,054,388 managed
-relative paths and 14,962 external binding occurrences. Revalidating its
-filesystem proof took 44 s. Hashing the database took 5.5 s per read
+Both counted 3,054,388 managed relative paths and 14,962 external binding
+occurrences. Revalidating the filesystem proof took 44 s. Hashing the
+database took 5.5 s per read
 (one-minute load 693–708 during the latter measurements). Adding the one scan,
 proof revalidation and two hash reads to the earlier three minutes of copy,
 verification, launch and check work gives an estimated 8 min 22 s for a

@@ -638,7 +638,7 @@ MANIFEST_FILE_EVIDENCE_FIELDS = frozenset({'source_capture', 'artifact_refs', 'p
 
 
 def require_local_paths(database, destination, immutable=True, source_root=None,
-                        summary_source_root=None, summary_source_paths=None, proof=None):
+                        summary_source_root=None, summary_source_paths=None, proof=None, snapshot_layout=None):
     """Read-only seed inspection. Never open a stored managed absolute path.
 
     source_root is the verified snapshot manifest's origin or the stopped source
@@ -646,6 +646,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     protected relocation, not redirected by this harness. Other Checklist roots
     remain forbidden. Verified source manifests may admit display-only source
     summaries; startup restricts those to the exact recorded metadata fields.
+    A snapshot also checks local spellings against its pre-remap layout.
     Counts are occurrences, including repeated project refs.
     """
     database = Path(database).absolute()
@@ -659,6 +660,7 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     mapping = ManagedPathMapping()
     external_bindings = ExternalBindingOverlapCache()
     local_paths = LocalPathChecks(database.parent)
+    snapshot_paths = LocalPathChecks(snapshot_layout) if snapshot_layout is not None else None
     binding_paths = {}
     trash_paths = {}
     binding_bytes = 0
@@ -728,7 +730,11 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
     def check_local(relative, location):
         # During create the physical copy is .seed-data. Only inspect its local
         # entries; never stat the origin descriptor or an outside link target.
-        try: local_paths.check(str(relative))
+        spelling = str(relative)
+        try:
+            if snapshot_paths is not None:
+                snapshot_paths.check(spelling)
+            local_paths.check(spelling)
         except ValueError: refuse(location, 'a stored file path through a symlink')
 
     def check_slot_absolute(value, location):
@@ -1085,12 +1091,17 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
         try: external_bindings.revalidate()
         except (OSError, RuntimeError, ValueError) as error:
             refuse('external binding release', str(error))
-        try: checked_directories = local_paths.finish()
+        try:
+            if snapshot_paths is not None:
+                snapshot_paths.finish()
+            checked_directories = local_paths.finish()
         except (OSError, RuntimeError, ValueError):
             refuse('local path release', 'a local directory that changed during inspection')
     except (UnicodeError, RecursionError) as error:
         raise ValueError('Seed values cannot be safely inspected. ' + RELOCATION_REQUIRED) from error
     finally:
+        if snapshot_paths is not None:
+            snapshot_paths.close()
         local_paths.close()
         connection.close()
     if proof is not None and local_paths.reusable:
@@ -1110,14 +1121,16 @@ SEED_PATH_PROOF = 'seed-path-proof.json'
 MAX_SEED_PROOF_BYTES = 16 * 1024 * 1024
 
 
-def seed_store_files(database, *, hash_bytes=False):
+def seed_store_files(database, *, hash_bytes=False, allow_journal=False):
     """Fingerprint the exact named database and WAL without following a leaf link."""
-    journal = database.with_name(database.name + '-journal')
-    try: journal.lstat()
-    except FileNotFoundError: pass
-    else: raise ValueError('Seed has a rollback journal.')
+    suffixes = ('', '-wal', '-journal') if allow_journal else ('', '-wal')
+    if not allow_journal:
+        journal = database.with_name(database.name + '-journal')
+        try: journal.lstat()
+        except FileNotFoundError: pass
+        else: raise ValueError('Seed has a rollback journal.')
     files = {}
-    for suffix in ('', '-wal'):
+    for suffix in suffixes:
         path = database.with_name(database.name + suffix)
         try: info = path.lstat()
         except FileNotFoundError:
@@ -1137,7 +1150,7 @@ def seed_store_files(database, *, hash_bytes=False):
                 if file_stamp(os.fstat(descriptor)) != stamp or file_stamp(path.lstat()) != stamp:
                     raise ValueError('Seed database or WAL changed while hashing.')
         files[suffix] = entry
-    if hash_bytes and seed_store_files(database) != seed_file_stamps(files):
+    if hash_bytes and seed_store_files(database, allow_journal=allow_journal) != seed_file_stamps(files):
         raise ValueError('Seed database or WAL changed while hashing.')
     return files
 
@@ -1147,7 +1160,7 @@ def seed_file_stamps(files):
 
 
 def inspect_seed_database(database, destination, *, proof=None, immutable=True, source_root=None,
-                          summary_source_root=None):
+                          summary_source_root=None, snapshot_layout=None):
     # A stopped slot copy may retain a cold rollback journal. Leave its
     # interpretation to SQLite and use a full scan on subsequent starts.
     if proof is not None and not immutable and os.path.lexists(database.with_name(database.name + '-journal')):
@@ -1156,7 +1169,7 @@ def inspect_seed_database(database, destination, *, proof=None, immutable=True, 
     if before is not None and immutable and before['-wal'] is not None:
         raise ValueError('An immutable seed must have no WAL.')
     inspection = require_local_paths(database, destination, immutable=immutable, source_root=source_root,
-                                     summary_source_root=summary_source_root, proof=proof)
+                                     summary_source_root=summary_source_root, proof=proof, snapshot_layout=snapshot_layout)
     if proof:
         files = seed_store_files(database, hash_bytes=True)
         if before != seed_file_stamps(files):
@@ -1167,7 +1180,7 @@ def inspect_seed_database(database, destination, *, proof=None, immutable=True, 
 
 def seed_proof_context(p, metadata, summary_source_root):
     seed = metadata['seed']
-    return {'format': 1, 'destination': str(p['data']), 'live': str(LIVE), 'default_live': str(DEFAULT_LIVE),
+    return {'format': 2, 'destination': str(p['data']), 'live': str(LIVE), 'default_live': str(DEFAULT_LIVE),
             'base': str(BASE), 'build': metadata['source_fingerprint'], 'source_root': seed.get('source_root'),
             'summary_source_root': summary_source_root, 'source_summary_paths': seed.get('source_summary_paths', {}),
             'inspection': seed['path_inspection']}
@@ -1199,6 +1212,13 @@ def record_seed_path_proof(p, metadata, proof, session):
     metadata['seed_path_proof_sha256'] = hashlib.sha256(raw).hexdigest()
 
 
+def seed_directories_match(root, directories):
+    try:
+        return all(list(file_stamp((root / name).lstat())) == stamp for name, stamp in directories.items())
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
 def revalidate_seed_paths(root, proof):
     mapping = ManagedPathMapping()
     if any(list(mapping.components(path)) != parts for path, parts in proof['aliases'].items()):
@@ -1213,7 +1233,7 @@ def revalidate_seed_paths(root, proof):
         if receipt_trash_opacity(Path(path), unbound) != opaque:
             return False
     contained(root, root)
-    return all(list(file_stamp((root / name).lstat())) == stamp for name, stamp in proof['directories'].items())
+    return seed_directories_match(root, proof['directories'])
 
 
 def reusable_seed_inspection(p, metadata, summary_source_root):
@@ -1250,7 +1270,9 @@ def reusable_seed_inspection(p, metadata, summary_source_root):
         stopped(p)
     except (OSError, RuntimeError, TypeError, KeyError, ValueError, subprocess.SubprocessError):
         return None
-    return metadata['seed']['path_inspection']
+    # Carry the same observations through launch preparation. A successful
+    # proof also establishes that no rollback journal was present.
+    return stamps | {'-journal': None}, proof['directories']
 
 
 def snapshot_objects(manifest):
@@ -1550,8 +1572,8 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
         raise ValueError('Snapshot table counts mismatch.')
     live_snapshot = is_live_snapshot(source, manifest['sourceRoot'])
     summary_source_root = manifest['sourceRoot'] if live_snapshot else None
-    # Only verified bytes enter the unpublished copy. Check path authority there
-    # after materializing managed links, where the service will actually use it.
+    # Only verified bytes enter the unpublished copy. The same scan checks
+    # local spellings in the snapshot and where the service will use them.
     timing.start('materialization_and_verification')
     working = private_seed_copy(destination)
     copy_snapshot_files(source, working, regular)
@@ -1570,7 +1592,8 @@ def snapshot_seed(source, destination, destination_root=None, current_schema=Non
         (working / 'checklist-store.identity.json').chmod(0o600)
     timing.start('destination_path_inspection')
     inspection = inspect_seed_database(working / 'checklist.sqlite', destination_root or destination, proof=proof,
-                                       source_root=manifest['sourceRoot'], summary_source_root=summary_source_root)
+                                       source_root=manifest['sourceRoot'], summary_source_root=summary_source_root,
+                                       snapshot_layout=source)
     source_summary_paths = inspection.pop('source_summary_paths', {})
     working.rename(destination)
     age = max(0, time.time() - manifest_file.stat().st_mtime)
@@ -2045,24 +2068,60 @@ def start(arguments, p):
     if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused', 'restaging']:
         raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
     manifest = bundle_check(p, metadata)
-    if metadata['seed']['kind'] != 'empty':
-        require_managed_path_support(Path(metadata['stage_path']), manifest)
-        seed = metadata['seed']
+    seed = metadata['seed']
+    handoff_stamps = inspection_mode = None
+    handoff_directories = {}
+    metadata.pop('start_path_inspection', None)
+
+    def checked_database():
+        database = contained(p['data'] / 'checklist.sqlite', p['folder'])
+        for suffix in ('-wal', '-shm', '-journal'):
+            contained(database.with_name(database.name + suffix), p['folder'])
+        return database
+
+    def scan_seed(database):
+        inspection = require_local_paths(database, p['data'], immutable=False, source_root=seed.get('source_root'),
+                                         summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
+        require_receipt_path_support(stage, manifest, inspection)
+
+    def validate_seed_handoff():
+        nonlocal handoff_stamps, handoff_directories, inspection_mode
+        if handoff_stamps is None:
+            return
+        database = checked_database()
+        observed = seed_store_files(database, allow_journal=True)
+        if observed == handoff_stamps and not registered and seed_directories_match(p['data'], handoff_directories):
+            return
+        if inspection_mode == 'full':
+            raise ValueError('Seed database, WAL or journal changed after startup path inspection.')
+        resume_phase = timing.current
+        timing.start('seed_path_reinspection')
+        scan_seed(database)
+        timing.start(resume_phase)
+        if seed_store_files(checked_database(), allow_journal=True) != observed:
+            raise ValueError('Seed database, WAL or journal changed during startup path inspection.')
+        inspection_mode = 'full'
+        handoff_stamps = observed
+        handoff_directories = {}
+
+    if seed['kind'] != 'empty':
+        stage = Path(metadata['stage_path'])
+        require_managed_path_support(stage, manifest)
         # Recorded paths only; a restored seed made before CL-276 r1 has no live_snapshot field.
         source_summaries = (seed['kind'] == 'backup' and seed.get('live_snapshot')) or (
             seed['kind'] == 'restored' and seed.get('source_manifest') is not None
             and is_live_snapshot(Path(seed['source_manifest']).parent, seed.get('source_root')))
         summary_source_root = seed.get('source_root') if source_summaries else None
         timing.start('seed_path_preflight')
-        database = contained(p['data'] / 'checklist.sqlite', p['folder'])
-        for suffix in ('-wal', '-shm', '-journal'):
-            contained(database.with_name(database.name + suffix), p['folder'])
-        inspection = reusable_seed_inspection(p, metadata, summary_source_root)
-        metadata['start_path_inspection'] = 'reused' if inspection is not None else 'full'
-        if inspection is None:
-            inspection = require_local_paths(database, p['data'], immutable=False, source_root=seed.get('source_root'),
-                                             summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
-        require_receipt_path_support(Path(metadata['stage_path']), manifest, inspection)
+        database = checked_database()
+        reusable = reusable_seed_inspection(p, metadata, summary_source_root)
+        if reusable is None:
+            scan_seed(database)
+            inspection_mode = 'full'
+        else:
+            handoff_stamps, handoff_directories = reusable
+            require_receipt_path_support(stage, manifest, seed['path_inspection'])
+            inspection_mode = 'reused'
     logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)
     plist = contained(p['folder'] / 'service.plist', p['folder'])
     contents = {'Label': p['label'], 'MachServices': {p['label']: True},
@@ -2083,13 +2142,27 @@ def start(arguments, p):
     save(p, metadata)
     if not registered:
         plist.write_bytes(plistlib.dumps(contents))
+        validate_seed_handoff()
         run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
     metadata['allow_synthetic_relays'] = allow_synthetic_relays
     metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'; save(p, metadata)
     timing.start('launch_to_healthy')
+    try:
+        # RunAtLoad is false. The health call first activates a new job, so
+        # check again after registration and its bookkeeping.
+        validate_seed_handoff()
+    except (OSError, ValueError, sqlite3.Error):
+        if not registered:
+            result = run(['launchctl', 'bootout', f'gui/{os.getuid()}/{p["label"]}'], check=False)
+            if result.returncode == 0:
+                metadata['mode'] = 'stopped'
+                save(p, metadata)
+        raise
     service_status(p, bound=bound)
-    launch_seconds = time.monotonic() - launch_started
+    launch_seconds = time.monotonic() - launch_started - timing.phases.get('seed_path_reinspection', 0)
     metadata['start_timing'] = timing.finish()
+    if inspection_mode is not None:
+        metadata['start_path_inspection'] = inspection_mode
     if first_start and metadata['seed'].get('kind') == 'backup' and metadata['seed'].get('live_snapshot') is True:
         seed = metadata['seed'];before = seed['before_start']
         measurement = {'format': 1, 'kind': 'checklist-owned-copy-startup', 'first_start': True, 'live_snapshot': True,
