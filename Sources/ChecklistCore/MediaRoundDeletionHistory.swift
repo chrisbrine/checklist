@@ -82,10 +82,9 @@ struct MediaRoundDeletionHistory {
         CoreError("CLEANUP_INVENTORY_LIMIT", message)
     }
 
-    // A parent can be required at any import state. Job ownership permits
-    // expiring its reply only in the transaction that removes every parent.
-    // Active/recoverable operation replies and policy/registration receipts
-    // need their payload even when the round's owned graph leaves.
+    // Round-owned jobs and terminal operation receipts can wait for the final
+    // pass. Active/recoverable operations and independent consumers can still
+    // need their payload when the round's graph leaves.
     private static func matchingCommands() -> String {
         """
         WITH dependents AS (
@@ -95,13 +94,13 @@ struct MediaRoundDeletionHistory {
             FROM records WHERE type='storage_job' AND CASE WHEN json_valid(data) THEN
                 json_type(data,'$.parent_principal')='text' AND json_type(data,'$.parent_command_id')='text' ELSE 0 END
             UNION ALL
-            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.command_id') AS BLOB),2
-            FROM metadata WHERE \(operationNeedsResult)
+            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.command_id') AS BLOB),\(operationCommandProtection)
+            FROM metadata WHERE \(operationKey)
             UNION ALL
-            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.error_result_command_id') AS BLOB),2
-            FROM metadata WHERE \(operationNeedsResult)
+            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.error_result_command_id') AS BLOB),\(operationErrorProtection)
+            FROM metadata WHERE \(operationKey)
         ), protection AS MATERIALIZED (
-            SELECT p,c,MAX(protection) locked FROM dependents WHERE p IS NOT NULL AND c IS NOT NULL GROUP BY p,c
+            SELECT p,c,MAX(protection) locked FROM dependents WHERE protection>0 AND p IS NOT NULL AND c IS NOT NULL GROUP BY p,c
         )
         SELECT principal,command_id,length(CAST(principal AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(digest AS BLOB))+length(CAST(result AS BLOB)) work_bytes,
             CASE WHEN json_valid(result) THEN CASE WHEN \(resultHasOtherConsumer)
@@ -111,10 +110,25 @@ struct MediaRoundDeletionHistory {
         """
     }
 
-    private static let operationNeedsResult = """
-        key GLOB 'command-operation:*' AND CASE WHEN json_valid(value) THEN
-            json_extract(value,'$.state') IN ('queued','running') OR json_extract(value,'$.recoverable')=1 ELSE 0 END
+    private static let operationKey = "key GLOB 'command-operation:*'"
+
+    // Match the canonical journal slots read by operationPayload. A failed
+    // operation with an inline error already carries its outcome.
+    private static let operationCommandProtection = operationProtection(terminalConsumer: "json_extract(value,'$.state')='succeeded'")
+    private static let operationErrorProtection = operationProtection(terminalConsumer: """
+        json_extract(value,'$.state')='failed' AND json_type(value,'$.error') IS NULL
+        AND json_type(value,'$.error_result_command_id')='text'
+        """)
+
+    private static func operationProtection(terminalConsumer: String) -> String {
         """
+        CASE WHEN json_valid(value) THEN CASE
+            WHEN json_extract(value,'$.state') IN ('queued','running') OR json_extract(value,'$.recoverable')=1 THEN 2
+            WHEN \(terminalConsumer) THEN 1
+            ELSE 0 END
+        ELSE 0 END
+        """
+    }
 
     private static let resultHasOtherConsumer = """
         json_type(result,'$.data.policy') IS NOT NULL
@@ -146,7 +160,7 @@ struct MediaRoundDeletionHistory {
             guard try admit(row["work_bytes"]) else { pass.more = true; return pass }
             pass.events.append(row["id"])
         }
-        let malformed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'command-operation:*' AND NOT json_valid(value))")
+        let malformed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM metadata WHERE \(operationKey) AND NOT json_valid(value))")
         guard malformed != true else { throw StoreRecovery.required("command_operation_invalid") }
         let commands = try Row.fetchCursor(db, sql: matchingCommands(), arguments: [tokens,tokens,tokens])
         var finalOnly: [(String, String)] = []
@@ -159,7 +173,7 @@ struct MediaRoundDeletionHistory {
             }
             if protection == 1 {
                 guard finalOnly.count < passLimit, charge <= TicketCleanupInventory.byteLimit - finalBytes else {
-                    throw oversized("Command results required by round-owned jobs exceed one final history pass. The round remains present.")
+                    throw oversized("Command results required until the round is removed exceed one final history pass. The round remains present.")
                 }
                 finalOnly.append(item)
                 finalBytes += charge
@@ -199,20 +213,27 @@ struct MediaRoundDeletionHistory {
             SELECT CAST(m.key AS BLOB) source_id, json_valid(m.value) valid,
                 CASE WHEN json_valid(m.value) THEN CAST(json_extract(m.value,'$.principal') AS BLOB) END locked_principal,
                 CASE WHEN json_valid(m.value) THEN CAST(json_extract(m.value,'$.command_id') AS BLOB) END locked_command,
-                CASE WHEN json_valid(m.value) THEN CAST(json_extract(m.value,'$.error_result_command_id') AS BLOB) END error_command
+                CASE WHEN json_valid(m.value) THEN CAST(json_extract(m.value,'$.error_result_command_id') AS BLOB) END error_command,
+                \(Self.operationCommandProtection) command_protection,
+                \(Self.operationErrorProtection) error_protection
             FROM \(journal) changed JOIN metadata m ON m.key=CAST(changed.id AS TEXT)
-            WHERE changed.kind=3 AND (NOT json_valid(m.value) OR (\(Self.operationNeedsResult)))
+            WHERE changed.kind=3 AND (NOT json_valid(m.value) OR (\(Self.operationKey)))
             """)
+        let minimumProtection = more ? 1 : 2
         while let row = try operations.next() {
             let id: Data = row["source_id"]
             guard row["valid"] as Bool else {
                 throw MediaRoundDeletionFence.changed("history_operation_invalid",type:"metadata",id:id)
             }
+            let locksCommand = (row["command_protection"] as Int) >= minimumProtection
+            let locksError = (row["error_protection"] as Int) >= minimumProtection
+            guard locksCommand || locksError else {continue}
             guard let principal: Data = row["locked_principal"], let command: Data = row["locked_command"] else {
                 throw MediaRoundDeletionFence.changed("history_operation_invalid",type:"metadata",id:id)
             }
             let error: Data? = row["error_command"]
-            if selected.contains(CommandIdentity(principal:principal,command:command)) || error.map({selected.contains(CommandIdentity(principal:principal,command:$0))}) == true {
+            if locksCommand && selected.contains(CommandIdentity(principal:principal,command:command)) ||
+                locksError && error.map({selected.contains(CommandIdentity(principal:principal,command:$0))}) == true {
                 throw MediaRoundDeletionFence.changed("history_result_dependent",type:"metadata",id:id)
             }
         }

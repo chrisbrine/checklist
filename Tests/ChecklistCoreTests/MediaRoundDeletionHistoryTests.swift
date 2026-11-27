@@ -140,6 +140,104 @@ extension MediaRoundDeletionTests {
         XCTAssertEqual(try f.get(round)["state"] as? String,"canceled")
     }
 
+    func testContinuedHistoryPreservesTerminalDeletionAndPreviewAcrossReopen() throws {
+        let f = try Fixture(), round = try f.round(f.type(checks.schema()))
+        let rid = try XCTUnwrap(round["id"] as? String)
+        let registration = try f.record(f.worker.sessionID!,"session")
+        let caller = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),
+                            projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        let lane = DispatchQueue(label:"test-media-history-terminal-operations")
+        f.router.configureCommandOperations(on:lane)
+        defer { f.router?.mediaRoundDeletionPreparationProbe = nil }
+        func drain() throws {
+            let finished = DispatchSemaphore(value:0)
+            lane.async {finished.signal()}
+            guard finished.wait(timeout:.now()+30) == .success else {
+                throw CoreError("TEST_TIMEOUT","The operation lane did not finish.")
+            }
+        }
+        func read(_ accepted: JSON) throws -> JSON {
+            let id = try XCTUnwrap(accepted["operation_id"] as? String)
+            let reply = try f.router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":id],caller:caller)
+            return try XCTUnwrap(reply["data"] as? JSON)
+        }
+
+        let previewCommand = uuid()
+        let preview = try worker(f,"media_intake_preview",["round_id":rid,"text":"Private fixture preview\n"],as:caller,command:previewCommand)
+        try drain()
+        let previewID = try XCTUnwrap(preview["operation_id"] as? String)
+        let previewResult = try XCTUnwrap(exactHistoryResult(f,principal:caller.principal,command:previewCommand))
+        XCTAssertEqual(jsonObject(previewResult)["round_id"] as? String,rid)
+        XCTAssertEqual(try f.router.dbQueue.read {try f.router.operationRecord($0,id:previewID)?["state"] as? String},"succeeded")
+
+        let canceled = try cancel(f,round)
+        let originalInput = try input(f,canceled), originalCommand = uuid()
+        let canceledRevision = try XCTUnwrap(canceled["revision"] as? Int)
+        f.router.mediaRoundDeletionPreparationProbe = { [router = f.router!, project = f.project, owner = f.owner] in
+            _ = try router.executeMediaCommand(method:"media_round_archive",params:["project_id":project,"round_id":rid,
+                "expected_revision":canceledRevision,"command_id":uuid()],caller:owner)
+        }
+        let original = try worker(f,"media_round_delete",originalInput,as:caller,command:originalCommand)
+        try drain()
+        f.router.mediaRoundDeletionPreparationProbe = nil
+        let first = try read(original), firstError = try XCTUnwrap(first["error"] as? JSON)
+        XCTAssertEqual(first["state"] as? String,"failed")
+        XCTAssertEqual(firstError["code"] as? String,"MEDIA_CONTEXT_CHANGED")
+        XCTAssertEqual((firstError["details"] as? JSON)?["record_id"] as? String,rid)
+        let originalID = try XCTUnwrap(original["operation_id"] as? String)
+        let stored = try f.router.dbQueue.read {try f.router.operationRecord($0,id:originalID)}
+        XCTAssertEqual(stored?["recoverable"] as? Bool,false)
+        let errorCommand = try XCTUnwrap(stored?["error_result_command_id"] as? String)
+        let errorResult = try XCTUnwrap(exactHistoryResult(f,principal:caller.principal,command:errorCommand))
+        let archived = try f.get(round), currentInput = try input(f,archived)
+        XCTAssertEqual(archived["state"] as? String,"archived")
+
+        // Insert the filler after the two receipts so the old selector reaches
+        // both receipts in a nonfinal command pass, with more history remaining.
+        try addMatchedHistoryCommands(f,round:rid)
+        let progressKey = try MediaRoundDeletionHistory.progressKey(project:f.project,round:rid)
+        f.router.mediaRoundDeletionPreparationProbe = { [router = f.router!] in
+            let progress = try router.dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:[progressKey])}
+            if progress != nil {
+                throw CoreError("TEST_INTERRUPT","Interrupted after a nonfinal history pass.")
+            }
+        }
+        let interrupted = try worker(f,"media_round_delete",currentInput,as:caller)
+        try drain()
+        f.router.mediaRoundDeletionPreparationProbe = nil
+        XCTAssertEqual((try read(interrupted)["error"] as? JSON)?["code"] as? String,"TEST_INTERRUPT")
+
+        func verifyBoundary(file: StaticString = #filePath,line: UInt = #line) {
+            XCTAssertEqual(try historyProgress(f,round:rid),"1",file:file,line:line)
+            XCTAssertEqual(try f.get(round)["revision"] as? Int,archived["revision"] as? Int,file:file,line:line)
+            XCTAssertEqual(try exactHistoryResult(f,principal:caller.principal,command:errorCommand),errorResult,file:file,line:line)
+            XCTAssertEqual(try jsonString(read(original)),try jsonString(first),file:file,line:line)
+            XCTAssertEqual(try jsonString(worker(f,"media_round_delete",originalInput,as:caller,command:originalCommand)),try jsonString(first),file:file,line:line)
+            XCTAssertTrue(try exactHistoryResult(f,principal:caller.principal,command:previewCommand) == previewResult,"The preview journal changed",file:file,line:line)
+            var previewStatus: JSON?
+            XCTAssertNoThrow(previewStatus = try read(preview),file:file,line:line)
+            XCTAssertEqual(previewStatus?["state"] as? String,"succeeded",file:file,line:line)
+            let result = previewStatus?["result"] as? JSON
+            XCTAssertEqual(result?["command_id"] as? String,previewCommand,file:file,line:line)
+            XCTAssertTrue(try jsonString(result?["data"] as? JSON ?? [:]) == previewResult,"The preview result changed",file:file,line:line)
+        }
+        verifyBoundary()
+        try f.reopen()
+        f.router.configureCommandOperations(on:lane)
+        verifyBoundary()
+
+        let resumed = try worker(f,"media_round_delete",currentInput,as:caller)
+        try drain()
+        XCTAssertEqual(try read(resumed)["state"] as? String,"succeeded")
+        XCTAssertNil(try historyProgress(f,round:rid))
+        checks.checkError("NOT_FOUND") {try f.get(round)}
+        XCTAssertEqual(try exactHistoryResult(f,principal:caller.principal,command:errorCommand),CommandRouter.prunedResult)
+        XCTAssertEqual(try exactHistoryResult(f,principal:caller.principal,command:previewCommand),CommandRouter.prunedResult)
+        checks.checkError("COMMAND_RESULT_EXPIRED") {try read(original)}
+        checks.checkError("COMMAND_RESULT_EXPIRED") {try read(preview)}
+        checks.checkError("COMMAND_RESULT_EXPIRED") {try self.worker(f,"media_round_delete",originalInput,as:caller,command:originalCommand)}
+    }
+
     func testContinuedHistoryKeepsPayloadsUsedByOtherCommandConsumers() throws {
         let f = try Fixture(), round = try cancel(f,f.round(f.type(checks.schema())))
         let rid = try XCTUnwrap(round["id"] as? String)
@@ -165,5 +263,34 @@ extension MediaRoundDeletionTests {
                 }
             }
         }
+    }
+
+    func testNonfinalHistoryFencesNewTerminalOperationDependent() throws {
+        let f = try Fixture(), round = try cancel(f,f.round(f.type(checks.schema())))
+        let rid = try XCTUnwrap(round["id"] as? String)
+        let principal = "fixture-media-history", command = "00000000-0000-0000-0000-000000000001"
+        let operation = CommandRouter.commandOperationID(principal:principal,command:command)
+        try addMatchedHistoryCommands(f,round:rid)
+        let original = try XCTUnwrap(exactHistoryResult(f,principal:principal,command:command))
+        f.router.mediaRoundDeletionPreparationProbe = { [router = f.router!, project = f.project] in
+            try router.dbQueue.write { db in
+                try router.saveOperation(db,["operation_id":operation,"principal":principal,"command_id":command,
+                    "method":"media_intake_preview","project_id":project,"digest":"fixture-digest",
+                    "incarnation":router.incarnation,"state":"succeeded"])
+            }
+        }
+        defer { f.router.mediaRoundDeletionPreparationProbe = nil }
+        let params = try input(f,round)
+        XCTAssertThrowsError(try worker(f,"media_round_delete",params)) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
+            XCTAssertEqual((error as? CoreError)?.details["check"] as? String,"history_result_dependent")
+            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,CommandRouter.commandOperationKey(operation))
+        }
+        f.router.mediaRoundDeletionPreparationProbe = nil
+        XCTAssertNil(try historyProgress(f,round:rid))
+        XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:command),original)
+        XCTAssertEqual(try f.get(round)["state"] as? String,"canceled")
+        XCTAssertEqual(try worker(f,"media_round_delete",params)["deleted"] as? Bool,true)
+        XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:command),CommandRouter.prunedResult)
     }
 }

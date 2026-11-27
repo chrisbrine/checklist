@@ -76,7 +76,14 @@ extension MediaRoundDeletionTests {
                 let result = try jsonString(index.isMultiple(of:3) ? [id:"exact key"] : ["text":index.isMultiple(of:5) ? id : id + "-suffix"])
                 try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES(?,?,?,'fixture',?,?,?)",
                     arguments:[uuid(),f.project,entity,kind,now(),result])
-                try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES('fixture',?,'digest',?)",arguments:[uuid(),result])
+                let command = uuid()
+                try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES('fixture',?,'digest',?)",arguments:[command,result])
+                if index.isMultiple(of:7) {
+                    let operation = CommandRouter.commandOperationID(principal:"fixture",command:command)
+                    try f.router.saveOperation(db,["operation_id":operation,"principal":"fixture","command_id":command,
+                        "method":"media_intake_preview","project_id":f.project,"digest":"digest",
+                        "incarnation":f.router.incarnation,"state":"succeeded"])
+                }
             }
         }
         try f.router.dbQueue.read {db in
