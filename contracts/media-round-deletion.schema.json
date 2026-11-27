@@ -214,6 +214,39 @@
         "data"
       ]
     },
+    "operation_successor_refusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A predecessor deletion refuses while a successor remains. Details identify the successor to delete first.",
+      "properties": {
+        "data": {
+          "allOf": [
+            {"$ref": "#/$defs/failedOperation"},
+            {
+              "properties": {
+                "error": {
+                  "properties": {
+                    "code": {"const": "MEDIA_ROUND_REFERENCED"},
+                    "details": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "record_id": {"$ref": "#/$defs/text"},
+                        "record_type": {"const": "media_round"}
+                      },
+                      "required": ["record_id", "record_type"]
+                    }
+                  },
+                  "required": ["details"]
+                }
+              }
+            }
+          ]
+        },
+        "write_admission": {"$ref": "#/$defs/writeAdmission"}
+      },
+      "required": ["data"]
+    },
     "operation_work_limit": {
       "description": "A failed operation names the exceeded bound for the selected deletion, including a workspace authority, matched reference, or indivisible history bound.",
       "type": "object",

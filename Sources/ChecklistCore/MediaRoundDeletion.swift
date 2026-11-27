@@ -284,6 +284,13 @@ extension CommandRouter {
         guard ["closed","canceled","archived"].contains(round["state"] as? String ?? "") else {
             throw CoreError("MEDIA_ROUND_NOT_CLOSED","Finish or cancel the round before deleting it. Draft and Open rounds cannot be deleted.")
         }
+        if let successor = try String.fetchOne(db,sql:"""
+            SELECT id FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_round'
+              AND json_extract(data,'$.predecessor_round_id')=CAST(? AS TEXT) COLLATE BINARY
+            ORDER BY id COLLATE BINARY LIMIT 1
+            """,arguments:[Data(project.utf8),Data(rid.utf8)]) {
+            throw CoreError("MEDIA_ROUND_REFERENCED","Delete the successor round before deleting its predecessor.",details:["record_id":successor,"record_type":"media_round"])
+        }
         // Retain only the selected structural graph. The existing corpus stream
         // validates unrelated envelopes without retaining their private payloads.
         var selected: [Data:PurgeRow] = [:],selectedBytes = 0
@@ -337,6 +344,27 @@ extension CommandRouter {
             let e = try GRDBRecordEnvelopeAdapter.decode(raw);try add(e.object,type:e.type)
             if e.type == "storage_job",let id = e.object["attachment_id"] as? String,
                try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE id=CAST(? AS TEXT) AND type='attachment')",arguments:[Data(id.utf8)]) == true {attachmentIDs.insert(Data(id.utf8))}
+        }
+        var handoffOnlyIDs = Set<Data>()
+        if round["predecessor_round_id"] is String {
+            // Done handoff can mark attachments under a predecessor's active
+            // capture owner. Keep the attachments without selecting that owner.
+            let handoffs = try Row.fetchCursor(db,sql:"""
+                SELECT CAST(id AS BLOB) AS id,octet_length(data) AS size FROM records
+                WHERE project_id=CAST(? AS TEXT) AND type='attachment'
+                  AND json_type(data,'$.task_id') IS NOT NULL
+                  AND json_extract(data,'$.media_cleanup_round_id')=CAST(? AS TEXT) COLLATE BINARY
+                """,arguments:[Data(project.utf8),Data(rid.utf8)])
+            while let row = try handoffs.next() {
+                let id: Data = row["id"]
+                guard attachmentIDs.insert(id).inserted else {continue}
+                let size: Int = row["size"]
+                selectedBytes += size
+                guard attachmentIDs.count <= 100_000,size <= TicketCleanupInventory.rowByteLimit,selectedBytes <= TicketCleanupInventory.byteLimit else {
+                    throw CoreError("CLEANUP_INVENTORY_LIMIT","The successor's ticket handoff exceeds the selected attachment or payload limit; nothing was removed.")
+                }
+                handoffOnlyIDs.insert(id)
+            }
         }
         var keptAttachments: [JSON] = [],keptAudit: [JSON] = [],observedIDs = Set<Data>()
         for rawID in attachmentIDs.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
@@ -417,6 +445,7 @@ extension CommandRouter {
         let retainedAttachments = Set(keptAttachments.compactMap {($0["id"] as? String).map {Data($0.utf8)}})
         let graphFinished = ProcessInfo.processInfo.systemUptime
         let deletionTasks = tasks
+        let handoffAttachments = handoffOnlyIDs
         @Sendable func observeReferences(_ snapshot: Database,partition: TicketCleanupRowRange? = nil,budget: MediaRoundDeletionReferenceBudget) throws -> MediaRoundDeletionReferences {
             var selection = MediaRoundDeletionReferences()
             // The shared stream validates complete unrelated envelopes but returns
@@ -435,8 +464,14 @@ extension CommandRouter {
                     row = .init(id:row.id,type:row.type,project:row.project,value:try self.record(snapshot,row.id,type:row.type))
                 }
                 if owned.contains(row.key) {return}
-                if retainedAttachments.contains(row.key) {return}
-                let large = bool(row.value,"_cleanup_large_match")
+                var value = row.value
+                if retainedAttachments.contains(row.key) {
+                    guard handoffAttachments.contains(row.key) else {return}
+                    // The handoff tag is detached below. Other references in
+                    // these additional retained attachments can still block deletion.
+                    value.removeValue(forKey:"media_cleanup_round_id")
+                }
+                let large = bool(value,"_cleanup_large_match")
                 let pending = row.type == "request" && row.value["state"] as? String == "pending"
                 let hold = row.type == "storage_hold"
                 let targets = hold ? holdNeedles : needles
@@ -445,7 +480,7 @@ extension CommandRouter {
                 // Traverse every value under the existing graph bounds. Most text
                 // atoms have no matching byte length and need no Data allocation.
                 do {
-                    try TicketCleanupInventory.strings(row.value,{text in
+                    try TicketCleanupInventory.strings(value,{text in
                         guard (!matches || pending && !pendingReference),lengths.contains(text.utf8.count) else {return}
                         let token = Data(text.utf8)
                         matches = matches || targets.contains(token)

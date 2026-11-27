@@ -485,6 +485,97 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertFalse((try deletion(f,successor)["files"] as? [JSON] ?? []).contains {$0["status"] as? String == "moved"})
     }
 
+    func testSuccessorDoneHandoffKeepsBothCapturesAndUnblocksPredecessorDeletion() throws {
+        let f = try Fixture();try trash(f)
+        let predecessor = try imageRound(f,"first-pass.png"),task = try results.task(f)
+        _ = try f.publish(predecessor);try f.acceptEach(predecessor)
+        _ = try f.call("media_round_finish",actions.fence(f.get(predecessor)))
+        let predecessorView = try f.get(predecessor)
+        let item = try XCTUnwrap((predecessorView["items"] as? [JSON])?.first)
+        let borrowed = try XCTUnwrap(f.rows("attachment").first)
+        let borrowedID = try XCTUnwrap(borrowed["id"] as? String)
+        let borrowedOwnerID = try XCTUnwrap(borrowed["attachment_owner_id"] as? String)
+        let borrowedJobID = try XCTUnwrap(borrowed["storage_job_id"] as? String)
+        var successorInput = actions.fence(predecessorView)
+        successorInput["source_round_id"] = successorInput.removeValue(forKey:"round_id")
+        successorInput["title"] = "Published follow-up pass"
+        successorInput["items"] = [["item_id":item["id"]!]]
+        let successor = try f.call("media_round_successor",successorInput)
+        let successorID = try XCTUnwrap(successor["id"] as? String)
+        let plan = try intake.confirm(f,intake.preview(f,successor,[intake.source(f,"follow-up.png",1)]))
+        _ = try intake.capture(f,plan)
+        _ = try results.link(f,successor,task)
+        _ = try f.publish(successor);try f.acceptEach(successor)
+        _ = try f.call("media_round_send_result",results.sendInput(f,successor))
+        try MediaLinkedTaskCleanupTests().done(f,task)
+        XCTAssertEqual(try f.get(successor)["state"] as? String,"archived")
+        let captures = try f.rows("attachment")
+        XCTAssertEqual(captures.count,2)
+        XCTAssertTrue(captures.allSatisfy {$0["task_id"] as? String == task["id"] as? String && $0["media_cleanup_round_id"] as? String == successorID})
+        let paths = try captures.map {try XCTUnwrap(f.router.ownerManagedPathProjection($0,caller:f.owner)["path"] as? String)}
+        let originalBytes = try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))}
+        let ticketRecords = try exactRecords(f,["task","message","delivery"])
+        let predecessorInput = try input(f,predecessor)
+        try assertRefusal(f,"MEDIA_ROUND_REFERENCED") {
+            do {return try worker(f,"media_round_delete",predecessorInput)}
+            catch let error as CoreError {
+                XCTAssertEqual(error.details["record_id"] as? String,successorID)
+                XCTAssertEqual(error.details["record_type"] as? String,"media_round")
+                throw error
+            }
+        }
+        let deleted = try worker(f,"media_round_delete",input(f,successor))
+        let kept = try XCTUnwrap(deleted["kept_attachments"] as? [JSON])
+        XCTAssertEqual(Set(kept.compactMap {$0["attachment_id"] as? String}),Set(captures.compactMap {$0["id"] as? String}))
+        XCTAssertTrue(kept.allSatisfy {$0["reason"] as? String == "kept_with_ticket"})
+        XCTAssertEqual(try jsonString(deletion(f,successor)["kept_attachments"]!),try jsonString(kept))
+        let retained = try f.record(borrowedID,"attachment")
+        XCTAssertNil(retained["media_cleanup_round_id"])
+        XCTAssertEqual(retained["attachment_owner_id"] as? String,borrowedOwnerID)
+        XCTAssertEqual(retained["storage_job_id"] as? String,borrowedJobID)
+        XCTAssertEqual((retained["media_capture_history"] as? JSON)?["round_id"] as? String,successorID)
+        XCTAssertEqual(try f.record(borrowedOwnerID,"storage_job")["kind"] as? String,"media_attachment_owner")
+        XCTAssertEqual(try f.get(predecessor)["state"] as? String,"closed")
+
+        XCTAssertEqual(try worker(f,"media_round_delete",predecessorInput)["deleted"] as? Bool,true)
+        XCTAssertEqual((try deletion(f,predecessor)["kept_attachments"] as? [JSON])?.compactMap {$0["attachment_id"] as? String},[borrowedID])
+        let final = try f.record(borrowedID,"attachment")
+        XCTAssertNil(final["attachment_owner_id"]);XCTAssertNil(final["storage_job_id"]);XCTAssertNil(final["media_cleanup_round_id"])
+        let history = try XCTUnwrap(final["media_capture_history"] as? JSON)
+        XCTAssertEqual(history["round_id"] as? String,predecessor["id"] as? String)
+        XCTAssertEqual(history["owner_id"] as? String,borrowedOwnerID)
+        XCTAssertEqual(history["import_job_id"] as? String,borrowedJobID)
+        XCTAssertTrue(try f.rows("media_round").isEmpty)
+        XCTAssertEqual(try exactRecords(f,["task","message","delivery"]),ticketRecords)
+        _ = try f.router.runTicketObjectDeletionCohort()
+        XCTAssertEqual(try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))},originalBytes)
+    }
+
+    func testStandaloneDeletionMatchesPriorAttachmentSelectionAcrossTerminalTickets() throws {
+        for category in ["done","canceled"] {
+            for hasForeignMarker in [false,true] {
+                let f = try Fixture();try trash(f)
+                let (round,task,owned) = try ticketCapture(f,category:category)
+                XCTAssertNil(round["predecessor_round_id"])
+                _ = try imageRound(f,"independent.png",index:1)
+                var independent = try XCTUnwrap(f.rows("attachment").first {$0["id"] as? String != owned["id"] as? String})
+                let independentID = try XCTUnwrap(independent["id"] as? String)
+                if hasForeignMarker {
+                    // This row is outside the legacy candidate/import graph.
+                    independent["task_id"] = task["id"]
+                    independent["media_cleanup_round_id"] = round["id"]
+                    try f.router.dbQueue.write {try f.router.save($0,independent,type:"attachment")}
+                    try assertRefusal(f,"MEDIA_ROUND_REFERENCED") {try self.worker(f,"media_round_delete",self.input(f,round))}
+                } else {
+                    let reply = try worker(f,"media_round_delete",input(f,round))
+                    XCTAssertEqual(reply["deleted"] as? Bool,true)
+                    XCTAssertEqual((reply["kept_attachments"] as? [JSON])?.compactMap {$0["attachment_id"] as? String},[try XCTUnwrap(owned["id"] as? String)])
+                    XCTAssertEqual(try jsonString(f.record(independentID,"attachment")),try jsonString(independent))
+                }
+            }
+        }
+    }
+
     func testFinalizedImportWithoutAttachmentIsInventoriedAndMovesOnlyThroughTrash() throws {
         let f = try Fixture();try trash(f)
         let round = try f.round(f.type(intake.imageSchema()))
