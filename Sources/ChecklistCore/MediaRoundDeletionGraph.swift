@@ -26,6 +26,8 @@ struct MediaRoundDeletionGraph {
         let total: Int
         let slices: Int
         var pass: Int
+        // Nil denotes a journal written before exact handoff proof. New
+        // journals commit that proof at visibility and have no witness pages.
         var handoffWitnessCount: Int? = nil
         var phase: Phase = .staging
         var staged = 0

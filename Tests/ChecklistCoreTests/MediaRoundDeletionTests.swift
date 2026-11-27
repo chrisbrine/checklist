@@ -490,9 +490,9 @@ final class MediaRoundDeletionTests: XCTestCase {
     }
 
     func testBoundedSuccessorKeepsDoneAndCanceledHandoffsUntilPublication() throws {
-        for category in ["done","canceled"] {
-            try checkSuccessorHandoff(category:category,bounded:true)
-        }
+        try checkSuccessorHandoff(category:"done",bounded:true)
+        try checkSuccessorHandoff(category:"done",bounded:true,reopen:true)
+        try checkSuccessorHandoff(category:"canceled",bounded:true,reopen:true)
     }
 
     private func successorDoneHandoff(_ f: Fixture) throws -> (predecessor: JSON,successor: JSON,task: JSON,borrowed: JSON) {
@@ -517,8 +517,8 @@ final class MediaRoundDeletionTests: XCTestCase {
         return (predecessor,successor,task,borrowed)
     }
 
-    private func forceSuccessorGraph(_ f: Fixture,successor: JSON) throws {
-        let id = try XCTUnwrap(successor["id"] as? String)
+    private func forceBoundedGraph(_ f: Fixture,round: JSON) throws {
+        let id = try XCTUnwrap(round["id"] as? String)
         try f.router.dbQueue.writeWithoutTransaction {db in
             XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db))
             try db.inTransaction {
@@ -532,7 +532,28 @@ final class MediaRoundDeletionTests: XCTestCase {
         }
     }
 
-    private func checkSuccessorHandoff(category: String,bounded: Bool) throws {
+    private func interruptSuccessorPublication(_ f: Fixture,successor: JSON,params: JSON) throws -> String {
+        let key = try MediaRoundDeletionGraph.key(MediaRoundDeletionHistory.progressKey(project:f.project,round:successor["id"] as! String))
+        try f.router.dbQueue.write {db in
+            try db.execute(sql:"""
+                CREATE TEMP TRIGGER interrupt_successor_publication BEFORE DELETE ON metadata
+                WHEN OLD.key='\(key)' BEGIN SELECT RAISE(ABORT,'synthetic interruption before publication'); END
+                """)
+        }
+        let rolledBack = LockedTestState(false)
+        f.router.mediaRoundDeletionWriterProbe = {phase,_,committed in
+            if phase == "media_round_graph_publish" && !committed {rolledBack.withLock {$0 = true}}
+        }
+        defer {f.router.mediaRoundDeletionWriterProbe = nil}
+        checks.checkError("OUTCOME_UNKNOWN") {try worker(f,"media_round_delete",params)}
+        XCTAssertTrue(rolledBack.withLock {$0})
+        let progress = try XCTUnwrap(f.router.dbQueue.read {try MediaRoundDeletionGraph.load($0,key,as:MediaRoundDeletionGraph.Progress.self)})
+        XCTAssertEqual(progress.phase,.retiring)
+        XCTAssertEqual(progress.removed,progress.total)
+        return key
+    }
+
+    private func checkSuccessorHandoff(category: String,bounded: Bool,reopen: Bool = false) throws {
         let f = try Fixture();try trash(f)
         let (predecessor,successor,task,borrowed) = try successorDoneHandoff(f)
         let successorID = try XCTUnwrap(successor["id"] as? String)
@@ -554,11 +575,9 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertTrue(captures.allSatisfy {$0["task_id"] as? String == task["id"] as? String && $0["media_cleanup_round_id"] as? String == successorID})
         let paths = try captures.map {try XCTUnwrap(f.router.ownerManagedPathProjection($0,caller:f.owner)["path"] as? String)}
         let originalBytes = try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))}
-        let ticketRecords = try exactRecords(f,["task","message","delivery"])
-        let predecessorInput = try input(f,predecessor)
         func refusePredecessor() throws {
             try assertRefusal(f,"MEDIA_ROUND_REFERENCED") {
-                do {return try worker(f,"media_round_delete",predecessorInput)}
+                do {return try worker(f,"media_round_delete",input(f,predecessor))}
                 catch let error as CoreError {
                     XCTAssertEqual(error.details["record_id"] as? String,successorID)
                     XCTAssertEqual(error.details["record_type"] as? String,"media_round")
@@ -568,36 +587,58 @@ final class MediaRoundDeletionTests: XCTestCase {
         }
         try refusePredecessor()
         let successorDeletion = try input(f,successor)
+        var legacyPage: String?
         if bounded {
-            let key = try MediaRoundDeletionGraph.key(MediaRoundDeletionHistory.progressKey(project:f.project,round:successorID))
-            try forceSuccessorGraph(f,successor:successor)
-            try f.router.dbQueue.write {db in
-                try db.execute(sql:"""
-                    CREATE TEMP TRIGGER interrupt_successor_publication BEFORE DELETE ON metadata
-                    WHEN OLD.key='\(key)' BEGIN SELECT RAISE(ABORT,'synthetic interruption before publication'); END
-                    """)
-            }
-            let rolledBackPublication = LockedTestState(false)
-            f.router.mediaRoundDeletionWriterProbe = {phase,_,committed in
-                if phase == "media_round_graph_publish" && !committed {
-                    rolledBackPublication.withLock {$0 = true}
+            try forceBoundedGraph(f,round:successor)
+            let key = try interruptSuccessorPublication(f,successor:successor,params:successorDeletion)
+            let taskID = task["id"] as! String
+            if reopen && category == "done" {
+                // Simulate a retiring journal from the previous format. Its
+                // saved ticket row becomes stale before the restart.
+                let page = MediaRoundDeletionGraph.handoffWitnessPrefix(key) + "00000000"
+                try f.router.dbQueue.write {db in
+                    var progress = try XCTUnwrap(MediaRoundDeletionGraph.load(db,key,as:MediaRoundDeletionGraph.Progress.self))
+                    if progress.handoffWitnessCount == 0 {
+                        let id = Data(taskID.utf8)
+                        let witness = try XCTUnwrap(MediaRoundDeletionFence.record(db,id:id))
+                        try MediaRoundDeletionGraph.save(db,page,[id:witness])
+                        progress.handoffWitnessCount = 1
+                        try MediaRoundDeletionGraph.save(db,key,progress)
+                    }
                 }
+                legacyPage = page
             }
-            checks.checkError("OUTCOME_UNKNOWN") {try worker(f,"media_round_delete",successorDeletion)}
-            XCTAssertTrue(rolledBackPublication.withLock {$0})
-            f.router.mediaRoundDeletionWriterProbe = nil
-            try f.reopen()
             let progress = try deletion(f,successor)
             XCTAssertEqual(progress["deletion_state"] as? String,"deleting")
             XCTAssertEqual(progress["removed_records"] as? Int,progress["total_records"] as? Int)
             checks.checkError("NOT_FOUND") {try f.record(successorID,"media_round")}
             try refusePredecessor()
-            if category == "done" {
-                let proof = try predecessorIntake(f,predecessor:predecessor,borrowed:borrowed)
-                try assertChangedIntakeRefusesGraphResume(f,successor:successor,params:successorDeletion,intake:proof)
+            let current = try f.record(taskID,"task")
+            let edited = try worker(f,"task_edit",["task_id":current["id"]!,"expected_revision":current["revision"]!,
+                "patch":["title":"Handoff ticket edited during retirement"]])
+            XCTAssertEqual(int(edited,"revision"),int(current,"revision") + 1)
+            XCTAssertEqual(edited["status_category"] as? String,category)
+            let status = try f.record(edited["status_id"] as! String,"status")
+            let renamed = try worker(f,"status_edit",["status_id":status["id"]!,"expected_revision":status["revision"]!,
+                "name":"Renamed terminal status"])
+            XCTAssertEqual(int(renamed,"revision"),int(status,"revision") + 1)
+            let described = try describeKeptAttachment(f,borrowedID)
+            XCTAssertEqual(described["task_id"] as? String,task["id"] as? String)
+            let archived = try worker(f,"media_round_archive",["round_id":predecessor["id"]!,
+                "expected_revision":try f.get(predecessor)["revision"]!])
+            XCTAssertEqual(archived["state"] as? String,"archived")
+            if reopen {try f.reopen()}
+            else {
+                try f.router.dbQueue.write {db in
+                    try db.execute(sql:"DROP TRIGGER interrupt_successor_publication")
+                }
             }
         }
+        let ticketRecords = try exactRecords(f,["task","message","delivery","status"])
         let deleted = try worker(f,"media_round_delete",successorDeletion)
+        if let legacyPage {
+            XCTAssertNil(try f.router.dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:[legacyPage])})
+        }
         let kept = try XCTUnwrap(deleted["kept_attachments"] as? [JSON])
         XCTAssertEqual(Set(kept.compactMap {$0["attachment_id"] as? String}),Set(captures.compactMap {$0["id"] as? String}))
         XCTAssertTrue(kept.allSatisfy {$0["reason"] as? String == "kept_with_ticket"})
@@ -608,9 +649,10 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertEqual(retained["storage_job_id"] as? String,borrowedJobID)
         XCTAssertEqual((retained["media_capture_history"] as? JSON)?["round_id"] as? String,successorID)
         XCTAssertEqual(try f.record(borrowedOwnerID,"storage_job")["kind"] as? String,"media_attachment_owner")
-        XCTAssertEqual(try f.get(predecessor)["state"] as? String,"closed")
+        XCTAssertEqual(try f.get(predecessor)["state"] as? String,bounded ? "archived" : "closed")
+        if bounded {XCTAssertEqual(retained["description"] as? String,"Revised capture description")}
 
-        XCTAssertEqual(try worker(f,"media_round_delete",predecessorInput)["deleted"] as? Bool,true)
+        XCTAssertEqual(try worker(f,"media_round_delete",input(f,predecessor))["deleted"] as? Bool,true)
         XCTAssertEqual((try deletion(f,predecessor)["kept_attachments"] as? [JSON])?.compactMap {$0["attachment_id"] as? String},[borrowedID])
         let final = try f.record(borrowedID,"attachment")
         XCTAssertNil(final["attachment_owner_id"]);XCTAssertNil(final["storage_job_id"]);XCTAssertNil(final["media_cleanup_round_id"])
@@ -619,9 +661,15 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertEqual(history["owner_id"] as? String,borrowedOwnerID)
         XCTAssertEqual(history["import_job_id"] as? String,borrowedJobID)
         XCTAssertTrue(try f.rows("media_round").isEmpty)
-        XCTAssertEqual(try exactRecords(f,["task","message","delivery"]),ticketRecords)
+        XCTAssertEqual(try exactRecords(f,["task","message","delivery","status"]),ticketRecords)
         _ = try f.router.runTicketObjectDeletionCohort()
         XCTAssertEqual(try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))},originalBytes)
+    }
+
+    private func describeKeptAttachment(_ f: Fixture,_ id: String) throws -> JSON {
+        let attachment = try f.record(id,"attachment")
+        return try worker(f,"attachment_update",["attachment_id":id,"expected_revision":attachment["revision"]!,
+            "action":"describe","description":"Revised capture description"])
     }
 
     private func assertSuccessorAttachmentReference(_ f: Fixture,successor: JSON,attachmentID: String,
@@ -658,7 +706,7 @@ final class MediaRoundDeletionTests: XCTestCase {
             }
         }
         XCTAssertEqual(try f.get(foreignRound)["state"] as? String,"draft")
-        if bounded {try forceSuccessorGraph(f,successor:successor)}
+        if bounded {try forceBoundedGraph(f,round:successor)}
         try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:foreignID)
     }
 
@@ -743,45 +791,30 @@ final class MediaRoundDeletionTests: XCTestCase {
         })
     }
 
-    private func assertChangedIntakeRefusesGraphResume(_ f: Fixture,successor: JSON,params: JSON,intake: JSON) throws {
-        let id = try XCTUnwrap(intake["id"] as? String)
-        let progress = try jsonString(deletion(f,successor))
-        try f.router.dbQueue.write {db in
-            var changed = intake
-            changed.removeValue(forKey:"attachment_owner_id")
-            try f.router.save(db,changed,type:"media_intake")
-        }
-        let before = try f.allState()
-        XCTAssertThrowsError(try worker(f,"media_round_delete",params)) {error in
-            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
-            XCTAssertEqual((error as? CoreError)?.details["check"] as? String,"planned_record_changed")
-            XCTAssertEqual((error as? CoreError)?.details["record_type"] as? String,"media_intake")
-            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,id)
-        }
-        XCTAssertEqual(try f.allState(),before)
-        XCTAssertEqual(try jsonString(deletion(f,successor)),progress)
-        try f.router.dbQueue.write {try f.router.save($0,intake,type:"media_intake")}
-    }
-
-    func testBoundedSuccessorRechecksHandoffAfterDetachAndRestart() throws {
-        let f = try Fixture(),(predecessor,successor,_,borrowed) = try successorDoneHandoff(f)
-        try forceSuccessorGraph(f,successor:successor)
-        let params = try input(f,successor)
-        let id = try XCTUnwrap(borrowed["id"] as? String)
-        let proof = try predecessorIntake(f,predecessor:predecessor,borrowed:borrowed)
-        f.router.mediaRoundDeletionGraphProbe = {
-            if try f.record(id,"attachment")["media_cleanup_round_id"] == nil {
-                throw CoreError("TEST_INTERRUPT","Stopped after handoff detachment.")
+    func testBoundedSuccessorResumesAcrossKeptAttachmentEditAndRestart() throws {
+        for detached in [false,true] {
+            let f = try Fixture(),(predecessor,successor,_,borrowed) = try successorDoneHandoff(f)
+            try forceBoundedGraph(f,round:successor)
+            let params = try input(f,successor)
+            let id = try XCTUnwrap(borrowed["id"] as? String)
+            f.router.mediaRoundDeletionGraphProbe = {
+                if (try f.record(id,"attachment")["media_cleanup_round_id"] == nil) == detached {
+                    throw CoreError("TEST_INTERRUPT","Stopped around handoff detachment.")
+                }
             }
+            checks.checkError("TEST_INTERRUPT") {try worker(f,"media_round_delete",params)}
+            XCTAssertEqual(try deletion(f,successor)["removed_records"] as? Int,0)
+            let edited = try describeKeptAttachment(f,id)
+            try f.reopen()
+            let reply = try worker(f,"media_round_delete",params)
+            XCTAssertEqual(reply["deleted"] as? Bool,true)
+            XCTAssertTrue((reply["kept_attachments"] as? [JSON] ?? []).contains {$0["attachment_id"] as? String == id})
+            let retained = try f.record(id,"attachment")
+            XCTAssertNil(retained["media_cleanup_round_id"])
+            XCTAssertEqual(retained["description"] as? String,edited["description"] as? String)
+            XCTAssertEqual(int(retained,"revision"),int(edited,"revision") + (detached ? 0 : 1))
+            XCTAssertEqual(try worker(f,"media_round_delete",input(f,predecessor))["deleted"] as? Bool,true)
         }
-        checks.checkError("TEST_INTERRUPT") {try worker(f,"media_round_delete",params)}
-        XCTAssertNil(try f.record(id,"attachment")["media_cleanup_round_id"])
-        XCTAssertEqual(try deletion(f,successor)["removed_records"] as? Int,0)
-        try f.reopen()
-        try assertChangedIntakeRefusesGraphResume(f,successor:successor,params:params,intake:proof)
-        let reply = try worker(f,"media_round_delete",params)
-        XCTAssertEqual(reply["deleted"] as? Bool,true)
-        XCTAssertTrue((reply["kept_attachments"] as? [JSON] ?? []).contains {$0["attachment_id"] as? String == id})
     }
 
     func testSuccessorFencesPredecessorIntakeProvenanceAtCommit() throws {
@@ -806,6 +839,64 @@ final class MediaRoundDeletionTests: XCTestCase {
         }
         XCTAssertTrue(try f.allState() == XCTUnwrap(afterWrite),"The fenced deletion changed the store")
         checks.checkError("NOT_FOUND") {try deletion(f,successor)}
+    }
+
+    func testBoundedSuccessorRefusesTicketReopenedBeforeVisibility() throws {
+        let f = try Fixture(),(_,successor,task,borrowed) = try successorDoneHandoff(f)
+        let taskID = task["id"] as! String
+        let current = try f.record(taskID,"task")
+        let ready = try worker(f,"task_edit",["task_id":taskID,"expected_revision":current["revision"]!,"patch":["readiness":"ready"]])
+        try forceBoundedGraph(f,round:successor)
+        let params = try input(f,successor)
+        var afterReopen: String?
+        f.router.mediaRoundDeletionPreparationProbe = {
+            let reopened = try self.worker(f,"task_transition",["task_id":taskID,"expected_revision":ready["revision"]!,
+                "action":"reopen","reason":"The handoff still needs work"])
+            XCTAssertEqual(reopened["status_category"] as? String,"queued")
+            afterReopen = try f.allState()
+        }
+        defer {f.router.mediaRoundDeletionPreparationProbe = nil}
+        XCTAssertThrowsError(try worker(f,"media_round_delete",params)) {error in
+            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
+            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,taskID)
+        }
+        XCTAssertEqual(try f.allState(),try XCTUnwrap(afterReopen))
+        XCTAssertEqual(try f.get(successor)["state"] as? String,"archived")
+        XCTAssertEqual(try f.record(borrowed["id"] as! String,"attachment")["media_cleanup_round_id"] as? String,successor["id"] as? String)
+        checks.checkError("NOT_FOUND") {try deletion(f,successor)}
+    }
+
+    func testBoundedSuccessorPublishesAfterBorrowedImportRecovery() throws {
+        let f = try Fixture(),(predecessor,successor,_,borrowed) = try successorDoneHandoff(f)
+        let attachmentID = try XCTUnwrap(borrowed["id"] as? String)
+        let jobID = try XCTUnwrap(borrowed["storage_job_id"] as? String)
+        try forceBoundedGraph(f,round:successor)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,attachmentID,type:"attachment")
+            attachment.removeValue(forKey:"attachment_owner_id")
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+            var job = try f.router.record(db,jobID,type:"storage_job")
+            job["state"] = "repair_required"
+            try f.router.save(db,f.router.revised(job),type:"storage_job")
+        }
+        let params = try input(f,successor)
+        _ = try interruptSuccessorPublication(f,successor:successor,params:params)
+        let pending = try f.record(jobID,"storage_job")
+        XCTAssertEqual(pending["state"] as? String,"repair_required")
+        try f.router.dbQueue.writeWithoutTransaction {db in
+            XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db))
+        }
+        let settled = try f.record(jobID,"storage_job")
+        XCTAssertEqual(settled["state"] as? String,"settled")
+        XCTAssertGreaterThan(int(settled,"revision"),int(pending,"revision"))
+        try f.reopen()
+        let published = try worker(f,"media_round_delete",params)
+        XCTAssertTrue((published["kept_attachments"] as? [JSON] ?? []).contains {$0["attachment_id"] as? String == attachmentID})
+        XCTAssertEqual(try f.record(attachmentID,"attachment")["storage_job_id"] as? String,jobID)
+        XCTAssertEqual(try worker(f,"media_round_delete",input(f,predecessor))["deleted"] as? Bool,true)
+        let final = try f.record(attachmentID,"attachment")
+        XCTAssertEqual((final["media_capture_history"] as? JSON)?["import_job_id"] as? String,jobID)
+        XCTAssertNil(final["storage_job_id"])
     }
 
     func testSuccessorKeepsExactPredecessorCaptureThroughItsImportJob() throws {
@@ -925,6 +1016,41 @@ final class MediaRoundDeletionTests: XCTestCase {
         _ = try f.router.runTicketObjectDeletionCohort()
         XCTAssertEqual(((try deletion(f,round)["files"] as? [JSON])?.first {$0["representation"] as? String == "original"})?["status"] as? String,"moved")
         XCTAssertFalse(FileManager.default.fileExists(atPath:original))
+    }
+
+    func testBoundedGraphResumeAfterReaderReleaseAndWorkspaceRebinding() throws {
+        let f = try Fixture();try trash(f)
+        let round = try imageRound(f,"graph-resume-reader.png")
+        _ = try f.publish(round)
+        let view = try f.get(round),target = ((view["items"] as! [JSON])[0]["published_target"] as! JSON)
+        let referenceID = try XCTUnwrap(strings(target,"attachment_reference_ids").first)
+        let owner = try f.router.dbQueue.read {try f.router.mediaOwnerValue($0,id:target["attachment_owner_id"] as! String,project:f.project)}
+        let lease = try f.router.acquireMediaAttachmentReadLease(project:f.project,referenceID:referenceID,owner:owner,caller:f.owner)
+        let original = try XCTUnwrap(lease.attachment["path"] as? String)
+        let workspace = URL(fileURLWithPath:original).deletingLastPathComponent().path
+        let secondProject = try results.call(f,"project_create",["name":"File protection fixture","key_prefix":"FILES"])
+        _ = try cancel(f,round)
+        try forceBoundedGraph(f,round:round)
+        let params = try input(f,round)
+        f.router.mediaRoundDeletionGraphProbe = {throw CoreError("TEST_INTERRUPT","Stopped after graph visibility.")}
+        checks.checkError("TEST_INTERRUPT") {try worker(f,"media_round_delete",params)}
+        XCTAssertEqual(try deletion(f,round)["removed_records"] as? Int,0)
+        _ = try f.call("media_example_read_release",["lease_id":lease.id])
+        let released = try f.record(lease.id,"storage_hold")
+        XCTAssertEqual(released["state"] as? String,"released")
+        _ = try results.call(f,"project_edit",["project_id":secondProject["id"]!,"expected_revision":secondProject["revision"]!,"root_path":workspace])
+        try f.reopen()
+        try trash(f)
+        let published = try worker(f,"media_round_delete",params)
+        XCTAssertEqual(published["deleted"] as? Bool,true)
+        let id = try XCTUnwrap(published["byte_deletion_receipt_id"] as? String)
+        let objects = try f.rows("storage_job").filter {$0["page_parent"] as? String == id}.flatMap {$0["objects"] as? [JSON] ?? []}
+        try ticketCleanupBackupTemplate(f.router,objects:objects)
+        _ = try f.router.runTicketObjectDeletionCohort()
+        let retained = try XCTUnwrap((deletion(f,round)["files"] as? [JSON])?.first {$0["representation"] as? String == "original"})
+        XCTAssertEqual(retained["status"] as? String,"kept")
+        XCTAssertTrue(strings(retained,"reasons").contains("workspace_file"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath:original))
     }
 
     func testExpiredReaderHoldsWithDictionaryKeyAndAbsolutePathResumeOrdinaryCleanup() throws {

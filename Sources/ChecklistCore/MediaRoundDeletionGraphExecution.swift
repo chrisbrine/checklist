@@ -27,7 +27,7 @@ extension CommandRouter {
     }
 
     func prepareMediaDeletionGraph(_ plan: MediaRoundDeletionPlan, audit: JSON,
-                                   receipt: String, graphKey: String) throws -> DeletionGraph.Work {
+                                   receipt: String) throws -> DeletionGraph.Work {
         let kept = try plan.keptAttachments.map { attachment -> [(DeletionGraph.Change,Int)] in
             let id = try StoredRecord(attachment,family:"attachment").string("id")
             let witness = try plan.graphWitness(id)
@@ -45,8 +45,7 @@ extension CommandRouter {
             }
         }
         let receiptWork = try prepareMediaGraphReceipt(project:plan.project,round:plan.round,receiptID:receipt,audit:audit,bytes:plan.bytes)
-        let handoffWitnesses = try prepareMediaGraphHandoffWitnesses(plan,kept:kept.flatMap {$0.map {$0.0}},graphKey:graphKey)
-        let slices = handoffWitnesses + receiptWork + DeletionGraph.slices(.detach,groups:kept) + DeletionGraph.slices(.detach,groups:media)
+        let slices = receiptWork + DeletionGraph.slices(.detach,groups:kept) + DeletionGraph.slices(.detach,groups:media)
             + DeletionGraph.slices(.erase,groups:erase)
         return .init(slices:slices,fence:plan.fence,
                      kept:Set(plan.keptAttachments.compactMap {($0["id"] as? String).map {Data($0.utf8)}}),
@@ -115,7 +114,7 @@ extension CommandRouter {
 
     func startMediaDeletionGraph(_ context: GraphDeletionContext, plan: MediaRoundDeletionPlan, audit: JSON) throws -> JSON {
         let receipt = uuid()
-        let work = try prepareMediaDeletionGraph(plan,audit:audit,receipt:receipt,graphKey:context.key)
+        let work = try prepareMediaDeletionGraph(plan,audit:audit,receipt:receipt)
         let payload = try JSONEncoder().encode(work)
         let members = work.slices.flatMap(\.members)
         let count = max((payload.count + DeletionGraph.journalChunkBytes - 1) / DeletionGraph.journalChunkBytes,
@@ -125,7 +124,7 @@ extension CommandRouter {
                                               revision:Int(revision),receipt:receipt,
                                               visibilityPrincipal:context.caller.principal,visibilityCommand:context.command,visibilityEpoch:uuid(),
                                               total:members.count,slices:work.slices.count,pass:plan.historyProgress ?? 0,
-                                              handoffWitnessCount:plan.handoffWitnessIDs.count)
+                                              handoffWitnessCount:0)
         var previous: DeletionGraph.Progress?
         for index in 0..<count {
             let offset = min(index * DeletionGraph.journalChunkBytes,payload.count)
@@ -216,11 +215,11 @@ extension CommandRouter {
         var next = progress
         next.pass += 1
         let writes = try history.rows.prepareWrites()
-        let owned = Set(work.slices.flatMap(\.members).map {Data($0.utf8)})
+        let graph = try MediaRoundDeletionFence.VisibleGraph(work)
         try writeMediaDeletionGraph(context,phase:"media_round_history_pass",from:progress,to:next) { db in
-            try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,afterVisibility:true)
+            try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,graph:graph)
             try history.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion)
-            try history.rows.validateResultDependents(db,journal:context.changes.name,removed:owned)
+            try history.rows.validateResultDependents(db,journal:context.changes.name,removed:graph.owned)
             try history.rows.apply(db,writes:writes)
         }
     }
@@ -229,6 +228,7 @@ extension CommandRouter {
                                      work: DeletionGraph.Work?) throws -> JSON {
         var cursor = progress
         if cursor.phase == .deleting, let work {
+            let graph = try MediaRoundDeletionFence.VisibleGraph(work)
             var batchLimit = DeletionGraph.rowLimit
             while cursor.next < work.slices.count {
                 try mediaRoundDeletionGraphProbe?()
@@ -241,6 +241,12 @@ extension CommandRouter {
                 let ids = try jsonString(slice.members)
                 let positions = try jsonString(slice.changes.map(\.position))
                 let updates = slice.kind == .detach ? try DeletionGraph.encode(slice.changes) : nil
+                // Kept attachments and owned media tombstones occupy separate slices.
+                let kept = slice.kind == .detach && work.kept.contains(Data(slice.changes[0].id.utf8))
+                if kept,
+                   !slice.changes.allSatisfy({$0.data != nil && $0.revision != nil && work.kept.contains(Data($0.id.utf8))}) {
+                    throw StoreRecovery.required("media_deletion_graph_journal_invalid")
+                }
                 var next = cursor
                 if end == source.changes.count {
                     next.next += 1
@@ -251,9 +257,10 @@ extension CommandRouter {
                 let operation = "media_round_graph_" + slice.kind.rawValue
                 do {
                     try writeMediaDeletionGraph(context,phase:operation,from:cursor,to:next) { db in
-                        try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,afterVisibility:true)
+                        try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,graph:graph)
                         try context.changes.apply(db) {
-                            try self.applyMediaGraphSlice(db,context:context,slice:slice,ids:ids,positions:positions,updates:updates)
+                            if kept,let updates {try self.detachKeptMediaGraphAttachments(db,context:context,updates:updates)}
+                            else {try self.applyMediaGraphSlice(db,context:context,slice:slice,ids:ids,positions:positions,updates:updates)}
                         }
                     }
                     cursor = next
@@ -267,9 +274,7 @@ extension CommandRouter {
             cursor.phase = .retiring
             if cursor.handoffWitnessCount == nil {cursor.handoffWitnessCount = 0}
             cursor.pass += 1
-            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire",from:before,to:cursor) { db in
-                try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,afterVisibility:true)
-            }
+            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire",from:before,to:cursor) { _ in }
         }
         guard cursor.phase == .retiring, cursor.removed == cursor.total else {
             throw StoreRecovery.required("media_deletion_graph_progress_invalid")
@@ -285,6 +290,19 @@ extension CommandRouter {
                 guard db.changesCount == 1 else {throw StoreRecovery.required("media_deletion_graph_journal_missing")}
             }
         }
+        // Older graphs kept copies of selection witnesses in separate pages.
+        // Retire them a page at a time. Visibility already committed the proof.
+        while let count = cursor.handoffWitnessCount,count > 0 {
+            let before = cursor
+            let offset = (count - 1) / DeletionGraph.rowLimit * DeletionGraph.rowLimit
+            let key = DeletionGraph.handoffWitnessPrefix(context.key) + String(format:"%08d",offset)
+            cursor.handoffWitnessCount = offset
+            cursor.pass += 1
+            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire_journal",from:before,to:cursor) { db in
+                try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key])
+                guard db.changesCount == 1 else {throw StoreRecovery.required("media_deletion_graph_handoff_unverified")}
+            }
+        }
         return try publishMediaGraphDeletion(context,progress:cursor)
     }
 
@@ -294,6 +312,38 @@ extension CommandRouter {
                 SELECT '\(DeletionGraph.memberPrefix)'||value FROM json_each(?)
             ) AND value=?
             """,arguments:[ids,context.key])
+    }
+
+    private func detachKeptMediaGraphAttachments(_ db: Database,context: GraphDeletionContext,updates: String) throws {
+        // Apply only links to this graph and their provenance. Ticket-side
+        // edits, import recovery and availability changes keep their values.
+        func ownsLink(_ field: String) -> String {
+            "EXISTS (SELECT 1 FROM metadata WHERE key='\(DeletionGraph.memberPrefix)'||json_extract(r.data,'$.\(field)') AND value=:graph)"
+        }
+        // Drive the join from the bounded slice. The record key's storage
+        // collation compares exact bytes and uses the primary-key index.
+        try db.execute(sql:"""
+            WITH selected AS MATERIALIZED (
+                SELECT r.rowid AS position,r.data,r.revision,json_extract(j.value,'$.data') AS planned,
+                       \(ownsLink("attachment_owner_id")) AS owner,
+                       \(ownsLink("storage_job_id")) AS job,
+                       \(ownsLink("media_cleanup_round_id")) AS marker
+                FROM json_each(:updates) j CROSS JOIN records r ON r.id=CAST(json_extract(j.value,'$.id') AS TEXT)
+                WHERE r.type='attachment' AND r.project_id=:project
+            ), detached AS MATERIALIZED (
+                SELECT position,revision+1 AS revision,planned,
+                       owner OR job OR json_type(data,'$.media_capture_history') IS NULL AS set_history,
+                       json_remove(data,CASE WHEN owner THEN '$.attachment_owner_id' ELSE '$[0]' END,
+                                        CASE WHEN job THEN '$.storage_job_id' ELSE '$[0]' END,
+                                        CASE WHEN marker THEN '$.media_cleanup_round_id' ELSE '$[0]' END) AS data
+                FROM selected WHERE owner OR job OR marker OR json_type(data,'$.media_capture_history') IS NULL
+            )
+            UPDATE records SET revision=detached.revision,
+                data=json_set(CASE WHEN set_history THEN json_set(detached.data,'$.media_capture_history',
+                    json_extract(planned,'$.media_capture_history')) ELSE detached.data END,
+                    '$.revision',detached.revision,'$.updated_at',:updated)
+            FROM detached WHERE records.rowid=detached.position
+            """,arguments:["graph":context.key,"updates":updates,"project":context.project,"updated":now()])
     }
 
     private func applyMediaGraphSlice(_ db: Database,context: GraphDeletionContext,slice: DeletionGraph.Slice,
@@ -338,22 +388,20 @@ extension CommandRouter {
 
     private func publishMediaGraphDeletion(_ context: GraphDeletionContext, progress: DeletionGraph.Progress) throws -> JSON {
         let marker: JSON = [DeletionGraph.firstReceiptField:progress.receipt,"round_id":context.round,"project_id":context.project]
-        let (reply,audit,handoffWitnesses) = try context.observer.read { db in
+        let (reply,audit) = try context.observer.read { db in
             let first = try self.mediaGraphFirstReply(db,marker)
             let receipt = try self.record(db,progress.receipt,type:"storage_job")
             guard let audit = receipt["deletion"] as? JSON else {throw StoreRecovery.required("media_deletion_graph_receipt_invalid")}
-            let witnesses = try self.readMediaGraphHandoffWitnesses(db,progress:progress,graphKey:context.key,
-                                                                 hasKeptAttachments:int(audit,"kept_attachment_count") > 0)
-            return (first,audit,witnesses)
+            // A legacy journal without any proof could have hidden a
+            // successor before exact handoff membership was required.
+            if progress.handoffWitnessCount == nil,progress.predecessor != nil,int(audit,"kept_attachment_count") > 0 {
+                throw StoreRecovery.required("media_deletion_graph_handoff_unverified")
+            }
+            return (first,audit)
         }
         let encoded = try jsonString(marker)
         let successorKey = try mediaGraphSuccessorKey(context,predecessor:progress.predecessor)
         try writeMediaDeletionGraph(context,phase:"media_round_graph_publish",from:progress,to:nil) { db in
-            if !handoffWitnesses.isEmpty {
-                try self.validateMediaGraphHandoffPublication(db,context:context,witnesses:handoffWitnesses)
-                let prefix = DeletionGraph.handoffWitnessPrefix(context.key)
-                try db.execute(sql:"DELETE FROM metadata WHERE key>=? AND key<?",arguments:[prefix,prefix + "~"])
-            }
             try db.execute(sql:"""
                 UPDATE records SET data=json_set(data,'$.state',json_extract(data,'$.media_graph_cleanup_state'),
                     '$.parent_principal',?,'$.parent_command_id',?,'$.intent_digest',?)

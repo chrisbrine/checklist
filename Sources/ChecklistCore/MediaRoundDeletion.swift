@@ -15,7 +15,6 @@ struct MediaRoundDeletionPlan {
     let audit: JSON
     let keptAttachments: [JSON]
     let handoffOnlyIDs: Set<Data>
-    let handoffWitnessIDs: Set<Data>
     let fence: MediaRoundDeletionFence
     let recordSizes: [Data:Int]
     let batchGraph: Bool
@@ -463,7 +462,7 @@ extension CommandRouter {
             if e.type == "storage_job",let id = e.object["attachment_id"] as? String,
                try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE id=CAST(? AS TEXT) AND type='attachment')",arguments:[Data(id.utf8)]) == true {attachmentIDs.insert(Data(id.utf8))}
         }
-        var handoffOnlyIDs = Set<Data>(),handoffWitnessIDs = Set<Data>(),observedIDs = Set<Data>()
+        var handoffOnlyIDs = Set<Data>(),observedIDs = Set<Data>()
         var handoffBytes = 0
         let predecessor = round["predecessor_round_id"] as? String
         if let predecessorID = predecessor,
@@ -524,8 +523,8 @@ extension CommandRouter {
                     }
                 }
                 let owner: Data = row["owner_id"],intake: Data = row["intake_id"]
-                handoffWitnessIDs.formUnion([id,Data(predecessorID.utf8),owner,intake])
-                if let job: Data = row["import_id"] {handoffWitnessIDs.insert(job)}
+                observedIDs.formUnion([id,Data(predecessorID.utf8),owner,intake])
+                if let job: Data = row["import_id"] {observedIDs.insert(job)}
             }
         }
         var keptAttachments: [JSON] = [],keptAudit: [JSON] = []
@@ -554,7 +553,6 @@ extension CommandRouter {
                 let ticketWitnesses = [Data(taskID.utf8),Data((try StoredRecord(status,family:"status").string("id")).utf8)]
                 observedIDs.formUnion(ticketWitnesses)
                 observedIDs.insert(rawID)
-                if handoffOnlyIDs.contains(rawID) {handoffWitnessIDs.formUnion(ticketWitnesses)}
                 keptAttachments.append(attachment)
                 keptAudit.append(["attachment_id":id,"task_id":taskID,"task_key":try StoredRecord(task,family:"task").string("key"),"status":"kept","reason":"kept_with_ticket"])
                 continue
@@ -680,7 +678,6 @@ extension CommandRouter {
         let cleanupFinished = ProcessInfo.processInfo.systemUptime
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         observedIDs.formUnion(owned)
-        observedIDs.formUnion(handoffWitnessIDs)
         let workspacePaths = objects.compactMap { object -> String? in
             guard let path = object["relative_path"] as? String else {return nil}
             // Staging objects retain their exact reference needles above. They
@@ -695,7 +692,7 @@ extension CommandRouter {
             "preparation_seconds":historyFinished-started,"preparation_timings":["graph_seconds":graphFinished-started,"references_seconds":referencesSeconds,"cleanup_seconds":cleanupFinished-historySelected,"history_seconds":historySelected-referencesFinished+historyFinished-cleanupFinished+(parallelHistory?.1 ?? 0)]]
         return .init(version:version,project:project,round:rid,predecessor:predecessor,records:removed,history:history,
                      historyProgress:progress,bytes:cleanup,audit:audit,keptAttachments:keptAttachments,
-                     handoffOnlyIDs:handoffOnlyIDs,handoffWitnessIDs:handoffWitnessIDs,fence:fence,recordSizes:selectedSizes,batchGraph:batchGraph)
+                     handoffOnlyIDs:handoffOnlyIDs,fence:fence,recordSizes:selectedSizes,batchGraph:batchGraph)
     }
 
     func mediaRoundDeletionReferences(_ snapshot: Database,owned: Set<Data>,retainedAttachments: Set<Data>,handoffOnlyIDs: Set<Data>,

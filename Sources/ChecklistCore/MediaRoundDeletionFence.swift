@@ -60,6 +60,16 @@ struct MediaRoundDeletionChanges {
 struct MediaRoundDeletionFence: Codable {
     struct Record: Codable, Equatable {let position: Int64;let revision: Int64;let digest: Data;let type: Data;let project: Data?}
 
+    struct VisibleGraph {
+        let owned: Set<Data>
+        let keptIDs: String
+
+        init(_ work: MediaRoundDeletionGraph.Work) throws {
+            owned = Set(work.slices.flatMap(\.members).map {Data($0.utf8)})
+            keptIDs = try jsonString(work.kept.map {String(decoding:$0,as:UTF8.self)})
+        }
+    }
+
     static func record(_ db: Database,id: Data) throws -> Record? {
         guard let row = try Row.fetchOne(db,sql:"SELECT rowid position,revision,CAST(data AS BLOB) data,CAST(type AS BLOB) type,CAST(project_id AS BLOB) project FROM records WHERE id=CAST(? AS TEXT)",arguments:[id]) else {return nil}
         return .init(position:row["position"],revision:row["revision"],digest:MediaPreparationOverlay.digest(row["data"]),type:row["type"],project:row["project"])
@@ -108,7 +118,7 @@ struct MediaRoundDeletionFence: Codable {
         CoreError("MEDIA_CONTEXT_CHANGED","A round record, deletion-plan row or relevant reference changed during preparation; no records changed.",details:["check":check,"record_type":type,"record_id":String(decoding:id,as:UTF8.self)])
     }
 
-    func validate(_ db: Database,changes: MediaRoundDeletionChanges,writerVersion: Int64,afterVisibility: Bool = false) throws {
+    func validate(_ db: Database,changes: MediaRoundDeletionChanges,writerVersion: Int64,graph: VisibleGraph? = nil) throws {
         try changes.validateObservation(db,writerVersion:writerVersion)
         guard try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(changes.name))") == true else {return}
         // Compare only changed project roots. Paths and the initial authority
@@ -127,9 +137,16 @@ struct MediaRoundDeletionFence: Codable {
                 let root: String? = entry["workspace"]
                 let workspace = root.flatMap {CleanupWorkspaceProtection.matchingWorkspace($0,ancestors:workspaceAncestors)}
                     .map {Data($0.utf8)}
-                guard workspace == workspaceProtections[id] else {throw Self.changed("workspace_protection",type:"project",id:id)}
+                // Workspace and retained holds gate the initial plan. The
+                // byte executor checks them again before it acts on the receipt.
+                if graph == nil,workspace != workspaceProtections[id] {
+                    throw Self.changed("workspace_protection",type:"project",id:id)
+                }
                 guard let seen = records[id] else {continue}
-                guard !afterVisibility, try Self.record(db,id:id) == seen else {
+                // Visibility commits selection. Later writers depend on the
+                // owned rows, while kept attachments are updated in place.
+                if let graph,!graph.owned.contains(id) {continue}
+                guard graph == nil, try Self.record(db,id:id) == seen else {
                     throw Self.changed("planned_record_changed",type:String(decoding:seen.type,as:UTF8.self),id:id)
                 }
             case 1:
@@ -145,19 +162,31 @@ struct MediaRoundDeletionFence: Codable {
         // Match complete text atoms AND dictionary keys as in the preparation
         // stream. SQL keeps even a large unrelated changed row out of Swift.
         for (table,kind,key,payload) in [("records",0,"id","data"),("events",1,"id","data"),("commands",2,"command_id","result")] {
+            let kept = kind == 0 ? graph?.keptIDs : nil
+            let common = kept == nil ? "" : "WITH kept(id) AS MATERIALIZED (SELECT CAST(value AS BLOB) FROM json_each(?))"
+            // The detach pass owns these links on kept attachments. The
+            // historical round ID written by that pass has no live authority.
+            let scanned = kept == nil ? "r.\(payload)" : """
+                CASE WHEN r.type='attachment' AND c.id IN (SELECT id FROM kept) AND json_valid(r.data)
+                     THEN json_remove(r.data,'$.attachment_owner_id','$.storage_job_id','$.media_cleanup_round_id','$.media_capture_history.round_id')
+                     ELSE r.data END
+                """
             let principal = kind == 2 ? " AND r.principal=c.principal" : ""
             let holds = kind == 0 ? " OR (r.type='storage_hold' AND CAST(token AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)))" : ""
             // Linked tickets only gate pending owner requests in preparation.
             // Their ordinary notes, events and receipts are not media references.
             let pending = kind == 0 ? " OR (r.type='request' AND json_extract(r.data,'$.state')='pending' AND CAST(json_extract(r.data,'$.task_id') AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)))" : ""
             let entity = kind == 1 ? " OR CAST(r.entity_id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))" : ""
-            var arguments: [DatabaseValueConvertible] = [tokens]
-            if kind == 0 {arguments.append(digests);arguments.append(tasks)}
+            var arguments: [DatabaseValueConvertible] = []
+            if let kept {arguments.append(kept)}
+            arguments.append(tokens)
+            if kind == 0 {arguments.append(digests);arguments.append(graph == nil ? tasks : "[]")}
             if kind == 1 {arguments.append(tokens)}
             let sql = """
+                \(common)
                 SELECT CAST(r.\(key) AS BLOB) id,\(kind == 0 ? "r.type" : kind == 1 ? "'event'" : "'command'") type FROM \(changes.name) c JOIN \(table) r ON r.\(key)=CAST(c.id AS TEXT)\(principal)
                 WHERE c.kind=\(kind) AND (NOT json_valid(r.\(payload)) OR EXISTS(
-                    SELECT 1 FROM (SELECT j.atom token FROM json_tree(r.\(payload)) j WHERE j.type='text' UNION ALL SELECT j.key FROM json_tree(r.\(payload)) j WHERE typeof(j.key)='text')
+                    SELECT 1 FROM (SELECT j.atom token FROM json_tree(\(scanned)) j WHERE j.type='text' UNION ALL SELECT j.key FROM json_tree(\(scanned)) j WHERE typeof(j.key)='text')
                     WHERE CAST(token AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))\(holds))\(pending)\(entity)) LIMIT 1
                 """
             if let row = try Row.fetchOne(db,sql:sql,arguments:StatementArguments(arguments)) {throw Self.changed("changed_reference",type:row["type"],id:row["id"])}
