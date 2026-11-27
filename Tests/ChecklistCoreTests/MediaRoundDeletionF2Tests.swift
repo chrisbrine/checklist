@@ -94,7 +94,8 @@ extension MediaRoundDeletionTests {
             let oldCommandRows = try Row.fetchAll(db,sql:"SELECT principal,command_id," + oldMatch("result") + " AS media_reference FROM commands",arguments:[tokens,tokens])
             let oldEvents = oldEventRows.filter {owned.contains(Data(($0["entity_id"] as String? ?? "").utf8)) || $0["media_reference"] as Bool}.map {$0["id"] as String}
             let oldCommands = oldCommandRows.filter {$0["media_reference"] as Bool}.map {[$0["principal"] as String,$0["command_id"] as String]}
-            let current = try MediaRoundDeletionHistory.select(db,project:f.project,owned:owned)
+            let current = try MediaRoundDeletionHistory.select(db,project:f.project,owned:owned,
+                progressKey:MediaRoundDeletionHistory.progressKey(project:f.project,round:id))
             XCTAssertFalse(current.continuing)
             XCTAssertFalse(current.more)
             XCTAssertEqual(Set(current.events),Set(oldEvents))

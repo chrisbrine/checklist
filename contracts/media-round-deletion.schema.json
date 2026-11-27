@@ -166,6 +166,38 @@
       },
       "required": ["error"]
     },
+    "projected_operations": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Content-free operation_get data while the round remains after a nonfinal history pass. The last pass expires these outcomes and keeps the original command IDs reserved.",
+      "properties": {
+        "success": {
+          "allOf": [
+            {"$ref": "#/$defs/projectedOperation"},
+            {
+              "properties": {
+                "state": {"const": "succeeded"},
+                "error": false
+              },
+              "required": ["result"]
+            }
+          ]
+        },
+        "failure": {
+          "allOf": [
+            {"$ref": "#/$defs/projectedOperation"},
+            {
+              "properties": {
+                "state": {"const": "failed"},
+                "result": false
+              },
+              "required": ["error"]
+            }
+          ]
+        }
+      },
+      "required": ["success", "failure"]
+    },
     "operation_failure": {
       "type": "object",
       "additionalProperties": false,
@@ -228,6 +260,57 @@
     "operation_result"
   ],
   "$defs": {
+    "projectedOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {"$ref": "#/$defs/uuid"},
+        "command_id": {"$ref": "#/$defs/uuid"},
+        "project_id": {"$ref": "#/$defs/text"},
+        "method": {"$ref": "#/$defs/text"},
+        "state": {"enum": ["succeeded", "failed"]},
+        "status_method": {"const": "operation_get"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "command_id": {"$ref": "#/$defs/uuid"},
+            "data": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {"result_redacted": {"const": true}},
+              "required": ["result_redacted"]
+            }
+          },
+          "required": ["command_id", "data"]
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {"type": "string", "pattern": "^[A-Z0-9_]{1,96}$"},
+            "message": {"const": "This operation failed. Its original error details were removed during round deletion."},
+            "retryable": {"type": "boolean"},
+            "details": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "command_id": {"$ref": "#/$defs/uuid"},
+                "result_redacted": {"const": true},
+                "command_outcome": {"enum": ["unknown", "rejected"]}
+              },
+              "required": ["command_id", "result_redacted"]
+            }
+          },
+          "required": ["code", "message", "retryable", "details"]
+        }
+      },
+      "required": ["operation_id", "command_id", "method", "state", "created_at", "finished_at", "status_method"]
+    },
     "text": {
       "type": "string",
       "minLength": 1,

@@ -51,12 +51,15 @@ final class StoragePhaseTiming {
         fputs(line + "\n", stderr)
     }
 
-    static func writerHold(operation: String, command: String, pass: Int, seconds: TimeInterval, committed: Bool) {
+    static func writerHold(operation: String, command: String, pass: Int, seconds: TimeInterval, committed: Bool,
+                           elapsedSeconds: TimeInterval? = nil, interruptedStep: String? = nil) {
         var load = [Double](repeating: 0, count: 3)
         let observed = getloadavg(&load, 3)
-        let value: JSON = ["kind":"storage_phase_timing", "operation":operation, "phase":"writer_hold",
+        var value: JSON = ["kind":"storage_phase_timing", "operation":operation, "phase":"writer_hold",
             "command_id":command, "pass":pass, "seconds":seconds, "committed":committed,
             "load":observed == 3 ? load : [], "time":now()]
+        value["elapsed_seconds"] = elapsedSeconds
+        value["interrupted_step"] = interruptedStep
         if let bytes = try? JSONSerialization.data(withJSONObject:value, options:[.sortedKeys]),
            let line = String(data:bytes, encoding:.utf8) { log(line) }
     }

@@ -227,6 +227,41 @@
       }
     }
   },
+  "projected_operations": {
+    "success": {
+      "operation_id": "00000000-0000-0000-0000-000000000921",
+      "command_id": "00000000-0000-0000-0000-000000000922",
+      "project_id": "00000000-0000-0000-0000-000000000013",
+      "method": "media_intake_preview",
+      "state": "succeeded",
+      "created_at": "2026-11-01T11:00:00Z",
+      "finished_at": "2026-11-01T11:00:02Z",
+      "status_method": "operation_get",
+      "result": {
+        "command_id": "00000000-0000-0000-0000-000000000922",
+        "data": {"result_redacted": true}
+      }
+    },
+    "failure": {
+      "operation_id": "00000000-0000-0000-0000-000000000923",
+      "command_id": "00000000-0000-0000-0000-000000000924",
+      "project_id": "00000000-0000-0000-0000-000000000013",
+      "method": "media_round_delete",
+      "state": "failed",
+      "created_at": "2026-11-01T11:30:00Z",
+      "finished_at": "2026-11-01T11:30:08Z",
+      "status_method": "operation_get",
+      "error": {
+        "code": "MEDIA_CONTEXT_CHANGED",
+        "message": "This operation failed. Its original error details were removed during round deletion.",
+        "retryable": false,
+        "details": {
+          "command_id": "00000000-0000-0000-0000-000000000924",
+          "result_redacted": true
+        }
+      }
+    }
+  },
   "operation_failure": {
     "data": {
       "operation_id": "00000000-0000-4000-8000-000000000911",

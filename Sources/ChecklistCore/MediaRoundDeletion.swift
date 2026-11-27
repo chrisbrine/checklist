@@ -104,6 +104,18 @@ extension CommandRouter {
     }
 
     private func executeMediaRoundDeletionPass(_ p: JSON,_ c: Caller,command: String,digest: String,preparation: inout TimeInterval,phases: inout [String:Double]) throws -> JSON? {
+        let passStarted = ProcessInfo.processInfo.systemUptime
+        var writerTiming: (operation: String, pass: Int, seconds: TimeInterval)?
+        var committed = false
+        var writerStep = "fence"
+        var journalClosed = false
+        defer {
+            if let timing = writerTiming {
+                StoragePhaseTiming.writerHold(operation:timing.operation,command:command,pass:timing.pass,seconds:timing.seconds,
+                                              committed:committed,elapsedSeconds:ProcessInfo.processInfo.systemUptime - passStarted,
+                                              interruptedStep:committed ? nil : writerStep)
+            }
+        }
         var configuration = Configuration();configuration.readonly = true
         configuration.qos = .default
         configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
@@ -124,7 +136,7 @@ extension CommandRouter {
             try? dbQueue.writeWithoutTransaction {db in
                 self.mediaRoundDeletionPreparations[preparationProject]?.remove(changes.name)
                 if self.mediaRoundDeletionPreparations[preparationProject]?.isEmpty == true {self.mediaRoundDeletionPreparations.removeValue(forKey:preparationProject)}
-                try changes.remove(db)
+                if !committed || !journalClosed {try changes.remove(db)}
             }
         }
         var plan: MediaRoundDeletionPlan?,replay: JSON?
@@ -147,29 +159,24 @@ extension CommandRouter {
         for (phase, seconds) in plan.audit["preparation_timings"] as? [String:Double] ?? [:] {phases[phase,default:0] += seconds}
         var audit = plan.audit
         audit["preparation_seconds"] = preparation;audit["preparation_timings"] = phases
-        let final: (receipt: PreparedTicketObjectDeletionReceipt, reply: JSON, encoded: String)?
+        let final: (receipt: PreparedTicketObjectDeletionReceipt, reply: JSON, encoded: String, ownedRows: String?)?
         if plan.history.more {final = nil}
         else {
             let id = uuid()
             let fields: JSON = ["round_id":plan.round,"deletion":audit,"parent_principal":c.principal,"parent_command_id":command,"intent_digest":digest]
             let receipt = Self.ticketObjectDeletionReceipt(project:plan.project,task:plan.round,cause:"media_round_delete",plan:plan.bytes,id:id,additionalFields:fields)
             let reply = try mediaRoundDeletionView(receipt)
-            final = (try PreparedTicketObjectDeletionReceipt(receipt),reply,try jsonString(reply))
+            let ownedRows = plan.history.continuing ? try jsonString(plan.records.map { [$0.id,$0.type] }) : nil
+            final = (try PreparedTicketObjectDeletionReceipt(receipt),reply,try jsonString(reply),ownedRows)
         }
         let progressKey = try MediaRoundDeletionHistory.progressKey(project:plan.project,round:plan.round)
         let pass = (plan.historyProgress ?? 0) + 1
-        var writerSeconds: TimeInterval?,committed = false
-        defer {
-            if let writerSeconds {
-                let operation = plan.history.continuing ? "media_round_history_pass" : "media_round_deletion_commit"
-                StoragePhaseTiming.writerHold(operation:operation,command:command,pass:pass,seconds:writerSeconds,committed:committed)
-            }
-        }
+        let operation = plan.history.continuing ? "media_round_history_pass" : "media_round_deletion_commit"
         do {return try ArchiveStorageGate.withExclusive(root:root) {_ in
             try self.withMediaRoundDeletionWrite {
                 try self.dbQueue.writeWithoutTransaction {db -> JSON? in
                     let started = ProcessInfo.processInfo.systemUptime
-                    defer {writerSeconds = ProcessInfo.processInfo.systemUptime-started}
+                    defer {writerTiming = (operation,pass,ProcessInfo.processInfo.systemUptime-started)}
                     var result: JSON?
                     func apply() throws {
                         try self.withValidatedDomainTransaction(db) {
@@ -189,28 +196,54 @@ extension CommandRouter {
                             }
                             let current = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[progressKey])
                             guard current == plan.historyProgress.map(String.init) else {throw MediaRoundDeletionFence.changed("history_progress",type:"media_round",id:Data(plan.round.utf8))}
+                            if plan.history.continuing {
+                                // The fence is closed and no other writer can enter this transaction.
+                                // The remaining observers still journal these changes for their own fences.
+                                try changes.remove(db)
+                                journalClosed = true
+                            }
                             if plan.history.more {
+                                writerStep = "history"
                                 try plan.history.apply(db)
                                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[progressKey,String(pass)])
+                                writerStep = "commit"
                                 return .commit
                             }
                             guard let final else {throw MediaRoundDeletionFence.changed("plan_unavailable",type:"media_round",id:Data(plan.round.utf8))}
+                            writerStep = "graph"
                             // The content-free first outcome remains replayable while
                             // this durable receipt exists, under ordinary pruning rules.
                             let backup = try plan.bytes.objects.isEmpty ? nil : self.ticketCleanupBackupGenerationRow(db)
                             try self.commitPreparedTicketObjectDeletionReceipt(db,final.receipt)
                             if let backup {try self.markTicketObjectDeletionBackupGeneration(db,receipt:final.receipt.id,generation:backup)}
                             for attachment in plan.keptAttachments {try self.save(db,attachment,type:"attachment")}
-                            for row in plan.records {
-                                try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(project.utf8),Data(row.type.utf8)])
-                                guard db.changesCount == 1 else {throw MediaRoundDeletionFence.changed("owned_record_delete",type:row.type,id:Data(row.id.utf8))}
+                            if let ownedRows = final.ownedRows {
+                                // Match only identities observed by the reader. Point lookups
+                                // through the primary key avoid a scan of the retained store.
+                                try db.execute(sql:"""
+                                    DELETE FROM records WHERE rowid IN (
+                                        SELECT r.rowid FROM json_each(?) expected CROSS JOIN records r
+                                        WHERE r.id=CAST(json_extract(expected.value,'$[0]') AS TEXT)
+                                          AND r.type=CAST(json_extract(expected.value,'$[1]') AS TEXT)
+                                          AND r.project_id=CAST(? AS TEXT))
+                                    """,arguments:[ownedRows,Data(project.utf8)])
+                                guard db.changesCount == plan.records.count else {
+                                    throw MediaRoundDeletionFence.changed("owned_record_delete",type:"media_round",id:Data(plan.round.utf8))
+                                }
+                            } else {
+                                for row in plan.records {
+                                    try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(project.utf8),Data(row.type.utf8)])
+                                    guard db.changesCount == 1 else {throw MediaRoundDeletionFence.changed("owned_record_delete",type:row.type,id:Data(row.id.utf8))}
+                                }
                             }
+                            writerStep = "retirement"
                             try plan.history.apply(db)
                             if plan.historyProgress != nil {try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[progressKey])}
                             try CommandOperationPurgeEpoch.advance(db,project:project)
                             try self.event(db,caller:c,project:project,entity:plan.round,kind:"media_round_deleted",data:audit)
                             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[c.principal,command,digest,final.encoded])
                             result = final.reply
+                            writerStep = "commit"
                             return .commit
                         }
                     }
@@ -443,7 +476,7 @@ extension CommandRouter {
                 let selection = try observeReferences(snapshot,partition:ranges[index],budget:parallelBudget)
                 return .references(selection,ProcessInfo.processInfo.systemUptime-began)
             }
-            let history = try MediaRoundDeletionHistory.select(snapshot,project:project,owned:owned,continuing:progress != nil)
+            let history = try MediaRoundDeletionHistory.select(snapshot,project:project,owned:owned,progressKey:progressKey,continuing:progress != nil)
             return .history(history,ProcessInfo.processInfo.systemUptime-began)
         }) {
             for piece in pieces {
@@ -463,7 +496,7 @@ extension CommandRouter {
         remaining.append(contentsOf:referenced.rows)
         observedIDs.formUnion(referenced.ids)
         let referencesFinished = ProcessInfo.processInfo.systemUptime
-        let history = try parallelHistory?.0 ?? MediaRoundDeletionHistory.select(db,project:project,owned:owned,continuing:progress != nil)
+        let history = try parallelHistory?.0 ?? MediaRoundDeletionHistory.select(db,project:project,owned:owned,progressKey:progressKey,continuing:progress != nil)
         let historySelected = ProcessInfo.processInfo.systemUptime
         // The record reference scan and fence also apply to an empty round.
         // Interim passes change no files. With zero file descriptors, the final

@@ -249,6 +249,14 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_expired']['error']['code'] = 'OPERATION_INTERRUPTED'
     reject('media-round-deletion', bad, 'interruption presented as receipt expiry')
+    for state, field, added in (('success', 'result', 'title'), ('failure', 'error', 'record_id')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        projected = bad['projected_operations'][state][field]['data' if state == 'success' else 'details']
+        projected[added] = 'Original private value'
+        reject('media-round-deletion', bad, 'original content in projected ' + state)
+        projected.pop(added)
+        projected.pop('result_redacted')
+        reject('media-round-deletion', bad, 'missing redaction marker in projected ' + state)
     owner_expiry = json.loads((ROOT / 'examples/agent-project-commands.json').read_text())['owner_selected_file_expiry']
     expired_schema = validators['media-round-deletion'].schema['properties']['operation_expired']
     if not validators['media-round-deletion'].evolve(schema=expired_schema).is_valid(owner_expiry['expired']):

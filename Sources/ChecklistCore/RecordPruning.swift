@@ -98,6 +98,9 @@ extension CommandRouter {
     static let prunableCommandResultsSQL = """
         SELECT c.rowid FROM commands c WHERE c.rowid <= ? AND c.result <> ?
           AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.policy') IS NULL AND json_type(c.result,'$._connection_registration') IS NULL ELSE 0 END
+          AND COALESCE(CASE WHEN json_valid(c.result) THEN
+              CASE WHEN json_type(c.result,'$.pruned')='true' THEN json_extract(c.result,'$.\(MediaRoundDeletionHistory.projectionProgressField)') END END,'')
+              NOT IN (SELECT key FROM metadata WHERE key GLOB '\(MediaRoundDeletionHistory.progressPrefix)*')
           AND NOT EXISTS (SELECT 1 FROM records r WHERE r.type='storage_job' AND CASE WHEN json_valid(r.data) THEN 0 ELSE 1 END)
           AND (c.command_id,c.principal) NOT IN (SELECT json_extract(r.data,'$.parent_command_id'),json_extract(r.data,'$.parent_principal') FROM records r
                WHERE r.type='storage_job' AND json_valid(r.data)

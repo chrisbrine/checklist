@@ -363,6 +363,10 @@ extension CommandRouter {
             guard let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) else {throw Self.expiredCommandError(command)}
             guard receipt["digest"] as String == operation["digest"] as? String else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation's command receipt no longer matches its accepted intent.")}
             var result = jsonObject(receipt["result"])
+            if try MediaRoundDeletionHistory.activeProjection(db,result:result) {
+                value["result"] = ["command_id":command,"data":["result_redacted":true]] as JSON
+                return value
+            }
             guard !Self.isPrunedResult(result) else {throw Self.expiredCommandError(command)}
             if operation["method"] as? String == "attachment_read" {
                 result = try self.attachmentOperationResult(db,result,operation:operation,caller:caller)
@@ -378,6 +382,10 @@ extension CommandRouter {
                   let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,errorCommand]) else {throw Self.expiredCommandError(operation["command_id"] as! String)}
             guard receipt["digest"] as String == hash(Data(("operation-error:" + (operation["digest"] as! String)).utf8)) else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation error receipt no longer matches its accepted intent.")}
             let result = jsonObject(receipt["result"])
+            if try MediaRoundDeletionHistory.activeProjection(db,result:result) {
+                value["error"] = try MediaRoundDeletionHistory.projectedError(result,command:operation["command_id"] as! String)
+                return value
+            }
             guard !Self.isPrunedResult(result) else {throw Self.expiredCommandError(operation["command_id"] as! String)}
             value["error"] = result["error"]
         }
