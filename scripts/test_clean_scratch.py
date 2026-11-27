@@ -1404,6 +1404,104 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(self.run_cleanup(apply=True, **options)[0], 0)
         self.assertEqual(list(self.trash.iterdir()), [])
 
+    def test_shared_round_receipt_holds_checkout_for_installed_and_previous_fingerprints(self):
+        self.installed = self.write(self.root, 'Applications/Checklist.app/Contents/Resources/build-info.json',
+                                    json.dumps({'source_fingerprint': self.fingerprint}).encode())
+        previous = 'b' * 64
+        self.write(self.root, 'Applications/.Checklist-previous-20261127T000000Z-1.app/'
+                             'Contents/Resources/build-info.json',
+                   json.dumps({'source_fingerprint': previous}).encode())
+        for name, fingerprint in [('installed', self.fingerprint), ('previous', previous)]:
+            container = self.item(name)
+            self.write(container, '.build/CACHEDIR.TAG')
+            self.write(container, 'staged/Checklist.app/Contents/Resources/build-info.json',
+                       json.dumps({'source_fingerprint': fingerprint}).encode())
+            for child in ('round-checkout', 'round-support'):
+                workspace = container / child
+                self.write(workspace, 'src/source.py')
+                self.mark(workspace, release=True)
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result, rows = self.run_cleanup(apply=apply)
+                self.assertEqual(result, 0)
+                self.assertEqual(len(rows), 4)
+                self.assertEqual({Path(row['path']).name for row in rows}, {'round-checkout', 'round-support'})
+                for row in rows:
+                    path = Path(row['path'])
+                    self.assertEqual(row['eligible_paths'], [])
+                    expected = 'latest installed' if path.parent.name == 'installed' else 'previous installed'
+                    self.assertIn(f'qualified copy of {expected} round', row['reason'])
+                    self.assertTrue((path / 'src/source.py').is_file())
+                self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_nonmatching_shared_round_receipt_keeps_released_siblings_eligible(self):
+        container = self.item('round')
+        self.write(container, '.build/CACHEDIR.TAG')
+        receipt = self.write(container, 'staged/Checklist.app/Contents/Resources/build-info.json',
+                             json.dumps({'source_fingerprint': 'b' * 64}).encode())
+        released = [container / name for name in ('checkout', 'support')]
+        for workspace in released:
+            self.write(workspace, 'src/source.py')
+            self.mark(workspace, release=True)
+        result, rows = self.run_cleanup()
+        self.assertEqual(result, 0)
+        self.assertEqual([row['eligible_paths'] for row in rows], [[str(path)] for path in released])
+        result, rows = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                         list(map(str, released)))
+        self.assertTrue(receipt.is_file())
+
+    def test_apply_rechecks_shared_round_receipt_before_trashing_checkout(self):
+        container = self.item('round')
+        self.write(container, '.build/CACHEDIR.TAG')
+        workspace = container / 'checkout'
+        payload = self.write(workspace, 'src/source.py')
+        self.mark(workspace, release=True)
+        observations = 0
+
+        def process_reader():
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                self.write(container, 'staged/Checklist.app/Contents/Resources/build-info.json',
+                           json.dumps({'source_fingerprint': self.fingerprint}).encode())
+            return []
+
+        result, rows = self.run_cleanup(apply=True, process_reader=process_reader)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['action'], 'kept_error')
+        self.assertIn('qualified copy of latest installed round', rows[0]['reason'])
+        self.assertTrue(payload.is_file())
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_apply_rechecks_child_marker_after_shared_round_scan(self):
+        container = self.item('round')
+        self.write(container, '.build/CACHEDIR.TAG')
+        workspace = container / 'checkout'
+        payload = self.write(workspace, 'src/source.py')
+        self.mark(workspace, release=True)
+        original = cleanup.shared_round_receipts
+        scans = 0
+
+        def scan(root, workspaces):
+            nonlocal scans
+            yield from original(root, workspaces)
+            scans += 1
+            if scans == 2:
+                self.mark(workspace)  # Reassign while the shared tree is inspected.
+
+        with patch.object(cleanup, 'shared_round_receipts', side_effect=scan):
+            result, rows = self.run_cleanup(apply=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(scans, 2)
+        self.assertEqual(len(rows), 1)
+        self.assertIn('changed during inspection', rows[0]['reason'])
+        self.assertTrue(payload.is_file())
+        self.assertFalse(cleanup.read_marker(workspace)['released'])
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_build_cache_container_respects_parent_and_foreign_scope(self):
         protected = self.item('marked-parent')
         legacy = self.item('ws123')

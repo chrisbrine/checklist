@@ -20,13 +20,14 @@ import sys
 import tempfile
 import time
 
-from retire_old_bundles import TRASH_TOOL, trash
+from retire_old_bundles import TRASH_TOOL, previous_timestamp, trash
 
 REPO = Path(__file__).resolve().parents[1]
 BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module-cache'}
 QUIET_SECONDS = 45 * 60
 UNMARKED_AGE_SECONDS = 7 * 24 * 60 * 60
 WORKSPACE_MARKER = '.checklist-workspace.json'
+BUILD_IDENTITY_NAMES = {'capture-manifest.json', 'build-info.json', 'source-manifest.json', WORKSPACE_MARKER}
 TICKET = re.compile(r'[A-Z][A-Z0-9]*-\d+')
 # Status categories that end a ticket's work; its registered folders may retire (CL-359).
 FINISHED = {'done', 'canceled', 'cancelled'}
@@ -684,7 +685,83 @@ def installed_fingerprint(path):
         return None
 
 
-def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaustive=False):
+def rollback_fingerprint(installed_info):
+    """Read the immediate rollback bundle beside a standard installed bundle."""
+    installed_info = installed_info.absolute()
+    if (installed_info.parts[-3:] != ('Contents', 'Resources', 'build-info.json')
+            or installed_info.parents[2].suffix != '.app'):
+        return None
+    bundles = sorted((previous_timestamp(bundle) or '', bundle)
+                     for bundle in installed_info.parents[3].iterdir()
+                     if bundle.name.startswith('.Checklist-previous-') and bundle.suffix == '.app')
+    if not bundles:
+        return None
+    stamp, bundle = bundles[-1]
+    if not bundles[0][0] or bundle.is_symlink() or (len(bundles) > 1 and bundles[-2][0] == stamp):
+        raise ValueError('previous installed identity unavailable; qualified-copy retention unresolved')
+    fingerprint = installed_fingerprint(bundle / 'Contents/Resources/build-info.json')
+    if fingerprint is None:
+        raise ValueError('previous installed identity unavailable; qualified-copy retention unresolved')
+    return fingerprint
+
+
+def build_identity_hold(paths, fingerprint, previous):
+    for path in paths:
+        try:
+            value = json.loads(path.read_text()).get('source_fingerprint')
+        except (ValueError, AttributeError):
+            # An unreadable receipt is not proof that a copy is obsolete.
+            return 'unreadable build identity; qualified-copy retention unresolved'
+        if value == fingerprint:
+            return 'qualified copy of latest installed round (matching source fingerprint)'
+        if previous is not None and value == previous:
+            return 'qualified copy of previous installed round (matching source fingerprint)'
+    return None
+
+
+def shared_rounds(items):
+    """Group the immediate workspace candidates split from a round container."""
+    rounds = {}
+    for item, kind in items:
+        parent = item.parent
+        if kind in {'session', 'spare'} and parent.name != 'scratchpad' and parent.parent.name == 'scratchpad':
+            rounds.setdefault(parent, set()).add(os.fspath(item))
+    return rounds
+
+
+def shared_round_receipts(root, workspaces):
+    """Scan parent-owned files once without entering independent workspace trees."""
+    pending = [os.fspath(root)]
+    while pending:
+        folder = pending.pop()
+        if os.path.islink(folder):
+            raise ValueError('linked shared round directory: ' + str(folder))
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.path in workspaces:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+                elif entry.name in BUILD_IDENTITY_NAMES and entry.is_file(follow_symlinks=False):
+                    yield Path(entry.path)
+
+
+def shared_round_holds(rounds, fingerprint, previous):
+    holds = {}
+    if fingerprint is None:  # The normal planner already retains every uncertain item.
+        return holds
+    for parent, workspaces in rounds.items():
+        try:
+            reason = build_identity_hold(shared_round_receipts(parent, workspaces), fingerprint, previous)
+        except (OSError, ValueError) as error:
+            reason = ValueError('unreadable shared round identity; retained: ' + str(error))
+        if reason:
+            holds[parent] = reason
+    return holds
+
+
+def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaustive=False,
+         *, previous=None, round_hold=None):
     """exhaustive=True skips the item-wide-hold shortcut (tests prove both agree)."""
     before = inventory(item)
     below_item = os.fspath(item).rstrip('/') + '/'
@@ -717,20 +794,17 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
         reason = 'latest installed identity unavailable; qualified-copy retention unresolved'
     elif (kind == 'qualification' and (read_marker(item) or {}).get('source_fingerprint') == fingerprint):
         reason = 'qualified copy of latest installed round (matching root source fingerprint)'
+    elif (kind == 'qualification' and previous is not None
+          and (read_marker(item) or {}).get('source_fingerprint') == previous):
+        reason = 'qualified copy of previous installed round (matching root source fingerprint)'
+    elif isinstance(round_hold, ValueError):
+        raise round_hold
+    elif round_hold:
+        reason = round_hold
     else:
-        for path, entry in files.items():
-            if path.name not in {'capture-manifest.json', 'build-info.json', 'source-manifest.json', WORKSPACE_MARKER}:
-                continue
-            if not stat.S_ISREG(entry[2]):
-                continue
-            try:
-                if json.loads(path.read_text()).get('source_fingerprint') == fingerprint:
-                    reason = 'qualified copy of latest installed round (matching source fingerprint)'
-                    break
-            except (ValueError, AttributeError):
-                # An unreadable receipt is not proof that a copy is obsolete.
-                reason = 'unreadable build identity; qualified-copy retention unresolved'
-                break
+        receipts = (path for path, entry in files.items()
+                    if path.name in BUILD_IDENTITY_NAMES and stat.S_ISREG(entry[2]))
+        reason = build_identity_hold(receipts, fingerprint, previous)
     if not reason and any(within(path, item) for path in processes):
         reason = 'running process uses this item'
     cutoff = (time.time() if now is None else now) - QUIET_SECONDS
@@ -857,7 +931,8 @@ def _set_preview_objects(objects):
     _PREVIEW_OBJECTS = objects
 
 
-def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released, objects=None, sizer=None):
+def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released,
+                objects=None, sizer=None, *, previous=None, round_hold=None):
     """One read-only preview decision; module-level so a process pool can run it."""
     # An old --preview is never an executable deletion plan.
     if not in_scope(item, kind, session_id, include_released):
@@ -866,7 +941,8 @@ def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_
     if held := held_preview(item, kind, keep, sizer):
         return held
     return preview_public(plan(item, kind, _PREVIEW_OBJECTS if objects is None else objects,
-                               [item] if in_use else [], fingerprint, keep, now))
+                               [item] if in_use else [], fingerprint, keep, now,
+                               previous=previous, round_hold=round_hold))
 
 
 def preview_executor(objects, workers=PREVIEW_WORKERS):
@@ -880,7 +956,7 @@ def preview_executor(objects, workers=PREVIEW_WORKERS):
 
 
 def preview_items(items, objects, used, fingerprint, keep, clock, session_id, include_released,
-                  workers=PREVIEW_WORKERS, executor=None, sizer=None):
+                  workers=PREVIEW_WORKERS, executor=None, sizer=None, *, previous=None, round_holds=None):
     """Read-only preview: the same per-item decisions and output order as apply's
     planning, with held-root du sizes and item plans computed in parallel.
 
@@ -892,14 +968,17 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
             ThreadPoolExecutor(max_workers=max(1, workers)) as size_pool:
         futures = []
         for item, kind in items:
+            round_hold = (round_holds or {}).get(item.parent)
             # Held roots use the very same background size futures as size_report;
             # do not make each process launch a duplicate du of that subtree.
             if sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
                 future = size_pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
-                                          session_id, include_released, objects, sizer)
+                                          session_id, include_released, objects, sizer,
+                                          previous=previous, round_hold=round_hold)
             else:
                 future = pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
-                                     session_id, include_released, None if process_pool else objects)
+                                     session_id, include_released, None if process_pool else objects,
+                                     previous=previous, round_hold=round_hold)
             futures.append((item, future))
         for item, future in futures:
             try:
@@ -970,7 +1049,7 @@ def restore_modes(modes, destinations):
 
 
 def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
-                session_id, include_released):
+                session_id, include_released, *, previous=None, rounds=None):
     batch = [(d, p) for d, p in batch if not d.get('stopped')]
     if not batch:
         return
@@ -983,6 +1062,12 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
             move_error(decision, error, stop=True)
         return
     used = used_items(processes, (Path(d['path']) for d in decisions))
+    # Recheck each shared tree once. Revalidate child inventories and installed
+    # identities afterward, so a slow shared scan cannot make those checks stale.
+    parents = {Path(d['path']).parent for d in decisions}
+    round_holds = shared_round_holds(
+        {parent: items for parent, items in (rounds or {}).items() if parent in parents},
+        fingerprint, previous)
     for decision in decisions:
         item = Path(decision['path'])
         try:
@@ -994,9 +1079,12 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
                 raise ValueError('item changed during inspection/Trash moves; stopped')
             if workspace_protection(item, decision['inventory']):
                 raise ValueError('workspace ownership/release changed; stopped')
+            if hold := round_holds.get(item.parent):
+                raise ValueError(str(hold) + '; stopped before Trash')
         except (OSError, ValueError) as error:
             move_error(decision, error, stop=True)
-    if installed_fingerprint(installed_info) != fingerprint:
+    if (installed_fingerprint(installed_info) != fingerprint
+            or rollback_fingerprint(installed_info) != previous):
         for decision in decisions:
             if not decision.get('stopped'):
                 move_error(decision, ValueError('installed round changed; rerun preview with its qualified copy retained'), stop=True)
@@ -1079,7 +1167,7 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
             move_error(decision, error, stop=True)
     if retry:
         apply_batch(retry, installed_info, fingerprint, process_reader, mover,
-                    session_id, include_released)
+                    session_id, include_released, previous=previous, rounds=rounds)
 
 
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
@@ -1108,14 +1196,18 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
     items = list(candidates(sessions, qualification, session_id, include_released))
     objects = git_objects(repo) if items else set()
     fingerprint = installed_fingerprint(installed_info)
+    previous = rollback_fingerprint(installed_info) if items and fingerprint else None
+    rounds = shared_rounds(items)
     processes = process_reader() if items else []
     # Background du starts only after process inspection: its own command
     # arguments must never read as a running process using an item.
     sizer = after_inspection() if after_inspection else None
     used = used_items(processes, (item for item, _ in items))
+    round_holds = shared_round_holds(rounds, fingerprint, previous)
     if not apply:
         return 1 if preview_items(items, objects, used, fingerprint, keep, clock, session_id,
-                                  include_released, executor=preview_pool, sizer=sizer) or failed else 0
+                                  include_released, executor=preview_pool, sizer=sizer,
+                                  previous=previous, round_holds=round_holds) or failed else 0
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
@@ -1123,7 +1215,8 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 # An old --preview is never an executable deletion plan.
                 if not in_scope(item, kind, session_id, include_released):
                     raise ValueError('workspace ownership/release changed; retained')
-                decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock())
+                decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock(),
+                                previous=previous, round_hold=round_holds.get(item.parent))
                 public = preview_public(decision)
                 if decision['moves']:
                     public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)
@@ -1137,7 +1230,7 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
         for batch in move_batches((d, p) for d in pending for p in d['moves']):
             try:
                 apply_batch(batch, installed_info, fingerprint, process_reader, mover,
-                            session_id, include_released)
+                            session_id, include_released, previous=previous, rounds=rounds)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 for decision in {id(d): d for d, _ in batch}.values():
                     move_error(decision, error, stop=True)

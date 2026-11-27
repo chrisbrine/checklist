@@ -407,7 +407,10 @@ An unmarked round folder with its own `.build` can still hold independently
 registered workspaces (CL-524). When the cache is the parent folder's only
 private-copy indicator, scratch cleanup previews each marked child with its own
 reason. A protected child can stay while eligible released siblings move to the
-Trash. The parent cache, loose evidence and unmarked children stay. See the
+Trash. The parent cache, loose evidence and unmarked children stay. When a
+receipt in the shared files identifies the installed or immediate rollback build,
+every workspace in the round stays. Apply rechecks shared receipts before each
+Trash batch. See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 
 Size budget (CL-359): each `clean_builds.py` and `clean_scratch.py` run ends with
