@@ -43,6 +43,7 @@ final class CommandOperations: @unchecked Sendable {
         let id: String
         let params: Data
         let method: String
+        let mediaRoundDeletionProject: Data?
         let caller: Caller
         let generation: String?
         let lease: StorageOperationLease
@@ -51,7 +52,7 @@ final class CommandOperations: @unchecked Sendable {
     private var queue: DispatchQueue?
     private var mediaRoundDeletionQueue: DispatchQueue?
     private var jobs: [String:Job] = [:]
-    private var mediaRoundDeletions: [String] = []
+    private var mediaRoundDeletions: [Data:[Job]] = [:]
     private var scheduled = Set<String>()
     private var recoveryRequired = Set<String>()
     private var executing = Set<String>()
@@ -181,10 +182,11 @@ final class CommandOperations: @unchecked Sendable {
     }
     func add(_ job: Job,router: CommandRouter) {
         lock.withLock {
-            if job.method == "media_round_delete",mediaRoundDeletionQueue != nil,jobs[job.id] == nil {
-                mediaRoundDeletions.append(job.id)
+            if let project = job.mediaRoundDeletionProject {
+                mediaRoundDeletions[project,default:[]].append(job)
+            } else {
+                jobs[job.id] = job
             }
-            jobs[job.id] = job
             recoveryRequired.remove(job.id)
             held.removeValue(forKey:job.id)
         }
@@ -193,11 +195,11 @@ final class CommandOperations: @unchecked Sendable {
     func resume(router: CommandRouter) {
         lock.withLock {
             guard let queue else {return}
-            if let mediaRoundDeletionQueue {
-                for id in mediaRoundDeletions {
-                    guard let job = jobs[id],scheduled.insert(id).inserted else {continue}
-                    schedule(job,on:mediaRoundDeletionQueue,router:router)
-                }
+            // Dispatch only the head of each project. A closed admission gate
+            // can unschedule the head without letting its successor overtake it.
+            for deletions in mediaRoundDeletions.values {
+                guard let job = deletions.first,scheduled.insert(job.id).inserted else {continue}
+                schedule(job,on:mediaRoundDeletionQueue ?? queue,router:router)
             }
             for job in jobs.values where scheduled.insert(job.id).inserted {schedule(job,on:queue,router:router)}
         }
@@ -207,9 +209,13 @@ final class CommandOperations: @unchecked Sendable {
             let finished = router.runCommandOperation(job)
             let callback = lock.withLock { () -> (@Sendable (String,Bool) -> Void)? in
                 scheduled.remove(job.id)
-                if finished,jobs[job.id]?.attempt == job.attempt {
-                    jobs.removeValue(forKey:job.id)
-                    if job.method == "media_round_delete" {mediaRoundDeletions.removeAll {$0 == job.id}}
+                if finished {
+                    if let project = job.mediaRoundDeletionProject {
+                        mediaRoundDeletions[project]?.removeFirst()
+                        if mediaRoundDeletions[project]?.isEmpty == true {mediaRoundDeletions.removeValue(forKey:project)}
+                    } else if jobs[job.id]?.attempt == job.attempt {
+                        jobs.removeValue(forKey:job.id)
+                    }
                 }
                 return completion
             }
@@ -481,7 +487,9 @@ extension CommandRouter {
             operation = staged.0
         }
         if schedule {
-            let job = CommandOperations.Job(id:id,params:try JSONSerialization.data(withJSONObject:params),method:method,caller:caller,generation:generation,lease:lease)
+            let deletionProject = method == "media_round_delete" ? (params["project_id"] as? String).map {Data($0.utf8)} : nil
+            let job = CommandOperations.Job(id:id,params:try JSONSerialization.data(withJSONObject:params),method:method,
+                                            mediaRoundDeletionProject:deletionProject,caller:caller,generation:generation,lease:lease)
             retained = true;commandOperations.add(job,router:self)
         }
         // Acceptance always identifies the same operation, including on replay.

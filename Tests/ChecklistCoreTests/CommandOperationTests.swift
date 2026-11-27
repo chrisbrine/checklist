@@ -167,6 +167,103 @@ final class CommandOperationTests: XCTestCase {
         XCTAssertEqual(try state(1),"succeeded")
     }
 
+    func testMediaRoundDeletionDeferredHeadKeepsItsPlaceWhenBackupAdmissionReopens() throws {
+        let checks = MediaRoundDeletionTests(),f = try MediaFrozenIntakeTests.Fixture()
+        let type = try f.type(MediaRoundTests().schema()),router = f.router!,storage = try XCTUnwrap(f.storage)
+        let inputs = try (1...2).map {_ in try deletionInput(f,checks.cancel(f,f.round(type)))}
+        let deletionQueue = DispatchQueue(label:"test-media-backup-admission")
+        let start = DispatchSemaphore(value:0),deferred = DispatchSemaphore(value:0),reopen = DispatchSemaphore(value:0)
+        let finished = DispatchSemaphore(value:0),execution = OperationCaptureProbe()
+        deletionQueue.async {XCTAssertEqual(start.wait(timeout:.now()+15),.success)}
+        router.configureCommandOperations(on:DispatchQueue(label:"test-other-operations"),mediaRoundDeletionQueue:deletionQueue) {_,_ in finished.signal()}
+        router.commandOperations.executionProbe = {execution.record($0,locked:router.writeAdmissionStatus["locked"] as? Bool == true)}
+        var capturing = false
+        defer {
+            if capturing {router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)}
+            start.signal();reopen.signal()
+            _ = waitForDeletionLane(deletionQueue)
+            router.commandOperations.executionProbe = nil
+        }
+        let first = try storage.call("media_round_delete",inputs[0])
+        // Stop the lane after the refused attempt and before any already
+        // dispatched successor. Reopening here used to put the head last.
+        deletionQueue.async {
+            deferred.signal()
+            XCTAssertEqual(reopen.wait(timeout:.now()+15),.success)
+        }
+        let second = try storage.call("media_round_delete",inputs[1])
+        try router.backupWrites.beginCapture();capturing = true
+        start.signal()
+        guard deferred.wait(timeout:.now()+10) == .success else {return XCTFail("Queue did not reach the deferred head")}
+        XCTAssertTrue(execution.executions.isEmpty)
+        for accepted in [first,second] {XCTAssertEqual(try read(storage,accepted,project:f.project)["state"] as? String,"queued")}
+        router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router);capturing = false
+        router.resumeCommandOperations()
+        reopen.signal()
+        for _ in 0..<2 {XCTAssertEqual(finished.wait(timeout:.now()+10),.success)}
+        XCTAssertEqual(execution.executions.map(\.id),try [first,second].map(operationID))
+        for (input,accepted) in zip(inputs,[first,second]) {try assertMediaDeleted(storage,accepted,input:input,project:f.project)}
+    }
+
+    func testMediaRoundDeletionRestartInterruptsPendingIDsAndPreservesOrderOnFreshSubmission() throws {
+        let checks = MediaRoundDeletionTests(),f = try MediaFrozenIntakeTests.Fixture()
+        let type = try f.type(MediaRoundTests().schema()),storage = try XCTUnwrap(f.storage)
+        let inputs = try (1...2).map {_ in try deletionInput(f,checks.cancel(f,f.round(type)))}
+        let pendingLane = DispatchQueue(label:"test-pending-media-deletions")
+        f.router.configureCommandOperations(on:pendingLane)
+        try f.router.backupWrites.beginCapture()
+        let pending = try inputs.map {try storage.call("media_round_delete",$0)}
+        guard waitForDeletionLane(pendingLane) else {return}
+        for accepted in pending {XCTAssertEqual(try read(storage,accepted,project:f.project)["state"] as? String,"queued")}
+        try f.reopen()
+
+        let router = f.router!,deletionQueue = DispatchQueue(label:"test-reopened-media-deletions",attributes:.concurrent)
+        let finished = DispatchSemaphore(value:0),execution = OperationCaptureProbe()
+        router.configureCommandOperations(on:deletionQueue) {_,_ in finished.signal()}
+        router.commandOperations.executionProbe = {execution.record($0,locked:false)}
+        defer {
+            _ = waitForDeletionLane(deletionQueue)
+            router.commandOperations.executionProbe = nil
+        }
+        for (input,accepted) in zip(inputs,pending) {
+            let command = try XCTUnwrap(data(accepted)["command_id"] as? String)
+            let replay = try storage.call("media_round_delete",input,command:command)
+            XCTAssertEqual(try operationID(replay),try operationID(accepted))
+            let interrupted = try read(storage,accepted,project:f.project)
+            XCTAssertEqual(interrupted["state"] as? String,"failed")
+            XCTAssertEqual((interrupted["error"] as? JSON)?["code"] as? String,"OPERATION_INTERRUPTED")
+            XCTAssertNil(interrupted["started_at"])
+        }
+        let fresh = try inputs.map {try storage.call("media_round_delete",$0)}
+        for _ in fresh {XCTAssertEqual(finished.wait(timeout:.now()+10),.success)}
+        for (input,accepted) in zip(inputs,fresh) {try assertMediaDeleted(storage,accepted,input:input,project:f.project)}
+        XCTAssertEqual(execution.executions.map(\.id),try fresh.map(operationID))
+    }
+
+    private func assertMediaDeleted(_ f: StorageFixture,_ accepted: JSON,input: JSON,project: String) throws {
+        let status = try read(f,accepted,project:project)
+        XCTAssertEqual(status["state"] as? String,"succeeded")
+        let result = try data(XCTUnwrap(status["result"] as? JSON))
+        XCTAssertEqual(result["deleted"] as? Bool,true)
+        XCTAssertEqual(result["round_id"] as? String,input["round_id"] as? String)
+    }
+
+    private func deletionInput(_ f: MediaFrozenIntakeTests.Fixture,_ round: JSON) throws -> JSON {
+        var input = try MediaRoundDeletionTests().input(f,round)
+        input["project_id"] = f.project
+        return input
+    }
+
+    private func operationID(_ accepted: JSON) throws -> String {try XCTUnwrap(data(accepted)["operation_id"] as? String)}
+
+    private func waitForDeletionLane(_ queue: DispatchQueue,file: StaticString = #filePath,line: UInt = #line) -> Bool {
+        let drained = DispatchSemaphore(value:0)
+        queue.async(flags:.barrier) {drained.signal()}
+        let finished = drained.wait(timeout:.now()+10) == .success
+        XCTAssertTrue(finished,"Deletion lane did not drain",file:file,line:line)
+        return finished
+    }
+
     func testMediaRoundDeleteReplayKeepsFirstInterruptedOutcome() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String,router = f.router!
         let lane = HeldLane(router);defer {lane.finish()}

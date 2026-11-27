@@ -352,7 +352,7 @@
         "preparation_seconds": {
           "type": "number",
           "minimum": 0,
-          "description": "Measured wall seconds spent preparing this deletion before the record commit. Legacy receipts omit both preparation fields rather than inventing a measurement."
+          "description": "Measured wall seconds spent preparing this deletion after queue wait and before the record commit. Legacy receipts omit both preparation fields."
         },
         "preparation_timings": {
           "description": "Independent wall-clock phase durations. Reference and history work can overlap.",
@@ -686,6 +686,7 @@
           "const": "media_round_delete"
         },
         "state": {
+          "description": "Queued deletions in the same project wait for earlier deletions, including a head deferred by backup write admission. Deletions in different projects can run concurrently.",
           "enum": [
             "queued",
             "running",
@@ -706,7 +707,8 @@
         },
         "started_at": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Execution start after queue wait. Subtract created_at to estimate the wait at timestamp precision."
         },
         "finished_at": {
           "type": "string",
