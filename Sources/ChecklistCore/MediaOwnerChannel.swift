@@ -75,7 +75,7 @@ extension CommandRouter {
     }
     private func mediaOwnerRecords(_ db: Database,project: String,family: String,predicate: String,arguments: StatementArguments,limit: Int,offset: Int = 0) throws -> [JSON] {
         var args: StatementArguments = [project,family]; args += arguments; args += [limit,offset]
-        return try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=? AND type=?" + predicate + " ORDER BY rowid LIMIT ? OFFSET ?",arguments:args).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        return try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=? AND type=? AND " + MediaRoundDeletionGraph.visibleSQL() + predicate + " ORDER BY rowid LIMIT ? OFFSET ?",arguments:args).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
     }
     func mediaOwnerHeader(_ db: Database,_ round: JSON,_ caller: Caller) throws -> JSON {
         var result = round

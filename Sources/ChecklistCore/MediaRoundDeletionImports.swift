@@ -2,6 +2,81 @@ import Foundation
 import GRDB
 import Darwin
 
+/// These are the only import states whose recovery opens the parent payload.
+final class MediaRoundDeletionImportRecovery: @unchecked Sendable {
+    static let receiptStates = ["committed", "repair_required"]
+    static let waitingReason = "media_import_recovery"
+    static let settlementField = "_media_history_settled_import"
+
+    static func provesSettlement(_ receipt: JSON, job: String, attachment: String) -> Bool {
+        CommandRouter.isPrunedResult(receipt) && receipt[settlementField] as? String == hash(Data((job + ":" + attachment).utf8))
+    }
+
+    static func needsReceiptSQL(_ data: String) -> String {
+        let states = receiptStates.map { "'\($0)'" }.joined(separator: ",")
+        return "json_extract(\(data),'$.state') IN (\(states))"
+    }
+
+    struct Pending: Error { let imports: [String] }
+
+    private let lock = NSLock()
+    private var waiting: [String: Set<Data>] = [:]
+    private var retrying = Set<String>()
+    private var recoveryTurn = false
+
+    func isWaiting(_ operation: String) -> Bool {
+        lock.withLock { waiting[operation] != nil }
+    }
+
+    var needsTurn: Bool { lock.withLock { recoveryTurn || !retrying.isEmpty } }
+
+    func requestRetry(_ operation: String) -> Bool {
+        lock.withLock {
+            guard waiting[operation] != nil else { return false }
+            return retrying.insert(operation).inserted
+        }
+    }
+
+    func takeRetries() -> Set<Data> {
+        lock.withLock {
+            defer { retrying.removeAll() }
+            return retrying.reduce(into: Set<Data>()) { imports, operation in
+                if let pending = waiting[operation] { imports.formUnion(pending) }
+            }
+        }
+    }
+
+    func park(_ operation: String, imports: Set<Data>, failures: [Data: Int]) {
+        guard !imports.isEmpty else { return }
+        lock.withLock {
+            waiting[operation] = imports
+            recoveryTurn = recoveryTurn || imports.contains { failures[$0, default: 0] < 2 }
+        }
+    }
+
+    func settled(_ id: Data) -> Bool {
+        lock.withLock {
+            var resumed = false
+            for operation in Array(waiting.keys) where waiting[operation]?.remove(id) != nil {
+                if waiting[operation]?.isEmpty == true {
+                    waiting.removeValue(forKey: operation)
+                    retrying.remove(operation)
+                    resumed = true
+                }
+            }
+            return resumed
+        }
+    }
+
+    func refresh(failures: [Data: Int]) {
+        lock.withLock {
+            recoveryTurn = waiting.values.contains { imports in
+                imports.contains { failures[$0, default: 0] < 2 }
+            }
+        }
+    }
+}
+
 extension CommandRouter {
     /// Read-lane inventory only. Finalized imports can own originals and previews
     /// before an attachment commits, so attachment rows alone are insufficient.

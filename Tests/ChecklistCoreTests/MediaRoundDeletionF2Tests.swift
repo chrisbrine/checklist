@@ -67,8 +67,7 @@ extension MediaRoundDeletionTests {
     func testSmallHistorySelectionAgreesWithPreviousScan() throws {
         let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
         let id = try XCTUnwrap(round["id"] as? String)
-        let tokens = try jsonString([id])
-        let owned = Set([Data(id.utf8)])
+        var owned = Set([Data(id.utf8)])
         try f.router.dbQueue.write {db in
             for index in 0..<137 {
                 let entity = index.isMultiple(of:7) ? id : uuid()
@@ -84,8 +83,16 @@ extension MediaRoundDeletionTests {
                         "method":"media_intake_preview","project_id":f.project,"digest":"digest",
                         "incarnation":f.router.incarnation,"state":"succeeded"])
                 }
+                if index.isMultiple(of:11) {
+                    let job = try f.router.managedImportKey(principal:"fixture",command:command)
+                    owned.insert(Data(job.utf8))
+                    let state = index.isMultiple(of:22) ? "settled" : "committed"
+                    try f.router.save(db,["id":job,"project_id":f.project,"kind":"attachment_import","state":state,
+                        "parent_principal":"fixture","parent_command_id":command,"intent_digest":"digest","revision":1],type:"storage_job")
+                }
             }
         }
+        let tokens = try jsonString(owned.map {String(decoding:$0,as:UTF8.self)})
         try f.router.dbQueue.read {db in
             func oldMatch(_ payload: String) -> String {
                 "EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(\(payload)) THEN CASE WHEN json_type(\(payload))='object' THEN \(payload) ELSE '{}' END ELSE '{}' END) j WHERE (j.type='text' AND CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))) OR (typeof(j.key)='text' AND CAST(j.key AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"

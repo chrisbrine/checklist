@@ -341,7 +341,7 @@ extension CommandRouter {
             guard let cursor = cursor as? String else {throw CoreError("CURSOR_RESET","Refresh these examples.")}
             window = try MediaQueryCursor.open(cursor,binding:binding,key:cursorKey)
         } else {
-            var predicates = ["i.type='media_item'","i.project_id=:project","r.type='media_round'","r.project_id=i.project_id","json_extract(r.data,'$.type_id')=:type","r.id<>:round","d.type='media_owner_decision'","d.project_id=i.project_id","json_extract(d.data,'$.disposition')='accepted'","json_extract(d.data,'$.origin')='human_ui'","t.type='media_item_target'","t.project_id=i.project_id"]
+            var predicates = ["i.type='media_item'","i.project_id=:project","r.type='media_round'",MediaRoundDeletionGraph.visibleSQL("r"),"r.project_id=i.project_id","json_extract(r.data,'$.type_id')=:type","r.id<>:round","d.type='media_owner_decision'","d.project_id=i.project_id","json_extract(d.data,'$.disposition')='accepted'","json_extract(d.data,'$.origin')='human_ui'","t.type='media_item_target'","t.project_id=i.project_id"]
             var args: StatementArguments = ["project":project,"type":schema.id.rawValue,"round":(try StoredRecord(round, family: "media").string("id"))]
             switch request.selection {
             case .explicitTargets(let targets):

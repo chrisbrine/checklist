@@ -48,6 +48,8 @@ public final class CommandRouter: @unchecked Sendable {
     var automaticBackupRetentionTrashRoot: URL? // Owned fixture directory only; nil uses the production Trash.
     var ticketCleanupTrashRoot: URL? // Owned fixture seam; nil uses the same-volume production Trash.
     /// Owned-test seam after the read-only deletion plan, before writer acquisition.
+    var mediaRoundDeletionGraphProbe: (@Sendable () throws -> Void)?
+    var mediaRoundDeletionWriterProbe: (@Sendable (String,TimeInterval,Bool) -> Void)?
     var mediaRoundDeletionPreparationProbe: (@Sendable () throws -> Void)?
     /// Owned-test seam after a selected-file intake preview has read its sources.
     var mediaIntakePreviewPreparationProbe: (@Sendable (PreparedMediaCommand) throws -> Void)?
@@ -220,7 +222,8 @@ public final class CommandRouter: @unchecked Sendable {
             ELSE 0 END ELSE 0 END)
         """
     func record(_ db: Database, _ id: String, type: String? = nil) throws -> JSON {
-        let query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)" + (type == nil ? "" : " AND type = CAST(? AS TEXT)")
+        var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id = CAST(? AS TEXT)" + (type == nil ? "" : " AND type = CAST(? AS TEXT)")
+        if type.map(MediaRoundDeletionGraph.mayOwn) ?? true {query += " AND " + MediaRoundDeletionGraph.visibleSQL()}
         let arguments = type.map { StatementArguments([Data(id.utf8), Data($0.utf8)]) } ?? StatementArguments([Data(id.utf8)])
         let values = try readSnapshotCache.records(db,key:["record",id,type]) {try self.fetchStoreRows(db,sql:query,arguments:arguments)}
         guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available.") }
@@ -235,6 +238,7 @@ public final class CommandRouter: @unchecked Sendable {
             ? "rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type = CAST(? AS TEXT))"
             : "type = CAST(? AS TEXT)")
         var arguments: [DatabaseValueConvertible] = [Data(type.utf8)]
+        if MediaRoundDeletionGraph.mayOwn(type) {query += " AND " + MediaRoundDeletionGraph.visibleSQL()}
         if let project {
             if type == "session" { query += " AND " + Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }
             else { query += " AND project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
@@ -374,6 +378,7 @@ public final class CommandRouter: @unchecked Sendable {
         var arguments: [DatabaseValueConvertible] = [Data(id.utf8),Data(type.utf8)]
         if type == "session" { query += Self.sessionProjectCandidate; arguments += [Data(project.utf8),Data(project.utf8)] }
         else { query += "project_id = CAST(? AS TEXT)"; arguments.append(Data(project.utf8)) }
+        if MediaRoundDeletionGraph.mayOwn(type) {query += " AND " + MediaRoundDeletionGraph.visibleSQL()}
         let values = try readSnapshotCache.records(db,key:["scoped",id,project,type]) {try self.fetchStoreRows(db,sql:query,arguments:StatementArguments(arguments))}
         guard let value = values.first else { throw CoreError("NOT_FOUND", "This record is not available in this project.") }
         return value

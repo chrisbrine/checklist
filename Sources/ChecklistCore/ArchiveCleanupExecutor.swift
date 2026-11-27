@@ -342,7 +342,8 @@ extension CommandRouter {
             let evidenceBackup = try self.doneEvidenceBackupWake(db).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
             let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}
             let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
-            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64(($0 + 0.01) * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry].compactMap {$0}.min()
+            let importRecovery = self.commandOperations.mediaImportWaits.needsTurn ? max(routineRetry ?? 0,nowMS + 250) : nil
+            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64(($0 + 0.01) * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry,importRecovery].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }

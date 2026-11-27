@@ -208,6 +208,18 @@ def check() -> dict:
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad[section]['params'][field] = value
         reject('media-round-deletion', bad, section + ' unsupported ' + field)
+    for field, value in (('deleted', True), ('deletion_state', 'completed'),
+                         ('removed_records', -1), ('total_records', 0),
+                         ('expected_revision', 0), ('title', 'Private round')):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['deletion_in_progress'][field] = value
+        reject('media-round-deletion', bad, 'round deletion progress invalid ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad.pop('deletion_in_progress')
+    reject('media-round-deletion', bad, 'missing deleting round example')
+    deleting = examples['media-round-deletion']['deletion_in_progress']
+    if deleting['removed_records'] > deleting['total_records']:
+        errors.append('media-round-deletion: removed records exceed the owned graph size')
     for field, value in (('content_base64', 'c3ludGhldGlj'), ('title', 'Original round title')):
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad['result'][field] = value
@@ -272,6 +284,7 @@ def check() -> dict:
     reject('media-round-deletion', bad, 'fabricated result for queued operation')
     for field, value in (
             ('state', 'succeeded'),
+            ('waiting_reason', 'backup_capture'),
             ('finished_at', '2026-11-01T12:00:06Z'),
             ('result', examples['media-round-deletion']['operation_result']['data']['result'])):
         bad = copy.deepcopy(examples['media-round-deletion'])

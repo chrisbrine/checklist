@@ -8,7 +8,7 @@ struct MediaRoundDeletionHistory {
     static let passLimit = 1024
     static let redactedEventKind = "media_history_redacted"
 
-    struct CommandIdentity: Hashable {
+    struct CommandIdentity: Hashable, Codable {
         let principal: Data
         let command: Data
 
@@ -29,7 +29,7 @@ struct MediaRoundDeletionHistory {
     }
 
     private enum Protection: Int {
-        case disposable = 0, succeeded, failed, finalOnly, retained
+        case disposable = 0, succeeded, failed, importRecovery, retained
     }
 
     private struct CommandWork {
@@ -37,9 +37,9 @@ struct MediaRoundDeletionHistory {
         let id: String
         let bytes: Int
         let protection: Protection
+        let settledBinding: String?
 
         var identity: CommandIdentity { CommandIdentity(principal, id) }
-        var canProject: Bool { protection == .succeeded || protection == .failed }
     }
 
     var events: [String] = []
@@ -47,6 +47,7 @@ struct MediaRoundDeletionHistory {
     private var projectedResults: [CommandIdentity: String] = [:]
     var continuing = false
     var more = false
+    var projectsFinal = false
 
     static let progressPrefix = "media-round-deletion-history:"
     static let projectionProgressField = "_media_history_progress"
@@ -67,31 +68,43 @@ struct MediaRoundDeletionHistory {
         """
     }
 
-    static func select(_ db: Database, project: String, owned: Set<Data>, progressKey: String, continuing: Bool = false) throws -> Self {
+    static func select(_ db: Database, project: String, owned: Set<Data>, progressKey: String, continuing: Bool = false, writerLimit: Int = passLimit, ordinaryLimit: Int = entryLimit, ordinaryBytes: Int? = nil, projectFinal: Bool = false) throws -> Self {
         let tokens = try jsonString(owned.map { String(decoding: $0, as: UTF8.self) })
-        if !continuing, let ordinary = try selectOrdinary(db, project: project, tokens: tokens) { return ordinary }
-        return try selectPass(db, project: project, tokens: tokens, progressKey: progressKey)
+        if !continuing, !projectFinal,
+           let ordinary = try selectOrdinary(db, project: project, tokens: tokens, limit:min(ordinaryLimit,writerLimit == passLimit ? entryLimit : writerLimit),workBytes:ordinaryBytes) { return ordinary }
+        return try selectPass(db, project: project, tokens: tokens, progressKey: progressKey, limit: writerLimit, projectFinal: projectFinal)
     }
 
-    /// Preserve the original single-commit plan inside its two admission bounds.
-    private static func selectOrdinary(_ db: Database, project: String, tokens: String) throws -> Self? {
-        var result = Self(), identityBytes = 0
+    private static let eventWorkBytes = """
+        length(CAST(id AS BLOB))+length(CAST(project_id AS BLOB))+COALESCE(length(CAST(entity_id AS BLOB)),0)
+          +length(CAST(actor AS BLOB))+length(CAST(kind AS BLOB))+length(CAST(occurred_at AS BLOB))+length(CAST(data AS BLOB))
+        """
+    private static let commandWorkBytes = """
+        length(CAST(principal AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(digest AS BLOB))+length(CAST(result AS BLOB))
+        """
+
+    /// Small domain transactions also bound the payload pages they will erase.
+    /// The default identity limit remains available to compare the old selector.
+    private static func selectOrdinary(_ db: Database, project: String, tokens: String, limit: Int, workBytes: Int?) throws -> Self? {
+        var result = Self(), remaining = workBytes ?? TicketCleanupInventory.byteLimit
         func admit(_ bytes: Int) -> Bool {
-            guard result.events.count + result.commands.count < entryLimit,
-                  bytes <= TicketCleanupInventory.byteLimit - identityBytes else { return false }
-            identityBytes += bytes
+            guard result.events.count + result.commands.count < limit, bytes <= remaining else {return false}
+            remaining -= bytes
             return true
         }
-        let events = try String.fetchCursor(db, sql: matchingEvents("id"), arguments: [Data(project.utf8),tokens,tokens,tokens])
-        while let id = try events.next() {
-            guard admit(id.utf8.count) else { return nil }
-            result.events.append(id)
+        let eventBytes = workBytes == nil ? "length(CAST(id AS BLOB))" : eventWorkBytes
+        let events = try Row.fetchCursor(db,sql:matchingEvents("id," + eventBytes + " AS work_bytes"),
+                                         arguments:[Data(project.utf8),tokens,tokens,tokens])
+        while let row = try events.next() {
+            guard admit(row["work_bytes"]) else {return nil}
+            result.events.append(row["id"])
         }
-        let commands = try Row.fetchCursor(db, sql: "SELECT principal,command_id FROM commands WHERE " + matches("result"), arguments: [tokens,tokens])
+        let commandBytes = workBytes == nil ? "length(CAST(principal AS BLOB))+length(CAST(command_id AS BLOB))" : commandWorkBytes
+        let commands = try Row.fetchCursor(db,sql:"SELECT principal,command_id," + commandBytes + " AS work_bytes FROM commands WHERE " + matches("result"),
+                                           arguments:[tokens,tokens])
         while let row = try commands.next() {
-            let principal: String = row["principal"], id: String = row["command_id"]
-            guard admit(principal.utf8.count + id.utf8.count) else { return nil }
-            result.commands.append((principal,id))
+            guard admit(row["work_bytes"]) else {return nil}
+            result.commands.append((row["principal"],row["command_id"]))
         }
         return result
     }
@@ -100,30 +113,43 @@ struct MediaRoundDeletionHistory {
         CoreError("CLEANUP_INVENTORY_LIMIT", message)
     }
 
-    // Round-owned jobs need the full receipt until their removal. A terminal
-    // operation only needs its outcome. Active/recoverable operations and
-    // independent consumers can still need the payload after round removal.
+    // Import recovery needs data only after commit and before settlement. Other
+    // round-owned import states need at most the journal pair and intent digest.
+    // Independent consumers can still need the payload after round removal.
     private static func matchingCommands() -> String {
         """
         WITH dependents AS (
             SELECT CAST(json_extract(data,'$.parent_principal') AS BLOB) p,
                    CAST(json_extract(data,'$.parent_command_id') AS BLOB) c,
-                   CASE WHEN CAST(id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))
-                       THEN \(Protection.finalOnly.rawValue) ELSE \(Protection.retained.rawValue) END protection
-            FROM records WHERE type='storage_job' AND CASE WHEN json_valid(data) THEN
-                json_type(data,'$.parent_principal')='text' AND json_type(data,'$.parent_command_id')='text' ELSE 0 END
+                   CASE WHEN owned_import
+                       THEN CASE WHEN \(MediaRoundDeletionImportRecovery.needsReceiptSQL("data"))
+                           THEN \(Protection.importRecovery.rawValue) ELSE 0 END
+                       ELSE \(Protection.retained.rawValue) END protection,
+                   CASE WHEN owned_import AND json_extract(data,'$.state')='settled'
+                       THEN json_array(id,json_extract(data,'$.attachment_id'),json_extract(data,'$.intent_digest')) END settlement
+            FROM (
+                SELECT id,data,json_extract(data,'$.kind')='attachment_import'
+                    AND CAST(id AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) owned_import
+                FROM records WHERE type='storage_job' AND CASE WHEN json_valid(data) THEN
+                    json_type(data,'$.parent_principal')='text' AND json_type(data,'$.parent_command_id')='text' ELSE 0 END
+            )
             UNION ALL
-            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.command_id') AS BLOB),\(operationCommandProtection)
+            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.command_id') AS BLOB),\(operationCommandProtection),NULL
             FROM metadata WHERE \(operationKey)
             UNION ALL
-            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.error_result_command_id') AS BLOB),\(operationErrorProtection)
+            SELECT CAST(json_extract(value,'$.principal') AS BLOB),CAST(json_extract(value,'$.error_result_command_id') AS BLOB),\(operationErrorProtection),NULL
             FROM metadata WHERE \(operationKey)
         ), protection AS MATERIALIZED (
-            SELECT p,c,MAX(protection) locked FROM dependents WHERE protection>0 AND p IS NOT NULL AND c IS NOT NULL GROUP BY p,c
+            SELECT p,c,MAX(protection) locked,MAX(settlement) settlement FROM dependents
+            WHERE (protection>0 OR settlement IS NOT NULL) AND p IS NOT NULL AND c IS NOT NULL GROUP BY p,c
         )
         SELECT principal,command_id,length(CAST(principal AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(digest AS BLOB))+length(CAST(result AS BLOB)) work_bytes,
             CASE WHEN json_valid(result) THEN CASE WHEN \(resultHasOtherConsumer)
-                THEN \(Protection.retained.rawValue) ELSE COALESCE(locked,0) END ELSE \(Protection.retained.rawValue) END protection
+                THEN \(Protection.retained.rawValue) ELSE COALESCE(locked,0) END ELSE \(Protection.retained.rawValue) END protection,
+            CASE WHEN settlement IS NOT NULL AND json_valid(result) THEN CASE
+                WHEN CAST(json_extract(settlement,'$[2]') AS BLOB)=CAST(digest AS BLOB)
+                 AND CAST(json_extract(settlement,'$[1]') AS BLOB)=CAST(json_extract(result,'$.data.id') AS BLOB)
+                THEN json_extract(settlement,'$[0]') || ':' || json_extract(settlement,'$[1]') END END settled_binding
         FROM commands AS journal LEFT JOIN protection ON p=CAST(journal.principal AS BLOB) AND c=CAST(journal.command_id AS BLOB)
         WHERE \(matches("result"))
         ORDER BY journal.rowid
@@ -160,22 +186,18 @@ struct MediaRoundDeletionHistory {
         OR (json_type(result,'$.data.operation_id')='text' AND json_type(result,'$.data.manifest_sha256')='text')
         """
 
-    private static func selectPass(_ db: Database, project: String, tokens: String, progressKey: String) throws -> Self {
-        var pass = Self(continuing: true), workBytes = 0
+    private static func selectPass(_ db: Database, project: String, tokens: String, progressKey: String, limit: Int, projectFinal: Bool) throws -> Self {
+        var pass = Self(continuing: true, projectsFinal: projectFinal), workBytes = 0
         func admit(_ charge: Int) throws -> Bool {
             guard charge <= TicketCleanupInventory.byteLimit else {
                 throw oversized("A matched history row exceeds the 16 MiB work limit for one pass. The round remains present.")
             }
-            guard pass.events.count + pass.commands.count < passLimit,
+            guard pass.events.count + pass.commands.count < limit,
                   charge <= TicketCleanupInventory.byteLimit - workBytes else { return false }
             workBytes += charge
             return true
         }
-        let eventColumns = """
-            id,length(CAST(id AS BLOB))+length(CAST(project_id AS BLOB))+COALESCE(length(CAST(entity_id AS BLOB)),0)
-            +length(CAST(actor AS BLOB))+length(CAST(kind AS BLOB))+length(CAST(occurred_at AS BLOB))+length(CAST(data AS BLOB)) work_bytes
-            """
-        let events = try Row.fetchCursor(db, sql: matchingEvents(eventColumns), arguments: [Data(project.utf8),tokens,tokens,tokens])
+        let events = try Row.fetchCursor(db, sql: matchingEvents("id," + eventWorkBytes + " AS work_bytes"), arguments: [Data(project.utf8),tokens,tokens,tokens])
         while let row = try events.next() {
             guard try admit(row["work_bytes"]) else { pass.more = true; return pass }
             pass.events.append(row["id"])
@@ -189,48 +211,55 @@ struct MediaRoundDeletionHistory {
             guard let protection = Protection(rawValue: row["protection"]) else {
                 throw StoreRecovery.required("command_operation_invalid")
             }
-            let item = CommandWork(principal: row["principal"], id: row["command_id"], bytes: row["work_bytes"], protection: protection)
+            let item = CommandWork(principal:row["principal"],id:row["command_id"],bytes:row["work_bytes"],
+                                   protection:protection,settledBinding:row["settled_binding"])
             switch item.protection {
             case .retained:
                 throw CoreError("MEDIA_ROUND_REFERENCED", "A retained job, replay or recovery record still requires a matched command result. The round remains present.")
             case .disposable:
                 guard try admit(item.bytes) else { pass.more = true; return pass }
+                if item.settledBinding != nil {pass.projectedResults[item.identity] = try historyProjection(db,item,progressKey:nil)}
                 pass.commands.append((item.principal, item.id))
-            case .succeeded, .failed, .finalOnly:
-                if reserved.count < passLimit, item.bytes <= TicketCleanupInventory.byteLimit - finalBytes {
+            case .importRecovery:
+                // The graph pass gates final removal on the same recovery states.
+                continue
+            case .succeeded, .failed:
+                if reserved.count < limit, item.bytes <= TicketCleanupInventory.byteLimit - finalBytes {
                     reserved.append(item)
                     finalBytes += item.bytes
                     continue
                 }
                 // Keep the old final transaction when the reserved set fits.
                 // If it cannot fit, move bounded terminal work into this pass.
-                let candidates = (reserved + [item]).filter(\.canProject)
-                guard !candidates.isEmpty else {
-                    throw oversized("Command results required until the round is removed exceed one final history pass. The round remains present.")
-                }
-                for candidate in candidates {
+                for candidate in reserved + [item] {
                     guard try admit(candidate.bytes) else { break }
-                    pass.projectedResults[candidate.identity] = try terminalProjection(db, candidate, progressKey: progressKey)
+                    pass.projectedResults[candidate.identity] = try historyProjection(db,candidate,progressKey:progressKey)
                     pass.commands.append((candidate.principal, candidate.id))
                 }
                 pass.more = true
                 return pass
             }
         }
-        if reserved.count > passLimit - pass.events.count - pass.commands.count || finalBytes > TicketCleanupInventory.byteLimit - workBytes {
+        if reserved.count > limit - pass.events.count - pass.commands.count || finalBytes > TicketCleanupInventory.byteLimit - workBytes {
             pass.more = true
         } else {
-            pass.commands.append(contentsOf: reserved.map { ($0.principal, $0.id) })
+            for item in reserved {
+                if projectFinal {pass.projectedResults[item.identity] = try historyProjection(db,item,progressKey:progressKey)}
+                pass.commands.append((item.principal,item.id))
+            }
         }
         return pass
     }
 
-    private static func terminalProjection(_ db: Database, _ item: CommandWork, progressKey: String) throws -> String {
+    private static func historyProjection(_ db: Database, _ item: CommandWork, progressKey: String?) throws -> String {
         // The ordinary replay routes already treat this as a tombstone. Only
         // operationPayload can read the projection, under its original digest,
         // scope and authority checks. The progress key contains no graph ID.
         var result = jsonObject(CommandRouter.prunedResult)
         result[projectionProgressField] = progressKey
+        if let binding = item.settledBinding {
+            result[MediaRoundDeletionImportRecovery.settlementField] = hash(Data(binding.utf8))
+        }
         if item.protection == .failed {
             let row = try Row.fetchOne(db, sql: """
                 SELECT json_extract(result,'$.error.code') code,
@@ -296,7 +325,7 @@ struct MediaRoundDeletionHistory {
             FROM \(journal) changed JOIN metadata m ON m.key=CAST(changed.id AS TEXT)
             WHERE changed.kind=3 AND (NOT json_valid(m.value) OR (\(Self.operationKey)))
             """)
-        let minimumProtection = more ? Protection.succeeded.rawValue : Protection.retained.rawValue
+        let minimumProtection = more || projectsFinal ? Protection.succeeded.rawValue : Protection.retained.rawValue
         while let row = try operations.next() {
             let id: Data = row["source_id"]
             guard row["valid"] as Bool else {
@@ -316,20 +345,44 @@ struct MediaRoundDeletionHistory {
         }
     }
 
-    func apply(_ db: Database) throws {
-        for id in events {
-            if continuing {
-                try db.execute(sql: "UPDATE events SET entity_id=NULL,actor='system:media_history',kind=?,occurred_at='1970-01-01T00:00:00Z',data='{}' WHERE id=CAST(? AS TEXT)", arguments: [Self.redactedEventKind,Data(id.utf8)])
-                guard db.changesCount == 1 else {throw MediaRoundDeletionFence.changed("planned_event_changed",type:"event",id:Data(id.utf8))}
-            } else {
-                try db.execute(sql: "DELETE FROM events WHERE id=CAST(? AS TEXT)", arguments: [Data(id.utf8)])
-            }
+    struct PreparedWrites {
+        let events: String
+        let commands: String
+    }
+
+    func prepareWrites() throws -> PreparedWrites {
+        let replacements = commands.map { principal, id in
+            let projection = (more || projectsFinal) ? projectedResults[CommandIdentity(principal,id)] : nil
+            return [principal, id, projection ?? CommandRouter.prunedResult]
         }
-        for (principal,id) in commands {
-            let replacement = projectedResults.isEmpty ? nil : projectedResults[CommandIdentity(principal,id)]
-            let result = replacement ?? CommandRouter.prunedResult
-            try db.execute(sql: "UPDATE commands SET result=? WHERE principal=? AND command_id=?", arguments: [result,principal,id])
-            if continuing,db.changesCount != 1 {throw MediaRoundDeletionFence.changed("planned_command_changed",type:"command",id:Data(id.utf8))}
+        return try .init(events:jsonString(events),commands:jsonString(replacements))
+    }
+
+    func apply(_ db: Database) throws {
+        try apply(db,writes:prepareWrites())
+    }
+
+    func apply(_ db: Database, writes: PreparedWrites) throws {
+        if !events.isEmpty {
+            let scope = "WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?))"
+            if continuing {
+                try db.execute(sql:"UPDATE events SET entity_id=NULL,actor='system:media_history',kind='\(Self.redactedEventKind)',occurred_at='1970-01-01T00:00:00Z',data='{}' " + scope,arguments:[writes.events])
+            } else {
+                try db.execute(sql:"DELETE FROM events " + scope,arguments:[writes.events])
+            }
+            guard db.changesCount == events.count else {throw MediaRoundDeletionFence.changed("planned_event_changed",type:"event",id:Data())}
+        }
+        if !commands.isEmpty {
+            try db.execute(sql:"""
+                WITH work AS MATERIALIZED (
+                    SELECT c.rowid AS position,json_extract(w.value,'$[2]') AS replacement
+                    FROM json_each(?) w CROSS JOIN commands c
+                    WHERE c.principal=CAST(json_extract(w.value,'$[0]') AS TEXT)
+                      AND c.command_id=CAST(json_extract(w.value,'$[1]') AS TEXT)
+                )
+                UPDATE commands SET result=work.replacement FROM work WHERE commands.rowid=work.position
+                """,arguments:[writes.commands])
+            guard db.changesCount == commands.count else {throw MediaRoundDeletionFence.changed("planned_command_changed",type:"command",id:Data())}
         }
     }
 }

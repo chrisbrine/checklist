@@ -38,7 +38,7 @@ enum TicketCleanupDescriptorPages {
     static let readySQL = """
         json_valid(records.data) AND json_extract(records.data,'$.kind')='ticket_object_delete' AND (
             (\(inlineOverflowSQL)) OR
-            (json_type(records.data,'$.descriptor_page_generation')='text' AND EXISTS (
+            (json_type(records.data,'$.descriptor_page_generation')='text' AND json_extract(records.data,'$.state')<>'deleting' AND EXISTS (
                 SELECT 1 FROM records parent JOIN records page ON page.project_id=parent.project_id AND page.type='storage_job'
                 WHERE parent.id=records.id AND \(activeSQL) AND
                 (\(CommandRouter.ticketObjectDeletionReadySQL(data:"page.data",id:"page.id",cause:"json_extract(parent.data,'$.cause')",state:"json_extract(page.data,'$.page_state')")))

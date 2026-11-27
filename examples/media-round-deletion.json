@@ -16,6 +16,15 @@
       "round_id": "00000000-0000-0000-0000-000000000902"
     }
   },
+  "deletion_in_progress": {
+    "deleted": false,
+    "deletion_state": "deleting",
+    "project_id": "00000000-0000-0000-0000-000000000901",
+    "round_id": "00000000-0000-0000-0000-000000000902",
+    "removed_records": 128,
+    "total_records": 2049,
+    "expected_revision": 4
+  },
   "result": {
     "project_id": "00000000-0000-0000-0000-000000000901",
     "round_id": "00000000-0000-0000-0000-000000000902",
@@ -298,6 +307,7 @@
       "command_id": "00000000-0000-4000-8000-000000000915",
       "method": "media_round_delete",
       "state": "running",
+      "waiting_reason": "media_import_recovery",
       "status_method": "operation_get",
       "project_id": "00000000-0000-0000-0000-000000000901",
       "created_at": "2026-11-01T12:00:02Z",

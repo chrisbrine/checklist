@@ -78,7 +78,9 @@ extension MediaRoundDeletionTests {
         XCTAssertNil(try historyProgress(f,round:rid))
         checks.checkError("NOT_FOUND") {try f.get(round)}
         checks.checkError("NOT_FOUND") {try f.record(jobID,"storage_job")}
-        XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:command),CommandRouter.prunedResult)
+        let retired = try XCTUnwrap(exactHistoryResult(f,principal:principal,command:command))
+        XCTAssertTrue(CommandRouter.isPrunedResult(jsonObject(retired)))
+        XCTAssertFalse(retired.contains(attachment))
         XCTAssertEqual(try f.record(late,"checkpoint")["event_id"] as? String,event)
         XCTAssertEqual(try f.record(retained,"checkpoint")["event_id"] as? String,event)
         try f.router.dbQueue.read { db in
@@ -90,6 +92,180 @@ extension MediaRoundDeletionTests {
         XCTAssertEqual((page["rows"] as? [JSON])?.count,0)
         let snapshot = try XCTUnwrap(f.router.handle(method:"snapshot",params:[:],caller:f.owner)["data"] as? JSON)
         XCTAssertFalse((snapshot["events"] as? [JSON] ?? []).contains { $0["id"] as? String == event })
+    }
+
+    func testSettledImportHistoryOverflowKeepsJournalAndGraphAcrossReopen() throws {
+        let f = try Fixture(), (round,_,_) = try ticketCapture(f,category:"done")
+        let rid = try XCTUnwrap(round["id"] as? String)
+        let original = try XCTUnwrap(f.rows("storage_job").first { $0["kind"] as? String == "attachment_import" })
+        let originalID = try XCTUnwrap(original["id"] as? String)
+        let ownerID = try XCTUnwrap(original["attachment_owner_id"] as? String)
+        let actualPrincipal = try XCTUnwrap(original["parent_principal"] as? String)
+        let actualCommand = try XCTUnwrap(original["parent_command_id"] as? String)
+        let actualAttachment = try XCTUnwrap(original["attachment_id"] as? String)
+        let principal = "fixture-settled-media-import"
+        let digest = String(repeating:"a",count:64)
+        let namespace = "objects/project-" + ChecklistCore.hash(Data(f.project.utf8)) + "/"
+        try f.router.dbQueue.writeWithoutTransaction { db in
+            XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db))
+            try db.inTransaction {
+                for _ in 0..<MediaRoundDeletionHistory.passLimit {
+                    let command = uuid(), attachment = uuid()
+                    let job = try f.router.managedImportKey(principal:principal,command:command)
+                    try f.router.save(db,["id":job,"project_id":f.project,"kind":"attachment_import","state":"settled",
+                        "attachment_owner_id":ownerID,"attachment_id":attachment,"object_relative_path":namespace + attachment,
+                        "parent_principal":principal,"parent_command_id":command,"intent_digest":digest,"revision":1],type:"storage_job")
+                    try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES(?,?,?,?)",
+                        arguments:[principal,command,digest,try jsonString(["data":["round_id":rid,"id":attachment,"title":"Private capture"]])])
+                }
+                return .commit
+            }
+        }
+        try addMatchedHistoryCommands(f,round:rid)
+        XCTAssertEqual(try f.record(originalID,"storage_job")["state"] as? String,"settled")
+        let stable = try exactRecords(f,["media_round","storage_job"])
+        func observedJournal() throws -> (matched: Int, pruned: Int) {
+            try f.router.dbQueue.read { db in
+                let row = try XCTUnwrap(Row.fetchOne(db,sql:"""
+                    SELECT count(*) matched,sum(json_extract(result,'$.pruned')=1) pruned FROM commands c JOIN records r ON r.type='storage_job'
+                    AND json_extract(r.data,'$.parent_principal')=c.principal AND json_extract(r.data,'$.parent_command_id')=c.command_id
+                    AND json_extract(r.data,'$.intent_digest')=c.digest WHERE c.principal=?
+                    """,arguments:[principal]))
+                return (row["matched"],row["pruned"])
+            }
+        }
+        f.router.mediaRoundDeletionPreparationProbe = {
+            guard try self.historyProgress(f,round:rid) != nil else {return}
+            throw CoreError("TEST_INTERRUPT","Interrupted after a committed settled-import history pass.")
+        }
+        let params = try input(f,round)
+        checks.checkError("TEST_INTERRUPT") {try self.worker(f,"media_round_delete",params)}
+        f.router.mediaRoundDeletionPreparationProbe = nil
+        let before = try observedJournal()
+        XCTAssertEqual(before.matched,MediaRoundDeletionHistory.passLimit)
+        XCTAssertGreaterThan(before.pruned,0)
+        XCTAssertLessThan(before.pruned,before.matched)
+        XCTAssertEqual(try historyProgress(f,round:rid),"1")
+        XCTAssertEqual(try exactRecords(f,["media_round","storage_job"]),stable)
+        try f.reopen()
+        XCTAssertEqual(try observedJournal().pruned,before.pruned)
+        XCTAssertEqual(try exactRecords(f,["media_round","storage_job"]),stable)
+        let tombstone = try XCTUnwrap(exactHistoryResult(f,principal:actualPrincipal,command:actualCommand))
+        XCTAssertFalse(tombstone.contains(actualAttachment))
+        XCTAssertTrue(MediaRoundDeletionImportRecovery.provesSettlement(jsonObject(tombstone),job:originalID,attachment:actualAttachment))
+        XCTAssertFalse(MediaRoundDeletionImportRecovery.provesSettlement(jsonObject(tombstone),job:originalID,attachment:uuid()))
+        let originalFile = f.router.root.appendingPathComponent(try XCTUnwrap(original["object_relative_path"] as? String))
+        let heldFile = f.base.appendingPathComponent("retired-receipt-original")
+        try FileManager.default.moveItem(at:originalFile,to:heldFile)
+        checks.checkError("MANAGED_FILE_UNAVAILABLE") {
+            try f.router.handle(method:"attachment_read",params:["project_id":f.project,
+                "attachment_id":actualAttachment,"representation":"original"],caller:f.owner)
+        }
+        XCTAssertEqual(try f.record(originalID,"storage_job")["state"] as? String,"repair_required")
+        try FileManager.default.moveItem(at:heldFile,to:originalFile)
+        try f.router.dbQueue.writeWithoutTransaction { db in
+            XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db),"Late repair uses the exact, content-free settlement proof")
+        }
+        XCTAssertEqual(try f.record(originalID,"storage_job")["state"] as? String,"settled")
+        XCTAssertEqual(try worker(f,"media_round_delete",params)["deleted"] as? Bool,true)
+        XCTAssertNil(try historyProgress(f,round:rid))
+        checks.checkError("NOT_FOUND") {try f.get(round)}
+        XCTAssertTrue(try f.rows("storage_job").allSatisfy { $0["kind"] as? String != "attachment_import" })
+        XCTAssertEqual(try f.router.dbQueue.read { db in
+            try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE principal=? AND digest=? AND json_extract(result,'$.pruned')=1",
+                arguments:[principal,digest])
+        },MediaRoundDeletionHistory.passLimit)
+    }
+
+    func testContinuedHistoryWaitsForLiveRepairAndResumesTheSameOperation() throws {
+        let f = try Fixture(), round = try cancel(f,imageRound(f,"pending-history.png"))
+        let rid = try XCTUnwrap(round["id"] as? String)
+        let job = try XCTUnwrap(f.rows("storage_job").first { $0["kind"] as? String == "attachment_import" })
+        let jobID = try XCTUnwrap(job["id"] as? String), principal = try XCTUnwrap(job["parent_principal"] as? String)
+        let importCommand = try XCTUnwrap(job["parent_command_id"] as? String)
+        let receipt = try XCTUnwrap(exactHistoryResult(f,principal:principal,command:importCommand))
+        let registration = try f.record(f.worker.sessionID!,"session")
+        let caller = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),
+                            projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        let original = f.router.root.appendingPathComponent(try XCTUnwrap(job["object_relative_path"] as? String))
+        let held = f.base.appendingPathComponent("held-original")
+        try FileManager.default.moveItem(at:original,to:held)
+        try f.router.dbQueue.writeWithoutTransaction { db in
+            XCTAssertEqual(try f.router.reconcileManagedAttachmentImports(db),.retryPending)
+        }
+        XCTAssertEqual(try f.record(jobID,"storage_job")["state"] as? String,"repair_required")
+        try addMatchedHistoryCommands(f,round:rid)
+
+        let lane = DispatchQueue(label:"test-media-history-recovery"), parked = DispatchSemaphore(value:0), finished = DispatchSemaphore(value:0)
+        f.router.configureCommandOperations(on:lane) { _, terminal in
+            if terminal {finished.signal()} else {parked.signal()}
+        }
+        let command = uuid(), params = try input(f,round)
+        let accepted = try worker(f,"media_round_delete",params,as:caller,command:command)
+        let operation = try XCTUnwrap(accepted["operation_id"] as? String)
+        func readStatus() throws -> JSON {
+            let reply = try f.router.handle(method:"operation_get",params:["operation_id":operation,"project_id":f.project],caller:caller)
+            return try XCTUnwrap(reply["data"] as? JSON)
+        }
+        guard parked.wait(timeout:.now() + 20) == .success else {return XCTFail("Deletion did not park for import recovery")}
+        let status = try readStatus()
+        XCTAssertEqual(status["state"] as? String,"running")
+        XCTAssertEqual(status["waiting_reason"] as? String,"media_import_recovery")
+        XCTAssertNil(status["error"])
+        XCTAssertNotNil(try historyProgress(f,round:rid))
+        XCTAssertEqual(try f.get(round)["revision"] as? Int,round["revision"] as? Int)
+        XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:importCommand),receipt)
+        try f.router.dbQueue.writeWithoutTransaction { db in
+            XCTAssertEqual(try f.router.reconcileManagedAttachmentImports(db),.suspended)
+        }
+        XCTAssertFalse(f.router.commandOperations.mediaImportWaits.needsTurn,"An unavailable file stops automatic recovery turns")
+        try FileManager.default.moveItem(at:held,to:original)
+        let replay = try worker(f,"media_round_delete",params,as:caller,command:command)
+        XCTAssertEqual(replay["operation_id"] as? String,operation)
+        XCTAssertEqual(replay["waiting_reason"] as? String,"media_import_recovery")
+        XCTAssertTrue(f.router.commandOperations.mediaImportWaits.needsTurn,"Exact replay rearms a suspended import")
+        try f.router.dbQueue.writeWithoutTransaction { db in
+            XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db),"Repair consumes the original persisted payload")
+        }
+        guard finished.wait(timeout:.now() + 20) == .success else {return XCTFail("The accepted deletion did not resume after repair")}
+        let completed = try readStatus()
+        XCTAssertEqual(completed["state"] as? String,"succeeded")
+        XCTAssertNil(completed["waiting_reason"])
+        XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:importCommand),CommandRouter.prunedResult)
+        checks.checkError("NOT_FOUND") {try f.get(round)}
+    }
+
+    func testLiveImportReceiptOverflowDoesNotConsumeFinalBatchCapacity() throws {
+        let f = try Fixture(), round = try cancel(f,f.round(f.type(checks.schema())))
+        let rid = try XCTUnwrap(round["id"] as? String), principal = "fixture-live-import-history"
+        let count = MediaRoundDeletionHistory.passLimit + 1
+        var owned = Set([Data(rid.utf8)])
+        try addMatchedHistoryCommands(f,round:rid)
+        try f.router.dbQueue.write { db in
+            let result = try jsonString(["data":["id":rid]])
+            for state in ["committed","repair_required"] {
+                for _ in 0..<count {
+                    let command = uuid(), job = try f.router.managedImportKey(principal:principal,command:command)
+                    owned.insert(Data(job.utf8))
+                    try f.router.save(db,["id":job,"project_id":f.project,"kind":"attachment_import","state":state,
+                        "parent_principal":principal,"parent_command_id":command,"revision":1],type:"storage_job")
+                    try db.execute(sql:"INSERT INTO commands VALUES (?,?,'fixture-digest',?)",arguments:[principal,command,result])
+                }
+            }
+            let progress = try MediaRoundDeletionHistory.progressKey(project:f.project,round:rid)
+            var passes = 0
+            repeat {
+                let pass = try MediaRoundDeletionHistory.select(db,project:f.project,owned:owned,progressKey:progress,continuing:passes != 0)
+                XCTAssertFalse(pass.commands.contains { $0.0 == principal })
+                XCTAssertLessThanOrEqual(pass.events.count + pass.commands.count,MediaRoundDeletionHistory.passLimit)
+                if pass.more {XCTAssertFalse(pass.commands.isEmpty && pass.events.isEmpty)}
+                try pass.apply(db)
+                passes += 1
+                if !pass.more {break}
+            } while passes < 10
+            XCTAssertEqual(passes,5)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE principal=? AND result=?",arguments:[principal,result]),count * 2)
+        }
     }
 
     func testOversizedHistoryContinuesAcrossSixteenMiBOfSelectedIdentities() throws {
@@ -138,6 +314,28 @@ extension MediaRoundDeletionTests {
         checks.checkError("MEDIA_ROUND_REFERENCED") {try self.worker(f,"media_round_delete",params)}
         XCTAssertEqual(try exactHistoryResult(f,principal:principal,command:command),original)
         XCTAssertEqual(try f.get(round)["state"] as? String,"canceled")
+    }
+
+    func testFinalHistoryPassFencesRelocatedOwnedRecordWithIdenticalContent() throws {
+        let f = try Fixture(), round = try cancel(f,f.round(f.type(checks.schema())))
+        let rid = try XCTUnwrap(round["id"] as? String)
+        try addMatchedHistoryCommands(f,round:rid)
+        let params = try input(f,round)
+        f.router.mediaRoundDeletionPreparationProbe = {
+            guard try self.historyProgress(f,round:rid) == "4" else {return}
+            try f.router.dbQueue.write { db in
+                try db.execute(sql:"UPDATE records SET rowid=(SELECT MAX(rowid)+1 FROM records) WHERE id=?",arguments:[rid])
+            }
+        }
+        XCTAssertThrowsError(try worker(f,"media_round_delete",params)) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
+            XCTAssertEqual((error as? CoreError)?.details["check"] as? String,"planned_record_changed")
+            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,rid)
+        }
+        f.router.mediaRoundDeletionPreparationProbe = nil
+        XCTAssertEqual(try historyProgress(f,round:rid),"4")
+        XCTAssertEqual(try f.get(round)["revision"] as? Int,round["revision"] as? Int)
+        XCTAssertEqual(try worker(f,"media_round_delete",params)["deleted"] as? Bool,true)
     }
 
     func testContinuedHistoryPreservesTerminalDeletionAndPreviewAcrossReopen() throws {
@@ -442,6 +640,53 @@ extension MediaRoundDeletionTests {
         XCTAssertTrue(try eligibleToPrune(command))
         XCTAssertTrue(try eligibleToPrune(errorCommand))
         XCTAssertEqual(try f.rows("media_intake").count,0)
+    }
+
+    func testSuccessfulOperationReceiptsAloneCanOverflowTheFinalPass() throws {
+        try assertTerminalReceiptOverflow(failed:false)
+    }
+
+    func testFailedOperationReceiptsAloneCanOverflowTheFinalPass() throws {
+        try assertTerminalReceiptOverflow(failed:true)
+    }
+
+    private func assertTerminalReceiptOverflow(failed: Bool) throws {
+        let f = try Fixture(), round = try cancel(f,f.round(f.type(checks.schema())))
+        let rid = try XCTUnwrap(round["id"] as? String), principal = "fixture-terminal-history"
+        let count = MediaRoundDeletionHistory.passLimit + 1
+        let result = try jsonString(failed
+            ? ["error":["code":"MEDIA_CONTEXT_CHANGED","retryable":false,"details":["record_id":rid,"private":"hidden"]]]
+            : ["round_id":rid,"private":"hidden"])
+        try f.router.dbQueue.write { db in
+            for _ in 0..<count {
+                let command = uuid(), id = CommandRouter.commandOperationID(principal:principal,command:command)
+                let errorCommand = CommandRouter.commandOperationID(principal:principal,command:"error:" + id)
+                var operation: JSON = ["operation_id":id,"principal":principal,"command_id":command,
+                    "method":failed ? "media_round_delete" : "media_intake_preview","project_id":f.project,
+                    "digest":"fixture-digest","incarnation":f.router.incarnation,"state":failed ? "failed" : "succeeded"]
+                if failed {operation["error_result_command_id"] = errorCommand}
+                try f.router.saveOperation(db,operation)
+                try db.execute(sql:"INSERT INTO commands VALUES (?,?,'fixture-digest',?)",arguments:[principal,failed ? errorCommand : command,result])
+            }
+        }
+        try addMatchedHistoryCommands(f,round:rid)
+        let projected = LockedTestState(false)
+        f.router.mediaRoundDeletionPreparationProbe = {
+            let sample = try f.router.dbQueue.read { db in
+                try String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND json_extract(result,'$.pruned')=1 LIMIT 1",arguments:[principal])
+            }
+            if let sample {
+                XCTAssertFalse(sample.contains("hidden"))
+                XCTAssertEqual(jsonObject(sample)["_media_history_error_code"] as? String,failed ? "MEDIA_CONTEXT_CHANGED" : nil)
+                projected.withLock { $0 = true }
+            }
+        }
+        defer {f.router.mediaRoundDeletionPreparationProbe = nil}
+        XCTAssertEqual(try worker(f,"media_round_delete",input(f,round))["deleted"] as? Bool,true)
+        XCTAssertTrue(projected.withLock { $0 })
+        XCTAssertEqual(try f.router.dbQueue.read { db in
+            try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE principal=? AND digest='fixture-digest' AND json_extract(result,'$.pruned')=1",arguments:[principal])
+        },count)
     }
 
     func testNonfinalHistoryFencesNewTerminalOperationDependent() throws {

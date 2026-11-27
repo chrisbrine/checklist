@@ -49,7 +49,7 @@ struct PreparedMediaCommand {
             // Another connection committed: refuse only when a record this command read or
             // writes changed, or a new media record of this project appeared.
             for (id,seen) in observed {
-                let row = try Row.fetchOne(db,sql:"SELECT revision,CAST(data AS BLOB) AS data FROM records WHERE id=CAST(? AS TEXT)",arguments:[id])
+                let row = try Row.fetchOne(db,sql:"SELECT revision,CAST(data AS BLOB) AS data FROM records WHERE id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL(),arguments:[id])
                 guard let row,row["revision"] as Int64 == seen.revision,MediaPreparationOverlay.digest(row["data"] as Data? ?? Data()) == seen.digest else {
                     throw CoreError("MEDIA_CONTEXT_CHANGED","A media record this command uses changed during preparation. Refresh and retry. No records changed.")
                 }

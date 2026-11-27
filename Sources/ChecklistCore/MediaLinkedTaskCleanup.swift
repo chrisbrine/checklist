@@ -86,7 +86,7 @@ extension CommandRouter {
 
     func mediaLinkedTaskTerminated(_ db: Database,task: JSON) throws {
         let tid = try StoredRecord(task,family:"task").string("id"),pid = try StoredRecord(task,family:"task").string("project_id")
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND (json_extract(records.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY OR records.id IN (SELECT json_extract(i.data,'$.round_id') FROM records i WHERE i.type='media_item' AND i.project_id=CAST(? AS TEXT) AND json_extract(i.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)) ORDER BY id COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
+        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL() + " AND (json_extract(records.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY OR records.id IN (SELECT json_extract(i.data,'$.round_id') FROM records i WHERE i.type='media_item' AND i.project_id=CAST(? AS TEXT) AND json_extract(i.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)) ORDER BY id COLLATE BINARY",arguments:[Data(pid.utf8),Data(tid.utf8),Data(pid.utf8),Data(tid.utf8)])
         let system = Caller(role:"owner",installation:"storage",projectIDs:[])
         for row in rows {
             var round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object
@@ -280,7 +280,7 @@ extension CommandRouter {
     /// byte owners. They never become ticket-purge record-removal ownership.
     func mediaDoneCleanupHistory(_ db: Database,task: JSON) throws -> [PurgeRow] {
         let tid = try StoredRecord(task,family:"task").string("id"),pid = try StoredRecord(task,family:"task").string("project_id")
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.state')='archived' AND (json_extract(data,'$.done_task_cleanup.task_id')=CAST(? AS TEXT) COLLATE BINARY OR EXISTS (SELECT 1 FROM json_each(records.data,'$.done_task_cleanup.managed_attachment_ids') a JOIN records f ON f.id=a.value AND f.type='attachment' AND f.project_id=records.project_id WHERE json_extract(f.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY))",arguments:[Data(pid.utf8),Data(tid.utf8),Data(tid.utf8)])
+        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL() + " AND json_extract(data,'$.state')='archived' AND (json_extract(data,'$.done_task_cleanup.task_id')=CAST(? AS TEXT) COLLATE BINARY OR EXISTS (SELECT 1 FROM json_each(records.data,'$.done_task_cleanup.managed_attachment_ids') a JOIN records f ON f.id=a.value AND f.type='attachment' AND f.project_id=records.project_id WHERE json_extract(f.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY))",arguments:[Data(pid.utf8),Data(tid.utf8),Data(tid.utf8)])
         var ids = Set<String>()
         for row in rows {
             let round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object,cleanup = round["done_task_cleanup"] as? JSON ?? [:]

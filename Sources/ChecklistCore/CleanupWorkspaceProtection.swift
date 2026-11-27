@@ -10,10 +10,16 @@ struct CleanupWorkspaceProtection {
     private var roots = Set<String>()
     private(set) var signatures = Set<Data>()
 
+    static func pathAncestors(_ paths: [String]) -> Set<String> {
+        paths.reduce(into: Set<String>()) { $0.formUnion(ancestors(of:canonical($1))) }
+    }
+
     init(_ db: Database,paths: [String]) throws {
-        guard !paths.isEmpty else {return}
-        var ancestors = Set<String>()
-        for path in paths {ancestors.formUnion(Self.ancestors(of:Self.canonical(path)))}
+        try self.init(db,ancestors:Self.pathAncestors(paths))
+    }
+
+    init(_ db: Database,ancestors: Set<String>) throws {
+        guard !ancestors.isEmpty else {return}
         let projects = try Row.fetchCursor(db,sql:"""
             SELECT CAST(id AS BLOB) id,json_extract(data,'$.root_path') root
             FROM records WHERE rowid IN (\(Self.projectRowIDs)) AND json_type(data,'$.root_path')='text'
@@ -22,8 +28,7 @@ struct CleanupWorkspaceProtection {
         while let row = try projects.next() {
             let path: String = row["root"]
             guard !path.isEmpty else {continue}
-            let workspace = Self.canonical(path)
-            guard ancestors.contains(workspace) else {continue}
+            guard let workspace = Self.matchingWorkspace(path,ancestors:ancestors) else {continue}
             var signature: Data = row["id"]
             let charge = signature.count + 1 + max(path.utf8.count,workspace.utf8.count)
             guard charge <= TicketCleanupInventory.rowByteLimit else {
@@ -41,6 +46,12 @@ struct CleanupWorkspaceProtection {
             roots.insert(workspace)
             bytes += charge
         }
+    }
+
+    static func matchingWorkspace(_ root: String,ancestors: Set<String>) -> String? {
+        guard !root.isEmpty,!ancestors.isEmpty else {return nil}
+        let resolved = canonical(root)
+        return ancestors.contains(resolved) ? resolved : nil
     }
 
     func protects(_ path: String) -> Bool {

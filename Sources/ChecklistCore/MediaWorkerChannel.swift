@@ -210,7 +210,7 @@ extension CommandRouter {
     static func mediaRoundListSQL(states: Int,task: Bool,after: Bool) -> String {
         let created = "COALESCE(json_extract(data,'$.created_at'),'')"
         var sql = "SELECT " + canonicalRecordColumns + "," + created + " AS media_created_at" +
-            " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_round'"
+            " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_round' AND " + MediaRoundDeletionGraph.visibleSQL()
         if states > 0 {
             sql += " AND json_extract(data,'$.state') IN (" + Array(repeating:"CAST(? AS TEXT)",count:states).joined(separator:",") + ")"
         }

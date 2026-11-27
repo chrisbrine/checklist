@@ -3,8 +3,8 @@ import Dispatch
 import Darwin
 import GRDB
 
-/// Capture closed write admission before a deletion pass. The scheduler
-/// retains the accepted job and starts a fresh observation after capture.
+/// A pass yielded for write admission or owned import recovery. The scheduler
+/// retains the accepted job and starts a fresh observation when it can proceed.
 struct MediaRoundDeletionAdmissionDeferred: Error {}
 
 /// Ticket purge and round deletion advance both keys in their removal
@@ -26,10 +26,12 @@ struct CommandOperationPurgeEpoch {
         try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=CAST(? AS TEXT)",arguments:[Data(key.utf8)])
     }
 
-    func changed(in db: Database) throws -> Bool {try Self.read(db,key:key) != value}
+    func changed(in db: Database, except epoch: String? = nil) throws -> Bool {
+        let current = try Self.read(db,key:key)
+        return current != value && (epoch == nil || current != epoch)
+    }
 
-    static func advance(_ db: Database,project: String) throws {
-        let epoch = uuid()
+    static func advance(_ db: Database,project: String,epoch: String = uuid()) throws {
         try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?),(CAST(? AS TEXT),?)",
                        arguments:[storeKey,epoch,Data(projectKey(project).utf8),epoch])
     }
@@ -61,6 +63,7 @@ final class CommandOperations: @unchecked Sendable {
     private static let mediaRoundDeletionLimit = 2
     private var mediaRoundDeletions: [Job] = []
     private var scheduledMediaRoundDeletions = 0
+    let mediaImportWaits = MediaRoundDeletionImportRecovery()
     private var scheduled = Set<String>()
     private var recoveryRequired = Set<String>()
     private var executing = Set<String>()
@@ -194,6 +197,11 @@ final class CommandOperations: @unchecked Sendable {
             self.completion = completion
         }
     }
+    func retryMediaImportRecovery(_ operation: String) {
+        guard mediaImportWaits.requestRetry(operation) else {return}
+        let notify = lock.withLock {completion}
+        notify?("media_round_delete",false)
+    }
     func add(_ job: Job,router: CommandRouter) {
         lock.withLock {
             if job.mediaRoundDeletionProject != nil {
@@ -215,6 +223,7 @@ final class CommandOperations: @unchecked Sendable {
             for job in mediaRoundDeletions {
                 guard scheduledMediaRoundDeletions < Self.mediaRoundDeletionLimit else {break}
                 guard let project = job.mediaRoundDeletionProject,projects.insert(project).inserted,
+                      !mediaImportWaits.isWaiting(job.id),
                       scheduled.insert(job.id).inserted else {continue}
                 scheduledMediaRoundDeletions += 1
                 schedule(job,on:mediaRoundDeletionQueue ?? queue,router:router)
@@ -241,8 +250,9 @@ final class CommandOperations: @unchecked Sendable {
                 return completion
             }
             if finished {job.lease.finish();callback?(job.method,true)}
-            // A blocked job retains its admitted lease and waits for the
-            // existing backup admission notification, without polling.
+            else if deletion && mediaImportWaits.isWaiting(job.id) {callback?(job.method,false)}
+            // Backup admission and settlement notify this scheduler when a
+            // deferred head can take another turn.
             if router.writeAdmissionStatus["locked"] as? Bool != true {resume(router:router)}
         }
     }
@@ -355,6 +365,10 @@ extension CommandRouter {
         var value = operation
         for key in ["principal","digest","authorization_generation","incarnation","recoverable","outcome_unknown","caller","reply_write_admission","error_result_command_id","purge_uses_store_epoch"] {value.removeValue(forKey:key)}
         value["status_method"] = "operation_get"
+        if operation["method"] as? String == "media_round_delete", let id = operation["operation_id"] as? String,
+           commandOperations.mediaImportWaits.isWaiting(id) {
+            value["waiting_reason"] = MediaRoundDeletionImportRecovery.waitingReason
+        }
         // A read operation that started while backup admission was closed has
         // no durable running marker; this process reports its actual state.
         if operation["state"] as? String == "queued",let id = operation["operation_id"] as? String,commandOperations.isActive(id) {value["state"] = "running"}
@@ -368,6 +382,9 @@ extension CommandRouter {
                 return value
             }
             guard !Self.isPrunedResult(result) else {throw Self.expiredCommandError(command)}
+            if operation["method"] as? String == "media_round_delete" {
+                result = try self.mediaGraphFirstReply(db,result)
+            }
             if operation["method"] as? String == "attachment_read" {
                 result = try self.attachmentOperationResult(db,result,operation:operation,caller:caller)
             }
@@ -475,6 +492,7 @@ extension CommandRouter {
                     }
                     return ["command_id":command,"command_outcome":"accepted","data":payload]
                 }
+                if method == "media_round_delete" {commandOperations.retryMediaImportRecovery(id)}
                 return operationAcknowledgment(previous)
             }
             if previous["state"] as? String != "failed" || !bool(previous,"recoverable") {return operationAcknowledgment(previous)}
@@ -544,6 +562,10 @@ extension CommandRouter {
         var data = operation
         for key in ["principal","caller","digest","authorization_generation","incarnation","recoverable","outcome_unknown","error","reply_write_admission","error_result_command_id","purge_uses_store_epoch"] {data.removeValue(forKey:key)}
         data["status_method"] = "operation_get"
+        if operation["method"] as? String == "media_round_delete", let id = operation["operation_id"] as? String,
+           commandOperations.mediaImportWaits.isWaiting(id) {
+            data["waiting_reason"] = MediaRoundDeletionImportRecovery.waitingReason
+        }
         return ["command_id":operation["command_id"]!,"command_outcome":"accepted","data":data]
     }
     func runCommandOperation(_ job: CommandOperations.Job) -> Bool {
@@ -721,7 +743,9 @@ extension CommandRouter {
                     let errorDigest = hash(Data(("operation-error:" + (value["digest"] as! String)).utf8))
                     let old = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[job.caller.principal,errorCommand])
                     if let old {guard old["digest"] as String == errorDigest else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation error receipt belongs to another command.")}}
-                    let crossedPurge = try purgeEpoch.changed(in:db)
+                    let ownVisibilityEpoch = try self.mediaDeletionVisibilityEpoch(db,method:job.method,params:params,
+                                                                                caller:job.caller,command:command)
+                    let crossedPurge = try purgeEpoch.changed(in:db,except:ownVisibilityEpoch)
                     let expired = crossedPurge || old.map {Self.isPrunedResult(jsonObject($0["result"]))} == true
                     let receipt: JSON = expired ? jsonObject(Self.prunedResult) : ["command_id":value["command_id"]!,"error":error]
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?) ON CONFLICT(principal,command_id) DO UPDATE SET result=excluded.result",arguments:[job.caller.principal,errorCommand,errorDigest,try jsonString(receipt)])

@@ -851,6 +851,71 @@ final class CommandOperationTests: XCTestCase {
         }
     }
 
+    func testRunningMediaDeletionRejectsRotatedGenerationBetweenGraphPasses() throws {
+        let checks = MediaRoundDeletionTests()
+        let media = try MediaFrozenIntakeTests.Fixture(),f = try XCTUnwrap(media.storage)
+        let router = try XCTUnwrap(media.router),project = media.project,owner = f.owner
+        let draft = try media.round(media.type(checks.checks.schema()))
+        for _ in 0..<32 {_ = try media.item(draft)}
+        let round = try checks.cancel(media,draft)
+        let roundID = try XCTUnwrap(round["id"] as? String)
+        let worker = try enrolledWorker(f,project:project),command = uuid()
+        let operationID = CommandRouter.commandOperationID(principal:worker.principal,command:command)
+        let errorReceipt = CommandRouter.commandOperationID(principal:worker.principal,command:"error:" + operationID)
+        let input = try checks.input(media,round).merging(["project_id":project]) {current,_ in current}
+        let observation = LockedTestState<String?>(nil),holds = LockedTestState<[(String,Bool)]>([])
+        @Sendable func deletionState() throws -> String {
+            try router.dbQueue.read {db in
+                let records = try String.fetchAll(db,sql:"SELECT data FROM records ORDER BY id")
+                let events = try String.fetchAll(db,sql:"SELECT json_array(id,project_id,entity_id,actor,kind,occurred_at,data) FROM events ORDER BY id")
+                let commands = try String.fetchAll(db,sql:"""
+                    SELECT json_array(principal,command_id,digest,result) FROM commands
+                    WHERE command_id<>? ORDER BY principal,command_id
+                    """,arguments:[errorReceipt])
+                let progress = try String.fetchAll(db,sql:"""
+                    SELECT json_array(key,value) FROM metadata
+                    WHERE key GLOB 'media-round-deletion-*' ORDER BY key
+                    """)
+                return try jsonString([records,events,commands,progress])
+            }
+        }
+
+        let lane = HeldLane(router)
+        let accepted = try f.call("media_round_delete",input,command:command,caller:worker)
+        XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+        router.mediaRoundDeletionWriterProbe = {phase,_,committed in
+            holds.withLock {$0.append((phase,committed))}
+        }
+        router.mediaRoundDeletionGraphProbe = {
+            // Let the first hidden-graph slice commit, then rotate before the next.
+            guard holds.withLock({$0.contains { $0.0 == "media_round_graph_receipt" && $0.1 }}),
+                  observation.withLock({$0 == nil}) else {return}
+            try Self.rotateRegistration(router,project:project,worker:worker,owner:owner)
+            let state = try deletionState()
+            observation.withLock {$0 = state}
+        }
+        lane.finish()
+        router.mediaRoundDeletionGraphProbe = nil
+        router.mediaRoundDeletionWriterProbe = nil
+
+        try assertRotatedOperationFailed(f,project:project,worker:worker,method:"media_round_delete",input:input,command:command,accepted:accepted)
+        let last = try XCTUnwrap(holds.withLock {$0.last})
+        XCTAssertEqual(last.0,"media_round_graph_detach")
+        XCTAssertFalse(last.1)
+        XCTAssertEqual(try deletionState(),try XCTUnwrap(observation.withLock {$0}),
+                       "The refused slice must preserve graph rows, the cursor, history and receipts")
+        let progress = try checks.deletion(media,round)
+        XCTAssertEqual(progress["deletion_state"] as? String,"deleting")
+        XCTAssertEqual(progress["removed_records"] as? Int,0)
+
+        let fresh = try f.call("media_round_delete",input,caller:worker)
+        lane.finish()
+        let complete = try read(f,fresh,project:project,caller:worker)
+        XCTAssertEqual(complete["state"] as? String,"succeeded")
+        XCTAssertEqual(try checks.deletion(media,round)["round_id"] as? String,roundID)
+        XCTAssertEqual(try checks.deletion(media,round)["deleted"] as? Bool,true)
+    }
+
     func testRunningEpicDeletionRejectsRotatedGenerationAndAcceptsCurrentWorkerAndOwner() throws {
         let f = try StorageFixture(),project = try f.project(),pid = try XCTUnwrap(project["id"] as? String)
         let worker = try enrolledWorker(f,project:pid),router = try XCTUnwrap(f.router)

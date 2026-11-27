@@ -134,7 +134,7 @@ enum MediaRecordRegistry {
     }
 
     static func envelopes(_ db: Database, project: String? = nil, limit: Int = 100_000, check: () throws -> Void = {}) throws -> [DecodedEnvelope] {
-        let condition = project == nil ? "" : " WHERE project_id = CAST(? AS TEXT)"
+        let condition = project == nil ? "" : " WHERE project_id = CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL()
         let arguments = project.map { StatementArguments([Data($0.utf8)]) } ?? StatementArguments()
         let rows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records" + condition + " ORDER BY id COLLATE BINARY",arguments:arguments)
         var result: [DecodedEnvelope] = []

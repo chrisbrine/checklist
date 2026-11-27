@@ -565,7 +565,7 @@ extension CommandRouter {
         // The sole writer constructs the complete selection before recovering it.
         guard try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM main.records WHERE type='storage_job')") == true else {return false}
         func candidate(_ prefix: String) -> String {
-            "CASE WHEN json_valid(\(prefix)data) THEN CASE WHEN json_type(\(prefix)data)='object' THEN json_extract(\(prefix)data,'$.state') IN ('committed','repair_required') ELSE 1 END ELSE 1 END"
+            "CASE WHEN json_valid(\(prefix)data) THEN CASE WHEN json_type(\(prefix)data)='object' THEN \(MediaRoundDeletionImportRecovery.needsReceiptSQL(prefix + "data")) ELSE 1 END ELSE 1 END"
         }
         try db.inSavepoint {
             try db.execute(sql:"CREATE TEMP TABLE checklist_import_recovery(record_rowid INTEGER PRIMARY KEY,source_id BLOB NOT NULL UNIQUE)")
@@ -574,7 +574,10 @@ extension CommandRouter {
                 let rows = action == "INSERT" ? ["NEW"] : action == "DELETE" ? ["OLD"] : ["OLD","NEW"]
                 let remove = rows.map {"DELETE FROM checklist_import_recovery WHERE record_rowid=\($0).rowid OR source_id=CAST(\($0).id AS BLOB);"}.joined()
                 let insert = action == "DELETE" ? "" : "INSERT INTO checklist_import_recovery SELECT NEW.rowid,CAST(NEW.id AS BLOB) WHERE NEW.type='storage_job' AND " + candidate("NEW.") + " ON CONFLICT(record_rowid) DO UPDATE SET source_id=excluded.source_id;"
-                try db.execute(sql:"CREATE TEMP TRIGGER checklist_import_recovery_" + action.lowercased() + " AFTER " + action + " ON main.records BEGIN " + remove + insert + " END")
+                // A settled import and every non-job row are absent from this
+                // index. A bulk graph deletion need not issue a lookup for them.
+                let condition = action == "DELETE" ? " WHEN CASE WHEN OLD.type='storage_job' THEN \(candidate("OLD.")) ELSE 0 END" : ""
+                try db.execute(sql:"CREATE TEMP TRIGGER checklist_import_recovery_" + action.lowercased() + " AFTER " + action + " ON main.records" + condition + " BEGIN " + remove + insert + " END")
             }
             return .commit
         }
@@ -584,8 +587,10 @@ extension CommandRouter {
     /// Bounded metadata recovery; never publishes a pending attachment or deletes
     /// a finalized original. Referenced objects and uncertain jobs are retained.
     func reconcileManagedAttachmentImports(_ db: Database) throws -> StorageMaintenanceWarning? {
+        defer {commandOperations.mediaImportWaits.refresh(failures:managedImportRecoveryFailures)}
+        for id in commandOperations.mediaImportWaits.takeRetries() {managedImportRecoveryFailures.removeValue(forKey:id)}
         guard try ensureManagedImportRecoveryIndex(db) else {return nil}
-        let rows = try self.fetchStoreRows(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
+        let rows = try self.fetchStoreRows(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' AND " + MediaRoundDeletionGraph.visibleSQL("r") + " ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
         managedImportMaintenanceAfterRow = rows.count == 32 ? (rows.last!["maintenance_position"] as Int64) : 0
         var warning: StorageMaintenanceWarning?
         for row in rows {
@@ -615,13 +620,19 @@ extension CommandRouter {
     private func reconcileManagedAttachmentImport(_ db: Database,job initial: JSON) throws {
         var job = initial
         guard job["kind"] as? String == "attachment_import" else { return }
-        guard ["committed","repair_required"].contains(job["state"] as? String ?? "") else { return }
+        guard MediaRoundDeletionImportRecovery.receiptStates.contains(job["state"] as? String ?? "") else { return }
         let objects = try managedImportObjects(job),
             pid = (try StoredRecord(job,
             family: "ManagedAttachmentImport").string("project_id")),
             aid = (try StoredRecord(job,
             family: "ManagedAttachmentImport").string("attachment_id"))
-        guard let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String, let digest = job["intent_digest"] as? String, let receipt = try managedImportReceipt(db,principal:principal,command:command,digest:digest), let result = receipt["data"] as? JSON, EnvelopeStorageIdentity.equal(result["id"] as? String,aid) else { throw managedImportFailure("committed_receipt_missing") }
+        let jobID = try StoredRecord(job,family:"ManagedAttachmentImport").string("id")
+        guard let principal = job["parent_principal"] as? String, let command = job["parent_command_id"] as? String,
+              let digest = job["intent_digest"] as? String, let receipt = try managedImportReceipt(db,principal:principal,command:command,digest:digest),
+              EnvelopeStorageIdentity.equal((receipt["data"] as? JSON)?["id"] as? String,aid) ||
+                MediaRoundDeletionImportRecovery.provesSettlement(receipt,job:jobID,attachment:aid) else {
+            throw managedImportFailure("committed_receipt_missing")
+        }
         var attachment = try scoped(db,aid,pid,type:"attachment")
         guard attachment["storage_job_id"] as? String == job["id"] as? String, attachment["sha256"] as? String == job["sha256"] as? String, (try? managedRelative(attachment["path"] as? String ?? "",family:"objects")) == job["object_relative_path"] as? String else { throw managedImportFailure("committed_reference_changed") }
         if try mediaTrashIntentOwnsImportRecovery(db,attachment:attachment) {return}
@@ -650,5 +661,6 @@ extension CommandRouter {
             if restoreOriginal || previewUnavailable { try self.save(db,self.revised(attachment),type:"attachment") }
             job["state"] = "settled"; try self.saveManagedImportProgress(db,self.revised(job)); return .commit
         }
+        if commandOperations.mediaImportWaits.settled(Data(jobID.utf8)) {resumeCommandOperations()}
     }
 }
