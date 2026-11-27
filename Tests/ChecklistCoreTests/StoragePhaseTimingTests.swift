@@ -47,4 +47,18 @@ final class StoragePhaseTimingTests: XCTestCase {
         XCTAssertEqual(phases.last, "complete")
         XCTAssertNil(budget.measurement.phaseTiming)
     }
+
+    func testGraphPreparationLogsStartEndAndMeasuredRows() throws {
+        var clock: TimeInterval = 10, lines: [String] = []
+        let timer = StoragePhaseTiming(operation:"media_round_graph_prepare",command:"fixture-command",
+                                       uptime:{clock},sink:{lines.append($0)})
+        timer.record("graph_selection")
+        clock = 12; timer.record("reference_and_history_scan",rowsRead:7)
+        clock = 17; timer.record("byte_cleanup",rowsRead:23)
+        clock = 19; timer.record("complete",terminal:true)
+        let rows = try lines.map {try XCTUnwrap(JSONSerialization.jsonObject(with:Data($0.utf8)) as? JSON)}
+        XCTAssertEqual(rows.compactMap {$0["next_phase"] as? String},["graph_selection","reference_and_history_scan","byte_cleanup","complete"])
+        XCTAssertEqual(rows.compactMap {$0["rows_read"] as? Int},[7,23])
+        XCTAssertEqual(rows.last?["elapsed_seconds"] as? Double,9)
+    }
 }

@@ -68,8 +68,7 @@ final class StorageRecoveryServer: NSObject, NSXPCListenerDelegate {
         super.init();listener.delegate = self
     }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        guard connection.effectiveUserIdentifier == getuid() else { return false }
-        return clientIdentity.accept(connection) { StorageRecoveryPeer(state: self.state) }
+        clientIdentity.accept(connection) { StorageRecoveryPeer(state: self.state) }
     }
 }
 final class StorageRecoveryPeer: NSObject, ChecklistRPC {
@@ -101,8 +100,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     // These requests can wait for a storage writer before replying. Keep each
     // admission order while leaving the coordinator free to authenticate reads.
     let ticketCaptureQueue = DispatchQueue(label:"org.checklist.ticket-capture",qos:.userInitiated)
+    let epicCreationQueue = DispatchQueue(label:"org.checklist.epic-creation",qos:.userInitiated)
     let mediaRoundDeletionAdmissionQueue = DispatchQueue(label:"org.checklist.media-round-deletion-admission",qos:.userInitiated)
-    let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.default,attributes:.concurrent,autoreleaseFrequency:.workItem)
+    let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.utility,attributes:.concurrent,autoreleaseFrequency:.workItem)
     var storageRunning = false
     var storageWakePlanning = false
     var storageWakeReplan = false
@@ -289,8 +289,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        guard connection.effectiveUserIdentifier == getuid() else { return false }
-        return clientIdentity.accept(connection, timedPeer: { Peer(coordinator: self, connection: connection, admission: $0) })
+        clientIdentity.accept(connection, timedPeer: { Peer(coordinator: self, connection: connection, admission: $0) })
     }
     func saveEnrollments() throws {
         requireCommandQueue()
@@ -497,7 +496,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             try saveEnrollments(); credentials.remove(installation)
             return .done(["data":["disconnected":true], "command_id":commandID])
         }
-        let expectedGeneration = method == "task_create" || method == "media_round_delete" ? sessionGeneration : nil
+        let expectedGeneration = ["task_create","epic_create","media_round_delete"].contains(method) ? sessionGeneration : nil
         return .router(method:method,params:params,caller:caller,expectedGeneration:expectedGeneration)
     }
     func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
@@ -878,6 +877,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                 let worker: DispatchQueue
                 switch method {
                 case "task_create": worker = coordinator.ticketCaptureQueue
+                case "epic_create": worker = coordinator.epicCreationQueue
                 case "media_round_delete": worker = coordinator.mediaRoundDeletionAdmissionQueue
                 default:
                     guard CommandRouter.runsOutsideSerialQueue(method) || coordinator.nativeLifecycle.resumptionInFlight else {
@@ -910,7 +910,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                         }
                     } catch {
                         var refusal: [String:Any] = ["error":Self.publicError(error)]
-                        if method == "task_create" || method == "media_round_delete" {
+                        if ["task_create","epic_create","media_round_delete"].contains(method) {
                             refusal["write_admission"] = router.writeAdmissionStatus
                         }
                         result = refusal

@@ -114,8 +114,17 @@ extension CommandRouter {
 
     func startMediaDeletionGraph(_ context: GraphDeletionContext, plan: MediaRoundDeletionPlan, audit: JSON) throws -> JSON {
         let receipt = uuid()
-        let work = try prepareMediaDeletionGraph(plan,audit:audit,receipt:receipt)
-        let payload = try JSONEncoder().encode(work)
+        let (work,payload) = try { () -> (DeletionGraph.Work, Data) in
+            let timing = StoragePhaseTiming(operation:"media_round_graph_prepare_journal",command:context.command,
+                                           uptime:{ProcessInfo.processInfo.systemUptime})
+            var result = "failed"
+            timing.record("journal_encoding")
+            defer {timing.record(result,terminal:true)}
+            let work = try prepareMediaDeletionGraph(plan,audit:audit,receipt:receipt)
+            let payload = try JSONEncoder().encode(work)
+            result = "complete"
+            return (work,payload)
+        }()
         let members = work.slices.flatMap(\.members)
         let count = max((payload.count + DeletionGraph.journalChunkBytes - 1) / DeletionGraph.journalChunkBytes,
                         (members.count + DeletionGraph.rowLimit - 1) / DeletionGraph.rowLimit)

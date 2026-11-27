@@ -111,12 +111,14 @@ final class ClientConnectionAdmissionTests: XCTestCase {
         XCTAssertEqual(server.counts.dispatched, 0)
     }
 
-    /// Fake signature reader and kernel key: counts full checks and can hold one open.
+    /// Fake signature reader and kernel key. Either can hold a check open.
     private final class Probe: @unchecked Sendable {
         private let lock = NSLock()
         private var key: ClientExecutableKey?
+        private var keyReads = 0
         private var reads = 0
         var identity: ClientBuildIdentity?
+        var slowKey: Int?
         var slowRead: Int?
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         init(_ identity: ClientBuildIdentity?) { self.identity = identity }
@@ -125,13 +127,18 @@ final class ClientConnectionAdmissionTests: XCTestCase {
             set { lock.lock(); key = newValue; lock.unlock() }
         }
         var signatureReads: Int { lock.lock(); defer { lock.unlock() }; return reads }
+        func readKey(_ connection: NSXPCConnection) -> ClientExecutableKey? {
+            lock.lock(); keyReads += 1; let number = keyReads; let observed = key; lock.unlock()
+            if number == slowKey { entered.signal(); _ = release.wait(timeout: .now() + 5) }
+            return observed
+        }
         func read(_ connection: NSXPCConnection) -> ClientBuildIdentity? {
             lock.lock(); reads += 1; let number = reads; lock.unlock()
-            if number == slowRead { entered.signal(); release.wait() }
+            if number == slowRead { entered.signal(); _ = release.wait(timeout: .now() + 5) }
             return identity
         }
         func admission(current: [ClientBuildIdentity], identifiers: Set<String> = []) -> ClientConnectionAdmission {
-            .init(currentClients: current, checklistIdentifiers: identifiers, identitySource: read, keySource: { _ in self.current })
+            .init(currentClients: current, checklistIdentifiers: identifiers, identitySource: read, keySource: readKey)
         }
     }
 
@@ -200,6 +207,33 @@ final class ClientConnectionAdmissionTests: XCTestCase {
         XCTAssertEqual(slow.wait(timeout: .now() + 3), .success)
         XCTAssertEqual((slowResult.value?["data"] as? [String: Any])?["received"] as? Bool, true)
         XCTAssertEqual(probe.signatureReads, 2)
+    }
+
+    func testSlowExecutableKeyDoesNotHoldUpAnotherConnection() throws {
+        let own = try ownIdentity()
+        let probe = Probe(own)
+        probe.current = key()
+        probe.slowKey = 3 // Priming the cache reads the key before and after verification.
+        let server = Listener(probe.admission(current: [own]))
+        defer { server.stop() }
+        _ = try server.send("service_info")
+
+        let slow = DispatchSemaphore(value: 0)
+        let slowResult = UncheckedBox()
+        DispatchQueue.global().async { slowResult.value = try? server.send("service_info"); slow.signal() }
+        defer { probe.release.signal() }
+        XCTAssertEqual(probe.entered.wait(timeout: .now() + 3), .success)
+
+        let started = ProcessInfo.processInfo.systemUptime
+        let ready = try server.send("service_info")
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 1)
+        XCTAssertEqual((ready["data"] as? [String: Any])?["received"] as? Bool, true)
+        XCTAssertEqual(slow.wait(timeout: .now()), .timedOut)
+
+        probe.release.signal()
+        XCTAssertEqual(slow.wait(timeout: .now() + 3), .success)
+        XCTAssertEqual((slowResult.value?["data"] as? [String: Any])?["received"] as? Bool, true)
+        XCTAssertEqual(probe.signatureReads, 1)
     }
 
     private final class UncheckedBox: @unchecked Sendable { var value: [String: Any]? }

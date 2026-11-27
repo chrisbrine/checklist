@@ -233,7 +233,7 @@ final class CommandOperations: @unchecked Sendable {
     }
     private func schedule(_ job: Job,on queue: DispatchQueue,router: CommandRouter) {
         let deletion = job.mediaRoundDeletionProject != nil
-        let qos: DispatchQoS = deletion ? .default : .unspecified
+        let qos: DispatchQoS = deletion ? .utility : .unspecified
         // Submitting from an ordinary request must not donate its priority to
         // the deletion's full preparation. The shared writer still serializes
         // only the operation's fenced commits.

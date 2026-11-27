@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import Darwin
 import GRDB
 import os
 @testable import ChecklistCore
@@ -36,6 +37,7 @@ final class CommandOperationServiceTests: XCTestCase {
             release.signal()
             holder.sync {}
             coordinator.queue.sync {}
+            coordinator.epicCreationQueue.sync {}
             coordinator.mediaRoundDeletionAdmissionQueue.sync {}
             coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
             coordinator.queue.sync {}
@@ -48,9 +50,23 @@ final class CommandOperationServiceTests: XCTestCase {
         let deletion = try JSONSerialization.data(withJSONObject:["method":"media_round_delete","installation":installation,
             "credential":credential,"workspace":directory.path,"params":["project_id":round.project,"round_id":round.id,
                 "expected_revision":round.revision,"reason":"Retire synthetic round","command_id":command]])
+        func epicRequest(command: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject:["method":"epic_create","installation":installation,
+                "credential":credential,"workspace":directory.path,"params":["project_id":round.project,"name":"Ordinary write",
+                    "command_id":command]])
+        }
+        let epicCommand = uuid()
         let status = try JSONSerialization.data(withJSONObject:["method":"service_info","params":[:]])
         let deletionReply = expectation(description:"Durable deletion admission"), statusReply = expectation(description:"Independent status")
+        let epicReply = expectation(description:"Committed epic")
         let accepted = OSAllocatedUnfairLock<String?>(initialState:nil)
+        peer.execute(try epicRequest(command:epicCommand)) { bytes in
+            let reply = (try? JSONSerialization.jsonObject(with:bytes)) as? JSON
+            XCTAssertEqual(reply?["command_id"] as? String,epicCommand)
+            XCTAssertEqual((reply?["data"] as? JSON)?["name"] as? String,"Ordinary write")
+            XCTAssertNotNil(reply?["write_admission"])
+            epicReply.fulfill()
+        }
         peer.execute(deletion) { bytes in
             let reply = (try? JSONSerialization.jsonObject(with:bytes)) as? JSON
             XCTAssertEqual(reply?["command_outcome"] as? String,"accepted")
@@ -67,16 +83,33 @@ final class CommandOperationServiceTests: XCTestCase {
         let responsive = XCTWaiter.wait(for:[statusReply],timeout:1)
         XCTAssertNil(accepted.withLock {$0},"Deletion must wait for a durable admission")
         release.signal()
-        wait(for:[deletionReply],timeout:5)
+        wait(for:[deletionReply,epicReply],timeout:5)
         if responsive != .completed {coordinator.queue.sync {}}
-        XCTAssertEqual(responsive,.completed,"Status must reply while deletion admission waits for the writer")
+        XCTAssertEqual(responsive,.completed,"Status must reply while deletion admission and the epic write wait for the writer")
         coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
         let operation = try XCTUnwrap(accepted.withLock {$0})
         let worker = Caller(role:"worker",installation:installation+"/"+generation,projectIDs:[round.project],sessionID:session,workspace:directory.path)
         let result = try router.handle(method:"operation_get",params:["project_id":round.project,"operation_id":operation],caller:worker)
         XCTAssertEqual((result["data"] as? JSON)?["state"] as? String,"succeeded")
+
+        let laneHeld = DispatchSemaphore(value:0), releaseLane = DispatchSemaphore(value:0)
+        coordinator.epicCreationQueue.async {
+            laneHeld.signal()
+            _ = releaseLane.wait(timeout:.now()+10)
+        }
+        defer {releaseLane.signal()}
+        guard laneHeld.wait(timeout:.now()+5) == .success else {return XCTFail("Epic queue was not held")}
+        let staleEpic = expectation(description:"Queued epic refused after its session changed")
+        peer.execute(try epicRequest(command:uuid())) { bytes in
+            let reply = (try? JSONSerialization.jsonObject(with:bytes)) as? JSON
+            XCTAssertEqual((reply?["error"] as? JSON)?["code"] as? String,"CONNECTION_REVOKED")
+            staleEpic.fulfill()
+        }
+        coordinator.queue.sync {}
         _ = try router.handle(method:"session_update",params:["command_id":uuid(),"project_id":round.project,"session_id":session,
             "expected_revision":registered["revision"]!,"provider":"claude"],caller:owner)
+        releaseLane.signal()
+        wait(for:[staleEpic],timeout:5)
         XCTAssertThrowsError(try router.handle(method:"media_round_delete",
             params:["command_id":uuid(),"project_id":round.project,"round_id":round.id,"expected_revision":round.revision,"reason":"Stale admission"],
             caller:worker,observeOperationWriterWait:nil,expectedAuthorizationGeneration:router.sessionGeneration(registered))) {
@@ -117,7 +150,10 @@ final class CommandOperationServiceTests: XCTestCase {
         let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0),secondFinished = DispatchSemaphore(value:0)
         let firstPreparation = OSAllocatedUnfairLock(initialState:true)
         let executions = OSAllocatedUnfairLock(initialState:[String]())
-        router.commandOperations.executionProbe = {id in executions.withLock {$0.append(id)}}
+        router.commandOperations.executionProbe = {id in
+            XCTAssertEqual(qos_class_self(),QOS_CLASS_UTILITY,"Accepted media deletion should run at utility priority")
+            executions.withLock {$0.append(id)}
+        }
         router.mediaRoundDeletionPreparationProbe = {
             let hold = firstPreparation.withLock {value in
                 defer {value = false}

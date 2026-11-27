@@ -51,7 +51,7 @@ public struct ClientAdmissionTiming: Sendable {
 
 /// A PID check selects the peer. XPC still checks the exact hash on every command message.
 /// The signature of each executable is read once; later clients of the same unchanged
-/// executable reuse that identity. A first read runs off the listener's serial queue.
+/// executable reuse that identity. All executable checks run off the listener's serial queue.
 public struct ClientConnectionAdmission {
     public let requirement: String?
     public let currentHashes: Set<Data>
@@ -81,8 +81,7 @@ public struct ClientConnectionAdmission {
         return ClientBuildIdentity.running(guest)
     }
 
-    /// A cached executable is classified at once. Otherwise the connection is held unresumed
-    /// while a concurrent queue reads its signature; a refused peer is then invalidated.
+    /// Each connection stays unresumed until the concurrent admission queue classifies it.
     public func accept(_ connection: NSXPCConnection, peer: @escaping () -> any ChecklistRPC) -> Bool {
         accept(connection, timedPeer: { _ in peer() })
     }
@@ -91,21 +90,19 @@ public struct ClientConnectionAdmission {
     /// stamps per connection, and expose them only on explicitly timed replies.
     public func accept(_ connection: NSXPCConnection, timedPeer: @escaping (ClientAdmissionTiming) -> any ChecklistRPC) -> Bool {
         let listener = ProcessInfo.processInfo.systemUptime
-        guard requirement != nil else { return false }
-        let key = keySource(connection)
-        if let key, let identity = cache.identity(for: key) {
-            let checked = ProcessInfo.processInfo.systemUptime
-            return admit(connection, identity, listener: listener, started: listener, finished: checked, cacheHit: true, peer: timedPeer)
-        }
+        guard requirement != nil, connection.effectiveUserIdentifier == getuid() else { return false }
         let check = Deferred { [self] in
             let started = ProcessInfo.processInfo.systemUptime
-            let identity = identitySource(connection)
+            // Even a hit needs proc_pidpath, stat and csops. A slow system call
+            // must leave the serial listener free to deliver the next connection.
+            let key = keySource(connection)
+            let cached = key.flatMap { cache.identity(for: $0) }
+            let identity = cached ?? identitySource(connection)
+            if cached == nil, let key, let identity, keySource(connection) == key { cache.store(identity, for: key) }
             let finished = ProcessInfo.processInfo.systemUptime
-            // Cache only when the executable did not change during the read.
-            if let key, let identity, keySource(connection) == key { cache.store(identity, for: key) }
             // A refused peer gets no exported object; resuming before invalidation tells
             // the client at once instead of leaving its first message unanswered.
-            if !admit(connection, identity, listener: listener, started: started, finished: finished, cacheHit: false, peer: timedPeer) { connection.resume(); connection.invalidate() }
+            if !admit(connection, identity, listener: listener, started: started, finished: finished, cacheHit: cached != nil, peer: timedPeer) { connection.resume(); connection.invalidate() }
         }
         Self.checks.async { check.run() }
         return true

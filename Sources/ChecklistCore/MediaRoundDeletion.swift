@@ -179,7 +179,7 @@ extension CommandRouter {
             }
         }
         var configuration = Configuration();configuration.readonly = true
-        configuration.qos = .default
+        configuration.qos = .utility
         configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
         defer {try? observer.close()}
@@ -238,7 +238,7 @@ extension CommandRouter {
                 existingGraph = (context,progress,work)
                 return
             }
-            plan = try self.prepareMediaRoundDeletion(db,p,c,project:project,historyLimit:historyLimit)
+            plan = try self.prepareMediaRoundDeletion(db,p,c,project:project,command:command,historyLimit:historyLimit)
             try self.mediaRoundDeletionPreparationProbe?()
         }
         if let replay {return replay}
@@ -383,8 +383,13 @@ extension CommandRouter {
         return CoreError(error.code,error.message,details:details)
     }
 
-    private func prepareMediaRoundDeletion(_ db: Database,_ p: JSON,_ c: Caller,project: String,historyLimit: Int) throws -> MediaRoundDeletionPlan {
+    private func prepareMediaRoundDeletion(_ db: Database,_ p: JSON,_ c: Caller,project: String,command: String,historyLimit: Int) throws -> MediaRoundDeletionPlan {
         let started = ProcessInfo.processInfo.systemUptime
+        let timing = StoragePhaseTiming(operation:"media_round_graph_prepare",command:command,
+                                       uptime:{ProcessInfo.processInfo.systemUptime})
+        var result = "failed"
+        timing.record("graph_selection")
+        defer {timing.record(result,terminal:true)}
         let version = try Int64.fetchOne(db,sql:"PRAGMA data_version")!
         let rid = try text(p,"round_id"),round = try scoped(db,rid,project,type:"media_round")
         let progressKey = try MediaRoundDeletionHistory.progressKey(project:project,round:rid)
@@ -619,6 +624,7 @@ extension CommandRouter {
         let batchGraph = removed.count + keptAttachments.count > DeletionGraph.rowLimit ||
             selectedBytes + supplementalBytes > DeletionGraph.byteLimit || objects.count > DeletionGraph.rowLimit
         let graphFinished = ProcessInfo.processInfo.systemUptime
+        timing.record("reference_and_history_scan",rowsRead:removed.count + keptAttachments.count)
         let deletionTasks = tasks
         let handoffAttachments = handoffOnlyIDs
         @Sendable func observeReferences(_ snapshot: Database,partition: TicketCleanupRowRange? = nil,budget: MediaRoundDeletionReferenceBudget) throws -> MediaRoundDeletionReferences {
@@ -657,12 +663,16 @@ extension CommandRouter {
         observedIDs.formUnion(referenced.ids)
         let referencesFinished = ProcessInfo.processInfo.systemUptime
         let history = try parallelHistory?.0 ?? MediaRoundDeletionHistory.select(db,project:project,owned:owned,progressKey:progressKey,continuing:progress != nil,writerLimit:historyLimit,ordinaryLimit:DeletionGraph.rowLimit,ordinaryBytes:DeletionGraph.byteLimit,projectFinal:batchGraph)
+        timing.record("byte_cleanup",rowsRead:referenced.rowsRead)
         if history.continuing && !history.more {
             let liveImports = removed.filter { row in
                 row.type == "storage_job" && row.value["kind"] as? String == "attachment_import"
                     && MediaRoundDeletionImportRecovery.receiptStates.contains(row.value["state"] as? String ?? "")
             }.map(\.id)
-            if !liveImports.isEmpty {throw MediaRoundDeletionImportRecovery.Pending(imports:liveImports)}
+            if !liveImports.isEmpty {
+                result = "waiting_for_import_recovery"
+                throw MediaRoundDeletionImportRecovery.Pending(imports:liveImports)
+            }
         }
         let historySelected = ProcessInfo.processInfo.systemUptime
         // The record reference scan and fence also apply to an empty round.
@@ -676,6 +686,7 @@ extension CommandRouter {
             cleanup.objects[index]["reader_hold_ids"] = try mediaRoundDeletionReaderHoldIDs(db,object:cleanup.objects[index])
         }
         let cleanupFinished = ProcessInfo.processInfo.systemUptime
+        timing.record("fence_observation")
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         observedIDs.formUnion(owned)
         let workspacePaths = objects.compactMap { object -> String? in
@@ -690,6 +701,7 @@ extension CommandRouter {
         let historyFinished = ProcessInfo.processInfo.systemUptime
         let audit: JSON = ["deleted":true,"round_id":rid,"project_id":project,"actor":c.principal,"actor_kind":c.isOwner ? "owner" : "agent","reason":reason,"counts":counts,"kept_attachments":keptAudit,
             "preparation_seconds":historyFinished-started,"preparation_timings":["graph_seconds":graphFinished-started,"references_seconds":referencesSeconds,"cleanup_seconds":cleanupFinished-historySelected,"history_seconds":historySelected-referencesFinished+historyFinished-cleanupFinished+(parallelHistory?.1 ?? 0)]]
+        result = "complete"
         return .init(version:version,project:project,round:rid,predecessor:predecessor,records:removed,history:history,
                      historyProgress:progress,bytes:cleanup,audit:audit,keptAttachments:keptAttachments,
                      handoffOnlyIDs:handoffOnlyIDs,fence:fence,recordSizes:selectedSizes,batchGraph:batchGraph)
@@ -706,6 +718,7 @@ extension CommandRouter {
         // only headers above 16 KiB. Exact SQL matching admits relevant payloads
         // below the same safe bound; unrelated prose needs no second traversal.
         try self.streamTicketCleanupRows(snapshot,needles:needles.union(deletionTasks),holdDigests:holdDigests,partition:partition) {projected,size in
+            selection.rowsRead += 1
             func projectMatches(_ row: PurgeRow) throws -> Bool {
                 var inventory = TicketCleanupInventory();inventory.needles = needles
                 return try self.ticketCleanupBatchLargeMatch(snapshot,row:row,inventory:inventory)

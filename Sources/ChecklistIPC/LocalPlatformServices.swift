@@ -119,7 +119,9 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         }
         connection.interruptionHandler = { complete(nil, nil) }
         connection.invalidationHandler = { complete(nil, nil) }
+        let resumeStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
         connection.resume()
+        let resumedConnection = timed ? ProcessInfo.processInfo.systemUptime : 0
         defer { connection.invalidate() }
         guard let remote = connection.remoteObjectProxyWithErrorHandler({ error in
             complete(nil, error)
@@ -127,6 +129,12 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         let sent = ProcessInfo.processInfo.systemUptime
         diagnostic["connection_setup_ms"] = (sent-started)*1000
         remote.execute(bytes) { value in complete(value, nil) }
+        if timed {
+            diagnostic["connection_resume_started_uptime_s"] = resumeStarted
+            diagnostic["connection_resumed_uptime_s"] = resumedConnection
+            diagnostic["sent_uptime_s"] = sent
+            diagnostic["execute_returned_uptime_s"] = ProcessInfo.processInfo.systemUptime
+        }
         let deadline: DispatchTime = replyTimeout.map { .now() + max(0, $0) } ?? .distantFuture
         guard semaphore.wait(timeout: deadline) == .success else {
             if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID, outcomeUnknown: true, transportReason: "reply_timeout") }
@@ -135,7 +143,6 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         let resumed = timed ? ProcessInfo.processInfo.systemUptime : 0
         let (received, failure, receivedAt) = outcome.withLock { ($0.response, $0.error, $0.receivedAt) }
         if timed {
-            diagnostic["sent_uptime_s"] = sent
             diagnostic["reply_received_uptime_s"] = receivedAt
             diagnostic["waiter_resumed_uptime_s"] = resumed
         }
