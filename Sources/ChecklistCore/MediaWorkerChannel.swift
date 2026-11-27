@@ -8,12 +8,13 @@ extension CommandRouter {
     static let mediaWorkerMethods = MediaWorkerContract.methods
     static let mediaWorkerReads = MediaWorkerContract.readMethods
 
-    func executeMediaWorkerChannel(method: String,params p: JSON,caller c: Caller) throws -> JSON {
+    func executeMediaWorkerChannel(method: String,params p: JSON,caller c: Caller,expectedAuthorizationGeneration: String? = nil) throws -> JSON {
         guard c.role == "worker",Self.mediaWorkerMethods.contains(method) else {
             throw CoreError("FORBIDDEN","An enrolled worker media command is required.")
         }
         if !Self.mediaWorkerReads.contains(method) {
-            let result = try executeMediaCommand(method:method,params:p,caller:c,workerChannel:true)
+            let result = try executeMediaCommand(method:method,params:p,caller:c,workerChannel:true,
+                expectedAuthorizationGeneration:expectedAuthorizationGeneration)
             // CL-419: a type command answers a closed projection; owner adoption records stay private.
             if method.hasPrefix("media_type_") { return mediaWorkerTypeChange(result) }
             // CL-420: a round closure or successor answers a closed round projection.

@@ -101,13 +101,16 @@ extension CommandRouter {
     /// macOS privacy refuses open(2) and listing of ~/.Trash for a process with no
     /// grant, but allows a path-based mkdir and open of a child, so no code here may
     /// open or list the Trash root (CL-360).
-    func executeStorageBackupPruning(method: String,params: JSON,caller: Caller,trashRoot: URL? = nil,automaticTrigger: String? = nil,observe: (String) throws -> Void = {_ in}) throws -> JSON {
+    func executeStorageBackupPruning(method: String,params: JSON,caller: Caller,trashRoot: URL? = nil,automaticTrigger: String? = nil,
+                                     expectedAuthorizationGeneration: String? = nil,observe: (String) throws -> Void = {_ in}) throws -> JSON {
         let incompleteOnly = Self.storageIncompleteBackupMethods.contains(method)
         let authorityGeneration: String?
         if automaticTrigger != nil {
             guard method == "backup_prune",caller.principal == Self.automaticBackupRetentionCaller.principal else {throw CoreError("FORBIDDEN","Automatic backup retention is an internal service operation.")}
             authorityGeneration = nil
-        } else if incompleteOnly {authorityGeneration = try requireIncompleteBackupAuthority(params:params,caller:caller)}
+        } else if incompleteOnly {
+            authorityGeneration = try requireIncompleteBackupAuthority(params:params,caller:caller,expectedGeneration:expectedAuthorizationGeneration)
+        }
         else {try owner(caller);authorityGeneration = nil}
         if method == "backup_retention_get" {return ["data":try dbQueue.read {db -> JSON in
             var settings = try backupRetentionSettings(db)
@@ -120,7 +123,9 @@ extension CommandRouter {
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
         let digest = hash(Data((method + (try jsonString(params))).utf8))
         do {return try ArchiveStorageGate.withExclusive(root:root) { _ in
-            // Authority can change while waiting for the filesystem gate.
+            // Registration changes also take this gate. Check the admitted
+            // generation here before any Trash move, then keep the gate through
+            // the transaction that retires the moved folders' metadata.
             if incompleteOnly {try requireIncompleteBackupAuthority(params:params,caller:caller,expectedGeneration:authorityGeneration)}
             if let replay = try dbQueue.read({try backupPruneReplay($0,command:command,digest:digest,caller:caller)}) {return replay}
             if method == "backup_retention_set" || method == "backup_pin" {
@@ -243,6 +248,9 @@ extension CommandRouter {
                 catch let error as CoreError where incompleteOnly && error.code == "BACKUP_PRUNE_SOURCE_CHANGED" {var kept = entry;kept["reason"] = "source_changed";kept["keep_reasons"] = ["source_changed"];retained.append(kept)}
             }
             return try dbQueue.write {db in
+                if let authorityGeneration {
+                    _ = try self.backupWriteAuthorization(db,params:params,caller:caller,expectedGeneration:authorityGeneration)
+                }
                 try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                 for entry in moved {
                     if let key = entry["generation_key"] as? String,!key.isEmpty {

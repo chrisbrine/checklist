@@ -645,7 +645,13 @@ extension CommandRouter {
                 }
             } else {try markRunning()}
             commandOperations.executionProbe?(job.id)
-            output = try handle(method:job.method,params:params,caller:job.caller)
+            switch job.method {
+            case "media_round_delete", "epic_delete", "import_rollback", "task_archive", "backup_incomplete_retire":
+                output = try handle(method:job.method,params:params,caller:job.caller,observeOperationWriterWait:nil,
+                                    expectedAuthorizationGeneration:job.generation)
+            default:
+                output = try handle(method:job.method,params:params,caller:job.caller)
+            }
         } catch is MediaRoundDeletionAdmissionDeferred where job.method == "media_round_delete" {return nil}
         catch let error as CoreError {failure = StorageFailureReport.annotated(error)}
         catch {

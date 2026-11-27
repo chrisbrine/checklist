@@ -86,11 +86,12 @@ extension CommandRouter {
     /// All graph work and preview hashing happen on a separate read-only
     /// snapshot. A narrow changed-row fence preserves unrelated service writes,
     /// including eventless/same-revision edits outside the deletion graph.
-    func executeMediaRoundDelete(_ p: JSON,_ c: Caller,command: String,digest: String) throws -> JSON {
+    func executeMediaRoundDelete(_ p: JSON,_ c: Caller,command: String,digest: String,expectedAuthorizationGeneration: String?) throws -> JSON {
         var preparation: TimeInterval = 0, phases: [String:Double] = [:]
         while true {
             if let result = try autoreleasepool(invoking: {
-                try executeMediaRoundDeletionPass(p,c,command:command,digest:digest,preparation:&preparation,phases:&phases)
+                try executeMediaRoundDeletionPass(p,c,command:command,digest:digest,expectedAuthorizationGeneration:expectedAuthorizationGeneration,
+                    preparation:&preparation,phases:&phases)
             }) {return result}
         }
     }
@@ -103,7 +104,8 @@ extension CommandRouter {
         return result
     }
 
-    private func executeMediaRoundDeletionPass(_ p: JSON,_ c: Caller,command: String,digest: String,preparation: inout TimeInterval,phases: inout [String:Double]) throws -> JSON? {
+    private func executeMediaRoundDeletionPass(_ p: JSON,_ c: Caller,command: String,digest: String,expectedAuthorizationGeneration: String?,
+                                               preparation: inout TimeInterval,phases: inout [String:Double]) throws -> JSON? {
         let passStarted = ProcessInfo.processInfo.systemUptime
         var writerTiming: (operation: String, pass: Int, seconds: TimeInterval)?
         var committed = false
@@ -181,6 +183,9 @@ extension CommandRouter {
                     func apply() throws {
                         try self.withValidatedDomainTransaction(db) {
                             let project = try self.mediaAccess(db,p,c,write:true)
+                            if let expectedAuthorizationGeneration {
+                                _ = try self.backupWriteAuthorization(db,params:p,caller:c,expectedGeneration:expectedAuthorizationGeneration)
+                            }
                             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
                             if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[c.principal,command]) {
                                 guard row["digest"] as String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID has a different intent.")}

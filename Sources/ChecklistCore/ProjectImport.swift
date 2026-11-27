@@ -20,7 +20,7 @@ extension CommandRouter {
         try requireAgentEditAuthority(db,project:project,caller:caller)
         return (pid,project)
     }
-    func executeProjectImport(method: String,params: JSON,caller: Caller) throws -> JSON {
+    func executeProjectImport(method: String,params: JSON,caller: Caller,expectedAuthorizationGeneration: String? = nil) throws -> JSON {
         if method == "import_receipt_get" {
             return try readForPreparation {db in
                 let (pid,_) = try importAuthorization(db,params,caller,write:false)
@@ -40,7 +40,10 @@ extension CommandRouter {
             if Self.isPrunedResult(result) {throw Self.expiredCommandError(command)}
             return result.merging(["replayed":true]) {_,new in new}
         }) {return replay}
-        if method == "import_rollback" {return try importTransaction(method:method,params:params,caller:caller,command:command,intent:intent,bundle:nil)}
+        if method == "import_rollback" {
+            return try importTransaction(method:method,params:params,caller:caller,command:command,intent:intent,bundle:nil,
+                expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+        }
         let path = try text(params,"path"),format = try text(params,"source_format"),namespace = try text(params,"source_namespace",max:500)
         if !caller.isOwner {
             guard let workspace = caller.workspace,containsPath(workspace,SafeFileRead.normalizedPrivatePrefix(URL(fileURLWithPath:path).standardizedFileURL.path)) else {throw CoreError("FILE_ACCESS_REQUIRED","Selected import must be inside the enrolled workspace.")}
@@ -63,7 +66,8 @@ extension CommandRouter {
     private func importPreviewDigest(bundle: TransferBundle,destination: String,params: JSON) throws -> String {
         hash(Data((bundle.schema + "\n" + bundle.namespace + "\n" + bundle.sourceHash + "\n" + destination + "\n" + (params["epic_id"] as? String ?? "")).utf8))
     }
-    func importTransaction(method: String,params: JSON,caller: Caller,command: String,intent: String,bundle: TransferBundle?) throws -> JSON {
+    func importTransaction(method: String,params: JSON,caller: Caller,command: String,intent: String,bundle: TransferBundle?,
+                           expectedAuthorizationGeneration: String? = nil) throws -> JSON {
         try ArchiveStorageGate.withExclusive(root:root) { _ in
             // Revalidate after waiting for the gate, before any imported bytes or
             // rows are written. The transaction consumes only this verified read.
@@ -84,6 +88,9 @@ extension CommandRouter {
                 var output: JSON = [:]
                 try withValidatedDomainTransaction(db) {
                     let (pid,project) = try importAuthorization(db,params,caller,write:true)
+                    if let expectedAuthorizationGeneration {
+                        _ = try backupWriteAuthorization(db,params:params,caller:caller,expectedGeneration:expectedAuthorizationGeneration)
+                    }
                     try requirePendingCommandIntent(db,command:command,digest:intent,caller:caller)
                     if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
                         guard row["digest"] as String == intent else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID belongs to another intent.")}

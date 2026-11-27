@@ -21,6 +21,18 @@ final class CommandOperationTests: XCTestCase {
         }
         deinit {release()}
     }
+    private struct MediaHistoryState: Equatable {
+        let passes: Int
+        let remainingCommands: Int
+        let roundEvents: Int
+        let redactedEvents: Int
+    }
+    private final class MediaRotationObservation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var observed: MediaHistoryState?
+        func record(_ state: MediaHistoryState) {lock.withLock {observed = state}}
+        var state: MediaHistoryState? {lock.withLock {observed}}
+    }
     private func data(_ reply: JSON) throws -> JSON {try XCTUnwrap(reply["data"] as? JSON)}
     private func assertPublicMetadata(_ value: JSON,file: StaticString = #filePath,line: UInt = #line) {
         for key in ["digest","principal","caller","authorization_generation","incarnation","recoverable","reply_write_admission","purge_uses_store_epoch"] {
@@ -418,15 +430,19 @@ final class CommandOperationTests: XCTestCase {
         XCTAssertEqual(try data(f.call("task_archive",input,command:command))["operation_id"] as? String,try data(archived)["operation_id"] as? String)
     }
 
-    func testImportPreviewAndCommitKeepTheirFinalDomainReplies() throws {
-        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+    private func importInput(_ f: StorageFixture,project pid: String) throws -> JSON {
         let directory = f.workspace.appendingPathComponent("import")
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
         let document: JSON = ["format":"synthetic-board/1","items":[["id":"OP-1","title":"Operation import","state":"queued"]],"events":[]]
         try JSONSerialization.data(withJSONObject:document,options:.sortedKeys).write(to:directory.appendingPathComponent("bundle.json"))
         let epic = try f.router!.dbQueue.read {try f.router!.records($0,type:"group",project:pid).first {$0["kind"] as? String == "epic"}!}
         let current = try f.router!.dbQueue.read {try f.router!.record($0,pid,type:"project")}
-        var input: JSON = ["project_id":pid,"path":directory.path,"source_format":"synthetic-board/1","source_namespace":"operation-fixture","expected_revision":current["revision"]!,"epic_id":epic["id"]!]
+        return ["project_id":pid,"path":directory.path,"source_format":"synthetic-board/1","source_namespace":"operation-fixture","expected_revision":current["revision"]!,"epic_id":epic["id"]!]
+    }
+
+    func testImportPreviewAndCommitKeepTheirFinalDomainReplies() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String
+        var input = try importInput(f,project:pid)
         let previewLane = HeldLane(f.router!);defer {previewLane.finish()}
         let pc = uuid();input["command_id"] = pc
         let accepted = try f.call("import_preview",input,command:pc)
@@ -706,6 +722,234 @@ final class CommandOperationTests: XCTestCase {
         }
         XCTAssertThrowsError(try read(f,accepted,project:pid,caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")}
         XCTAssertThrowsError(try f.call("attachment_cleanup_preview",input,command:command,caller:worker)) {XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")}
+    }
+
+    private func enrolledWorker(_ f: StorageFixture,project: String,registrationProject: String? = nil) throws -> Caller {
+        let installation = "operation-generation-worker"
+        let session = try data(f.call("session_register",["project_id":registrationProject ?? project,"project_ids":[project],"label":"Operation worker",
+            "provider":"codex","role":"worker","installation":installation,"workspace":f.workspace.path]))
+        return Caller(role:"worker",installation:installation,projectIDs:[project],
+            sessionID:try XCTUnwrap(session["id"] as? String),workspace:f.workspace.path)
+    }
+
+    private static func rotateRegistration(_ router: CommandRouter,project: String,worker: Caller,owner: Caller,
+                                           registrationProject: String? = nil) throws {
+        let params = ["project_id":project]
+        let before = try XCTUnwrap(router.backupWriteAuthorization(params:params,caller:worker))
+        let reply = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":registrationProject ?? project,
+            "session_id":try XCTUnwrap(worker.sessionID),"provider":"codex","role":"worker",
+            "installation":worker.installation,"workspace":try XCTUnwrap(worker.workspace)],caller:owner)
+        let registration = try XCTUnwrap(reply["data"] as? JSON)
+        XCTAssertEqual(registration["state"] as? String,"connected")
+        XCTAssertNotEqual(try router.backupWriteAuthorization(params:params,caller:worker),before)
+    }
+
+    private func assertRotatedOperationFailed(_ f: StorageFixture,project: String,worker: Caller,
+                                              method: String,input: JSON,command: String,accepted: JSON) throws {
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String),router = try XCTUnwrap(f.router)
+        try router.dbQueue.read {db in
+            let record = try XCTUnwrap(router.operationRecord(db,id:id))
+            let terminal = try router.operationPayload(db,record,caller:worker)
+            XCTAssertEqual(terminal["state"] as? String,"failed")
+            XCTAssertNotNil(terminal["started_at"])
+            XCTAssertNotNil(terminal["finished_at"])
+            XCTAssertEqual(terminal["command_id"] as? String,command)
+            XCTAssertEqual((terminal["error"] as? JSON)?["code"] as? String,"CONNECTION_REVOKED")
+            XCTAssertFalse(bool(record,"recoverable"))
+            XCTAssertFalse(bool(record,"outcome_unknown"))
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM commands WHERE principal=? AND command_id=?",arguments:[worker.principal,command]),0)
+        }
+        XCTAssertThrowsError(try f.call("command_status",["project_id":project,"command_id":command],caller:worker)) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")
+        }
+        XCTAssertThrowsError(try f.call(method,input,command:command,caller:worker)) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")
+        }
+    }
+
+    private func runWithRegistrationRotation(_ f: StorageFixture,project: String,worker: Caller,method: String,input: JSON,
+                                              registrationProject: String? = nil) throws {
+        let router = try XCTUnwrap(f.router),lane = HeldLane(router),command = uuid()
+        let accepted = try f.call(method,input,command:command,caller:worker)
+        XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+        let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+        defer {router.commandOperations.executionProbe = nil}
+        router.commandOperations.executionProbe = { observed in
+            guard observed == id else {return}
+            do {
+                XCTAssertEqual(try self.read(f,accepted,project:project,caller:worker)["state"] as? String,"running")
+                try Self.rotateRegistration(router,project:project,worker:worker,owner:f.owner,registrationProject:registrationProject)
+            } catch {XCTFail("Could not rotate the running operation's registration: \(error)")}
+        }
+        lane.finish()
+        try assertRotatedOperationFailed(f,project:project,worker:worker,method:method,input:input,command:command,accepted:accepted)
+    }
+
+    func testRunningMediaDeletionRejectsRotatedGenerationAtHistoryAndFinalWriters() throws {
+        let checks = MediaRoundDeletionTests()
+        for rotateBeforeFinal in [false,true] {
+            let media = try MediaFrozenIntakeTests.Fixture(),f = try XCTUnwrap(media.storage)
+            let router = try XCTUnwrap(media.router),project = media.project
+            let round = try checks.cancel(media,media.round(media.type(checks.checks.schema())))
+            let roundID = try XCTUnwrap(round["id"] as? String)
+            let worker = try enrolledWorker(f,project:project),owner = f.owner
+            let historyCount = MediaRoundDeletionHistory.entryLimit + 1
+            let progressKey = try MediaRoundDeletionHistory.progressKey(project:project,round:roundID)
+            try router.dbQueue.write {db in
+                try db.execute(sql:"""
+                    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?)
+                    INSERT INTO commands(principal,command_id,digest,result)
+                    SELECT 'fixture-rotation-history',printf('00000000-0000-0000-0000-%012d',i),'fixture',json_object('round_id',?) FROM n
+                    """,arguments:[historyCount,roundID])
+            }
+            @Sendable func historyState() throws -> MediaHistoryState {
+                try router.dbQueue.read {db in
+                    let passes = try Int.fetchOne(db,sql:"SELECT CAST(value AS INTEGER) FROM metadata WHERE key=?",arguments:[progressKey]) ?? 0
+                    let remaining = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM commands WHERE principal='fixture-rotation-history' AND result<>?",arguments:[CommandRouter.prunedResult]) ?? 0
+                    let events = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM events WHERE project_id=? AND entity_id=?",arguments:[project,roundID]) ?? 0
+                    let redacted = try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM events WHERE project_id=? AND kind=?",arguments:[project,MediaRoundDeletionHistory.redactedEventKind]) ?? 0
+                    return MediaHistoryState(passes:passes,remainingCommands:remaining,roundEvents:events,redactedEvents:redacted)
+                }
+            }
+            let atRotation = MediaRotationObservation()
+            let lane = HeldLane(router),command = uuid()
+            let input = try checks.input(media,round).merging(["project_id":project]) {current,_ in current}
+            let accepted = try f.call("media_round_delete",input,command:command,caller:worker)
+            XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+            let id = try XCTUnwrap(data(accepted)["operation_id"] as? String)
+            router.mediaRoundDeletionPreparationProbe = {
+                guard atRotation.state == nil else {return}
+                let state = try historyState()
+                if rotateBeforeFinal {
+                    guard state.passes > 0,state.remainingCommands <= MediaRoundDeletionHistory.passLimit else {return}
+                } else {
+                    XCTAssertEqual(state.passes,0)
+                    XCTAssertEqual(state.remainingCommands,historyCount)
+                }
+                atRotation.record(state)
+                let running = try router.handle(method:"operation_get",params:["project_id":project,"operation_id":id],caller:worker)
+                XCTAssertEqual((running["data"] as? JSON)?["state"] as? String,"running")
+                try Self.rotateRegistration(router,project:project,worker:worker,owner:owner)
+            }
+            lane.finish()
+            router.mediaRoundDeletionPreparationProbe = nil
+            try assertRotatedOperationFailed(f,project:project,worker:worker,method:"media_round_delete",input:input,command:command,accepted:accepted)
+            XCTAssertEqual(try historyState(),try XCTUnwrap(atRotation.state),"The refused writer may neither advance history nor remove the round")
+            XCTAssertEqual(try media.get(round)["state"] as? String,"canceled")
+            checks.checks.checkError("NOT_FOUND") {try checks.deletion(media,round)}
+
+            let current = rotateBeforeFinal ? f.owner : worker
+            let fresh = try f.call("media_round_delete",input,caller:current)
+            lane.finish()
+            let complete = try read(f,fresh,project:project,caller:current)
+            XCTAssertEqual(complete["state"] as? String,"succeeded")
+            XCTAssertEqual(try data(XCTUnwrap(complete["result"] as? JSON))["deleted"] as? Bool,true)
+            checks.checks.checkError("NOT_FOUND") {try media.get(round)}
+            let finished = try historyState()
+            XCTAssertEqual(finished.passes,0)
+            XCTAssertEqual(finished.remainingCommands,0)
+        }
+    }
+
+    func testRunningEpicDeletionRejectsRotatedGenerationAndAcceptsCurrentWorkerAndOwner() throws {
+        let f = try StorageFixture(),project = try f.project(),pid = try XCTUnwrap(project["id"] as? String)
+        let worker = try enrolledWorker(f,project:pid),router = try XCTUnwrap(f.router)
+        func epicInput() throws -> JSON {
+            let epic = try data(f.call("epic_create",["project_id":pid,"name":"Unused synthetic Epic"]))
+            return ["project_id":pid,"epic_id":try XCTUnwrap(epic["id"]),"expected_revision":try XCTUnwrap(epic["revision"])]
+        }
+        let input = try epicInput()
+        try runWithRegistrationRotation(f,project:pid,worker:worker,method:"epic_delete",input:input)
+        let epicID = try XCTUnwrap(input["epic_id"] as? String)
+        XCTAssertEqual(try router.dbQueue.read {try router.scoped($0,epicID,pid,type:"group")["revision"] as? Int},input["expected_revision"] as? Int)
+        let lane = HeldLane(router)
+        let current = try f.call("epic_delete",input,caller:worker)
+        let owner = try f.call("epic_delete",epicInput())
+        lane.finish()
+        XCTAssertEqual(try read(f,current,project:pid,caller:worker)["state"] as? String,"succeeded")
+        _ = try assertSucceeded(f,owner,project:pid)
+    }
+
+    func testRunningArchiveCleanupRejectsRotatedGenerationWithoutEnqueuingCleanup() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = try XCTUnwrap(project["id"] as? String)
+        let worker = try enrolledWorker(f,project:pid),router = try XCTUnwrap(f.router)
+        let settings = try router.dbQueue.read {try router.record($0,pid,type:"project")}
+        _ = try f.call("archive_storage_settings",["project_id":pid,"expected_revision":settings["revision"]!,
+            "settings_revision":settings["settings_revision"]!,"archive_storage":["preset":"clean_large_managed_on_archive","large_original_bytes":1,"retained_budget_bytes":0]])
+        func archiveInput() throws -> JSON {
+            let task = try f.task(project),tid = try XCTUnwrap(task["id"] as? String)
+            let source = f.workspace.appendingPathComponent("archive-\(tid).txt")
+            try Data("Archive cleanup fixture \(tid)".utf8).write(to:source)
+            _ = try f.call("attachment_add",["project_id":pid,"task_id":tid,"path":source.path])
+            let preview = try data(f.call("attachment_cleanup_preview",["project_id":pid,"task_id":tid]))
+            XCTAssertGreaterThan(int(preview,"clean_bytes"),0)
+            return ["project_id":pid,"task_id":tid,"expected_revision":task["revision"]!,
+                "cleanup":true,"cleanup_preview_id":try XCTUnwrap(preview["cleanup_preview_id"])]
+        }
+        let input = try archiveInput(),ownerInput = try archiveInput()
+        let tid = try XCTUnwrap(input["task_id"] as? String)
+        try runWithRegistrationRotation(f,project:pid,worker:worker,method:"task_archive",input:input)
+        try router.dbQueue.read {db in
+            XCTAssertFalse(bool(try router.scoped(db,tid,pid,type:"task"),"archived"))
+            XCTAssertTrue(try router.records(db,type:"cleanup_job",project:pid).isEmpty)
+        }
+        let lane = HeldLane(router)
+        let current = try f.call("task_archive",input,caller:worker)
+        let owner = try f.call("task_archive",ownerInput)
+        lane.finish()
+        XCTAssertEqual(try read(f,current,project:pid,caller:worker)["state"] as? String,"succeeded")
+        _ = try assertSucceeded(f,owner,project:pid)
+        XCTAssertEqual(try router.dbQueue.read {try router.records($0,type:"cleanup_job",project:pid).count},2)
+    }
+
+    func testRunningImportRollbackRejectsRotatedGenerationAndAcceptsCurrentWorkerAndOwner() throws {
+        for route in ["rotated worker","current worker","owner"] {
+            let f = try StorageFixture(fast:true),project = try f.project(),pid = try XCTUnwrap(project["id"] as? String)
+            // A registration in another granted project rotates the generation
+            // without invalidating the imported project's rollback digest.
+            let registrationWorkspace = f.base.appendingPathComponent("registration-workspace")
+            try FileManager.default.createDirectory(at:registrationWorkspace,withIntermediateDirectories:true)
+            let registrationProject = try data(f.call("project_create",["name":"Worker registration","key_prefix":"REG","root_path":registrationWorkspace.path]))
+            let registrationID = try XCTUnwrap(registrationProject["id"] as? String)
+            let worker = try enrolledWorker(f,project:pid,registrationProject:registrationID),router = try XCTUnwrap(f.router)
+            var imported = try importInput(f,project:pid)
+            imported["preview_digest"] = try data(f.call("import_preview",imported))["preview_digest"]
+            let receipt = try data(f.call("import_commit",imported))
+            let rid = try XCTUnwrap(receipt["receipt_id"] as? String)
+            let input: JSON = ["project_id":pid,"receipt_id":rid,"expected_revision":1]
+            let caller = route == "owner" ? f.owner : worker
+            if route == "rotated worker" {
+                let before = try router.dbQueue.read {try router.importDestinationDigest($0,pid)}
+                try runWithRegistrationRotation(f,project:pid,worker:worker,method:"import_rollback",input:input,registrationProject:registrationID)
+                XCTAssertEqual(try router.dbQueue.read {try router.importDestinationDigest($0,pid)},before)
+            } else {
+                let lane = HeldLane(router)
+                let accepted = try f.call("import_rollback",input,caller:caller)
+                lane.finish()
+                XCTAssertEqual(try read(f,accepted,project:pid,caller:caller)["state"] as? String,"succeeded",route)
+            }
+            try router.dbQueue.read {db in
+                let stale = route == "rotated worker"
+                XCTAssertEqual(try router.scoped(db,rid,pid,type:"import_receipt")["state"] as? String,stale ? "committed" : "rolled_back",route)
+                XCTAssertEqual(try router.records(db,type:"task",project:pid).count,stale ? 1 : 0,route)
+            }
+        }
+    }
+
+    func testRunningIncompleteBackupRetirementRejectsRotatedGeneration() throws {
+        let f = try StorageFixture(fast:true),project = try f.project(),pid = try XCTUnwrap(project["id"] as? String)
+        let worker = try enrolledWorker(f,project:pid),router = try XCTUnwrap(f.router)
+        let preview = try data(f.call("backup_incomplete_preview",["project_id":pid],caller:worker))
+        XCTAssertEqual(preview["incomplete_count"] as? Int,0)
+        let input: JSON = ["project_id":pid,"preview_sha256":try XCTUnwrap(preview["preview_sha256"])]
+        try runWithRegistrationRotation(f,project:pid,worker:worker,method:"backup_incomplete_retire",input:input)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM metadata WHERE key GLOB 'backup-prune-intent:*'")},0)
+        let lane = HeldLane(router)
+        let current = try f.call("backup_incomplete_retire",input,caller:worker)
+        let owner = try f.call("backup_incomplete_retire",input)
+        lane.finish()
+        XCTAssertEqual(try read(f,current,project:pid,caller:worker)["state"] as? String,"succeeded")
+        _ = try assertSucceeded(f,owner,project:pid)
     }
     func testConcurrentDifferentIntentsCannotOwnBothAdmissionJournals() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),task = try f.task(project),pid = project["id"] as! String,router = f.router!

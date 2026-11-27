@@ -7,9 +7,11 @@ extension CommandRouter {
     /// Internal domain seam; CL-116 exposes only its explicit native-owner allowlist.
     /// Capture/holds are composed internally; public activation still needs the complete
     /// owner UI/rendering/query/rework slice and its native qualification.
-    func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false,workerChannel: Bool = false) throws -> JSON {
+    func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false,workerChannel: Bool = false,
+                             expectedAuthorizationGeneration: String? = nil) throws -> JSON {
         do {
-            return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection,workerChannel:workerChannel)
+            return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection,
+                workerChannel:workerChannel,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
         } catch let error as MediaSchemaError {
             // Portable schema helpers have no transport error codes. Translate at
             // the command boundary, including resource and canonical preparation.
@@ -66,7 +68,8 @@ extension CommandRouter {
         "media_round_successor":["source_round_id","expected_revision","observed_context_token","manifest_id","manifest_digest","title","items"]
         ]
 
-    private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool,workerChannel: Bool) throws -> JSON {
+    private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool,workerChannel: Bool,
+                                              expectedAuthorizationGeneration: String?) throws -> JSON {
         let reads = CommandMethods.mediaInternalReads
         guard let fields = Self.mediaCommandFields[method],Set(p.keys).isSubset(of:fields.union(["command_id",
             "project_id"])) else { throw CoreError("INVALID_INPUT","Unknown internal media command or fields.") }
@@ -92,7 +95,9 @@ extension CommandRouter {
         let command = try text(p,"command_id",max:100)
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data((method + (try jsonString(p))).utf8))
-        if method == "media_round_delete" {return try executeMediaRoundDelete(p,c,command:command,digest:digest)}
+        if method == "media_round_delete" {
+            return try executeMediaRoundDelete(p,c,command:command,digest:digest,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+        }
         // Rework capture writes ordinary tickets, which the media-only preparation cannot hold.
         if ["media_rework_create","media_round_send_result"].contains(method) {
             return try mediaTicketCommand(method:method,params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)

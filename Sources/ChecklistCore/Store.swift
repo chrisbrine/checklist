@@ -516,7 +516,8 @@ public final class CommandRouter: @unchecked Sendable {
             }
             defer {if writerRead {backupWrites.finishWrite()}}
             do {
-                let value = try executeMediaWorkerChannel(method:method,params:params,caller:caller)
+                let value = try executeMediaWorkerChannel(method:method,params:params,caller:caller,
+                    expectedAuthorizationGeneration:expectedAuthorizationGeneration)
                 var reply: JSON = ["data":value]
                 if !Self.mediaWorkerReads.contains(method) { reply["command_id"] = params["command_id"] }
                 return reply
@@ -552,7 +553,10 @@ public final class CommandRouter: @unchecked Sendable {
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
         if Self.storageRestoreMethods.contains(method) {return try executeStorageRestore(method:method,params:params,caller:caller)}
-        if Self.storageBackupPruningMethods.contains(method) {return try executeStorageBackupPruning(method:method,params:params,caller:caller)}
+        if Self.storageBackupPruningMethods.contains(method) {
+            return try executeStorageBackupPruning(method:method,params:params,caller:caller,
+                expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+        }
         if Self.projectImportMethods.contains(method) {
             let writerRead = Self.readMethods.contains(method) && readers == nil
             if writerRead {
@@ -562,7 +566,8 @@ public final class CommandRouter: @unchecked Sendable {
                 }
             }
             defer {if writerRead {backupWrites.finishWrite()}}
-            return try executeProjectImport(method:method,params:params,caller:caller)
+            return try executeProjectImport(method:method,params:params,caller:caller,
+                expectedAuthorizationGeneration:expectedAuthorizationGeneration)
         }
         if method == "task_purge_preview" {
             guard let readers else {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","A purge preview needs a separate read lane. Retry the preview.")}
