@@ -77,7 +77,7 @@ extension CommandRouter {
         let predicate: String
         let order: String
         if surface == "activity" {
-            select = "SELECT e.id,e.project_id,e.entity_id,e.actor,e.kind,e.occurred_at,e.data FROM events e WHERE e.project_id IN (SELECT value FROM json_each(:projects)) AND (:query='' OR checklist_contains(e.kind,:query))"
+            select = "SELECT e.id,e.project_id,e.entity_id,e.actor,e.kind,e.occurred_at,e.data FROM events e WHERE e.project_id IN (SELECT value FROM json_each(:projects)) AND e.kind<>'\(MediaRoundDeletionHistory.redactedEventKind)' AND (:query='' OR checklist_contains(e.kind,:query))"
             predicate = "";order = " ORDER BY e.seq DESC"
         } else {
             var filter = "r.project_id IN (SELECT value FROM json_each(:projects))"

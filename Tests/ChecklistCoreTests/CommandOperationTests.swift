@@ -264,6 +264,67 @@ final class CommandOperationTests: XCTestCase {
         return finished
     }
 
+    func testMediaRoundDeletionYieldsToBackupAndResumesTheSameOperation() throws {
+        let checks = MediaRoundDeletionTests(),f = try MediaFrozenIntakeTests.Fixture()
+        let round = try checks.cancel(f,f.round(f.type(MediaRoundTests().schema())))
+        let router = f.router!,deletionQueue = DispatchQueue(label:"test-media-deletion-capture")
+        let registration = try f.record(f.worker.sessionID!,"session")
+        let worker = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),
+                            projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        router.configureCommandOperations(on:DispatchQueue(label:"test-other-operations"),mediaRoundDeletionQueue:deletionQueue)
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.mediaRoundDeletionPreparationProbe = {
+            entered.signal()
+            guard release.wait(timeout:.now()+15) == .success else {
+                throw CoreError("TEST_TIMEOUT","Paused deletion was not released.")
+            }
+        }
+        func drainDeletionLane() {
+            let drained = DispatchSemaphore(value:0)
+            deletionQueue.async {drained.signal()}
+            XCTAssertEqual(drained.wait(timeout:.now()+15),.success)
+        }
+        defer {release.signal();release.signal();drainDeletionLane();router.mediaRoundDeletionPreparationProbe = nil}
+        var input = try checks.input(f,round)
+        input["project_id"] = f.project;input["command_id"] = uuid()
+        let accepted = try data(router.handle(method:"media_round_delete",params:input,caller:worker))
+        let operationID = try XCTUnwrap(accepted["operation_id"] as? String)
+        func status() throws -> JSON {
+            try data(router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":operationID],caller:worker))
+        }
+        guard entered.wait(timeout:.now()+15) == .success else {return XCTFail("Deletion did not reach its read snapshot")}
+        let capture = DispatchSemaphore(value:0)
+        DispatchQueue.global().async {
+            do {try router.backupWrites.beginCapture()} catch {XCTFail("Capture could not start: \(error)")}
+            capture.signal()
+        }
+        let acquiredBeforeRelease = capture.wait(timeout:.now()+5) == .success
+        release.signal()
+        if !acquiredBeforeRelease {
+            XCTAssertEqual(capture.wait(timeout:.now()+15),.success)
+        }
+        XCTAssertTrue(acquiredBeforeRelease,"Read-only preparation held backup write admission")
+        defer {router.backupWrites.endBackup(router:router);router.resumeCommandOperations()}
+        guard acquiredBeforeRelease else {return}
+        drainDeletionLane()
+        let paused = try status()
+        XCTAssertEqual(paused["state"] as? String,"running")
+        let startedAt = try XCTUnwrap(paused["started_at"] as? String)
+        let stillPresent = try data(router.handle(method:"media_round_get",params:["project_id":f.project,"round_id":input["round_id"]!],caller:worker))
+        XCTAssertEqual(stillPresent["state"] as? String,"canceled")
+
+        router.backupWrites.endCapture(router:router)
+        router.resumeCommandOperations()
+        guard entered.wait(timeout:.now()+15) == .success else {return XCTFail("Original deletion did not resume after capture")}
+        release.signal()
+        drainDeletionLane()
+        let completed = try status()
+        XCTAssertEqual(completed["state"] as? String,"succeeded")
+        XCTAssertEqual(completed["started_at"] as? String,startedAt)
+        let result = try XCTUnwrap(completed["result"] as? JSON)
+        XCTAssertEqual((result["data"] as? JSON)?["deleted"] as? Bool,true)
+    }
+
     func testMediaRoundDeleteReplayKeepsFirstInterruptedOutcome() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String,router = f.router!
         let lane = HeldLane(router);defer {lane.finish()}

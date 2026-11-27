@@ -7,7 +7,7 @@ extension CommandRouter {
     /// A copy keeps its incarnation, so that alone cannot authorize a destination.
     /// Legacy destinations without a root binding stay unavailable; never adopt
     /// them by stamping the copy's current root onto historical authority.
-    func mediaCleanupTrashBindingFailure(_ receipt: JSON) -> String? {
+    func mediaCleanupTrashBindingFailure(_ receipt: JSON,allowUnboundPageTargets: Bool = false) -> String? {
         let objects = receipt["objects"] as? [JSON] ?? []
         let pending = objects.filter {$0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"}
         guard !pending.isEmpty else {return nil}
@@ -21,8 +21,9 @@ extension CommandRouter {
         guard name == folder || name.hasPrefix(folder + "-") && UUID(uuidString:String(name.dropFirst(folder.count + 1))) != nil else {return "trash_intent_invalid"}
         for object in pending {
             guard let path = object["relative_path"] as? String,path.hasPrefix("objects/"),
-                  (try? StorageObjectFiles.parts(path)) != nil,object["kind"] as? String == "file",
-                  let target = object["trash_path"] as? String else {return "trash_intent_invalid"}
+                  (try? StorageObjectFiles.parts(path)) != nil,object["kind"] as? String == "file" else {return "trash_intent_invalid"}
+            if allowUnboundPageTargets,object["trash_path"] == nil {continue}
+            guard let target = object["trash_path"] as? String else {return "trash_intent_invalid"}
             let expected = directory.appendingPathComponent(hash(Data(path.utf8)) + "-" + URL(fileURLWithPath:path).lastPathComponent).path
             guard Data(target.utf8) == Data(expected.utf8) else {return "trash_intent_invalid"}
         }
@@ -38,17 +39,30 @@ extension CommandRouter {
               let pid = attachment["project_id"] as? String,let stored = attachment["path"] as? String,
               let sha = attachment["sha256"] as? String,let size = (attachment["size"] as? NSNumber)?.int64Value else {return false}
         let path = try managedRelative(stored,family:"objects")
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.kind')=? AND json_type(data,'$.media_trash_directory')='text' AND EXISTS (SELECT 1 FROM json_each(records.data,'$.objects') o WHERE json_extract(o.value,'$.disposal')='trash' AND json_extract(o.value,'$.representation')='original' AND json_extract(o.value,'$.state') IN ('pending','removed','already_missing') AND json_extract(o.value,'$.relative_path')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(o.value,'$.sha256')=? AND json_extract(o.value,'$.size')=? AND EXISTS (SELECT 1 FROM json_each(o.value,'$.owner_ids') owner WHERE CAST(owner.value AS BLOB)=CAST(? AS BLOB)))",arguments:[Data(pid.utf8),Self.ticketObjectDeletionKind,Data(path.utf8),sha,size,Data(id.utf8)])
-        for row in rows {
-            let receipt = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
-            guard let directory = receipt["media_trash_directory"] as? String else {continue}
+        let rows = try Row.fetchCursor(db,sql:"""
+            WITH parents AS (
+                SELECT id,project_id,data FROM records
+                WHERE type='storage_job' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.kind')=?
+                AND json_type(data,'$.media_trash_directory')='text'
+            ), descriptors AS (
+                SELECT json_extract(parent.data,'$.media_trash_directory') AS directory,o.value AS object
+                FROM parents parent,json_each(parent.data,'$.objects') o
+                WHERE json_extract(parent.data,'$.descriptor_page_generation') IS NULL
+                UNION ALL
+                SELECT json_extract(parent.data,'$.media_trash_directory') AS directory,o.value AS object
+                FROM parents parent JOIN records page ON \(TicketCleanupDescriptorPages.activeSQL),json_each(page.data,'$.objects') o
+            )
+            SELECT directory,json_extract(object,'$.trash_path') AS target FROM descriptors
+            WHERE json_extract(object,'$.disposal')='trash' AND json_extract(object,'$.representation')='original'
+              AND json_extract(object,'$.state') IN ('pending','removed','already_missing')
+              AND json_extract(object,'$.relative_path')=CAST(? AS TEXT) COLLATE BINARY
+              AND json_extract(object,'$.sha256')=? AND json_extract(object,'$.size')=?
+              AND EXISTS(SELECT 1 FROM json_each(object,'$.owner_ids') owner WHERE CAST(owner.value AS BLOB)=CAST(? AS BLOB))
+            """,arguments:[Data(pid.utf8),Self.ticketObjectDeletionKind,Data(path.utf8),sha,size,Data(id.utf8)])
+        while let row = try rows.next() {
+            guard let directory: String = row["directory"],let target: String = row["target"] else {continue}
             let expected = URL(fileURLWithPath:directory,isDirectory:true).appendingPathComponent(hash(Data(path.utf8)) + "-" + URL(fileURLWithPath:path).lastPathComponent).path
-            if (receipt["objects"] as? [JSON] ?? []).contains(where:{object in
-                object["disposal"] as? String == "trash" && object["representation"] as? String == "original" &&
-                ["pending","removed","already_missing"].contains(object["state"] as? String ?? "") &&
-                object["relative_path"] as? String == path && object["sha256"] as? String == sha &&
-                (object["size"] as? NSNumber)?.int64Value == size && strings(object,"owner_ids").contains(id) && object["trash_path"] as? String == expected
-            }) {return true}
+            if Data(target.utf8) == Data(expected.utf8) {return true}
         }
         return false
     }
@@ -56,10 +70,10 @@ extension CommandRouter {
     /// The durable deletion receipt names its exact same-volume Trash entry
     /// before the existing executor can move bytes. A restart reuses that name.
     /// The optional root is an internal owned-fixture seam, never client input.
-    func prepareMediaCleanupTrash(_ db: Database,receipt original: JSON) throws -> JSON {
+    func prepareMediaCleanupTrash(_ db: Database,receipt original: JSON,page: TicketBytePageExecution? = nil) throws -> JSON {
         var receipt = original,objects = receipt["objects"] as? [JSON] ?? []
         guard objects.contains(where:{$0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"}) else {return receipt}
-        if let reason = mediaCleanupTrashBindingFailure(receipt) {throw CoreError("CLEANUP_TRASH_INVALID","The retained Trash intent has no current instance authority; originals retained.",details:["reason":reason])}
+        if let reason = mediaCleanupTrashBindingFailure(receipt,allowUnboundPageTargets:page != nil && !bool(receipt,"descriptor_legacy_trash_binding")) {throw CoreError("CLEANUP_TRASH_INVALID","The retained Trash intent has no current instance authority; originals retained.",details:["reason":reason])}
         let id = try StoredRecord(receipt,family:"storage_job").string("id")
         let folderName = "Checklist-media-" + hash(Data((incarnation + ":" + id).utf8))
         let marker: JSON = ["receipt_id":id,"source_root":root.path,"incarnation":incarnation]
@@ -106,7 +120,11 @@ extension CommandRouter {
         if changed {
             receipt["media_trash_directory"] = directory.path;receipt["media_trash_source_root"] = root.path
             receipt["objects"] = objects;receipt = revised(receipt)
-            try withValidatedDomainTransaction(db) {try self.save(db,receipt,type:"storage_job");return .commit}
+            try withValidatedDomainTransaction(db) {
+                if let page {receipt = try self.saveTicketBytePage(db,receipt:receipt,execution:page)}
+                else {try self.save(db,receipt,type:"storage_job")}
+                return .commit
+            }
         }
         return receipt
     }

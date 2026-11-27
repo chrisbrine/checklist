@@ -208,7 +208,7 @@ extension CommandRouter {
         let groups = try (result["groups"] as? [JSON] ?? []).map {try groupProjection(db,$0)};result["groups"] = groups
         result["triages"] = groups.filter { $0["kind"] as? String == "triage" }; result["epics"] = groups.filter { $0["kind"] as? String == "epic" }
         result["messages"] = try SnapshotMessageProjection.hydrate(records(db,type:"message"), loadDeliveries: { try records(db,type:"delivery").map {try deliveryReceiptProjection(db,$0)} })
-        result["events"] = try Row.fetchAll(db,sql:"SELECT id,project_id,entity_id,actor,kind,occurred_at,data FROM events ORDER BY seq DESC LIMIT 200").map { row -> JSON in ["id":row["id"] as String,"project_id":row["project_id"] as String? ?? "","entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])] }
+        result["events"] = try Row.fetchAll(db,sql:"SELECT id,project_id,entity_id,actor,kind,occurred_at,data FROM events WHERE kind<>? ORDER BY seq DESC LIMIT 200",arguments:[MediaRoundDeletionHistory.redactedEventKind]).map { row -> JSON in ["id":row["id"] as String,"project_id":row["project_id"] as String? ?? "","entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])] }
         result["service"] = try dispatch(db,method:"service_info",p:[:],c:c)
         return result
     }

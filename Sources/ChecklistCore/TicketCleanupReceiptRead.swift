@@ -32,7 +32,24 @@ extension CommandRouter {
             result = try ticketCleanupReceiptSummary(db,id:id,project:pid)
             let sql: String
             if section == "objects" {
-                sql = "SELECT json_object('byte_deletion_receipt_id',j.id,'item_index',i.key,'object_index',o.key,'object',json(o.value)) value FROM records r,json_each(r.data,'$.items') i JOIN records j ON j.id=json_extract(i.value,'$.byte_deletion_receipt_id') AND j.project_id=r.project_id AND j.type='storage_job',json_each(j.data,'$.objects') o WHERE r.id=? ORDER BY i.key,o.key LIMIT ? OFFSET ?"
+                sql = """
+                    WITH linked AS (
+                        SELECT parent.id,parent.project_id,parent.data,i.key AS item_index
+                        FROM records r,json_each(r.data,'$.items') i
+                        JOIN records parent ON parent.id=json_extract(i.value,'$.byte_deletion_receipt_id') AND parent.project_id=r.project_id AND parent.type='storage_job'
+                        WHERE r.id=?
+                    ), descriptors AS (
+                        SELECT parent.id,parent.item_index,o.key AS object_index,o.value
+                        FROM linked parent,json_each(parent.data,'$.objects') o
+                        WHERE json_extract(parent.data,'$.descriptor_page_generation') IS NULL
+                        UNION ALL
+                        SELECT parent.id,parent.item_index,json_extract(page.data,'$.page_offset')+o.key AS object_index,o.value
+                        FROM linked parent JOIN records page ON \(TicketCleanupDescriptorPages.activeSQL),json_each(page.data,'$.objects') o
+                    )
+                    SELECT json_object('byte_deletion_receipt_id',id,'item_index',item_index,'object_index',object_index,'object',json(value)) value
+                    FROM descriptors ORDER BY item_index,object_index LIMIT ? OFFSET ?
+                    """
+
             } else {
                 sql = "SELECT i.value value FROM records r,json_each(r.data,'$.\(section)') i WHERE r.id=? ORDER BY i.key LIMIT ? OFFSET ?"
             }

@@ -336,7 +336,7 @@ extension CommandRouter {
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_hold') AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
             let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
-            let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND (" + Self.ticketObjectDeletionReadySQL + ")")
+            let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND ((" + Self.ticketObjectDeletionReadySQL + ") OR (" + TicketCleanupDescriptorPages.readySQL + "))")
             let deletionDeadline = try pendingProjects.map {max(Int64((try self.ticketCleanupProjectRetry(db,project:$0) ?? .distantPast).timeIntervalSince1970 * 1000),nowMS + 50)}.min()
             let lifecycle = try self.nextTicketCleanupDeadline(db)
             let evidenceBackup = try self.doneEvidenceBackupWake(db).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
@@ -360,7 +360,7 @@ extension CommandRouter {
         guard try !StorageSnapshotRetention.isActive(root:root) else {return prepared.receipt}
         var receipt = prepared.receipt
         guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,objects.contains(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
-        if let reason = mediaCleanupTrashBindingFailure(receipt) {
+        if let reason = mediaCleanupTrashBindingFailure(receipt,allowUnboundPageTargets:prepared.page != nil && !bool(receipt,"descriptor_legacy_trash_binding")) {
             // A copied or unbound legacy destination is history, never a file
             // authority. Settle its pending moves without opening that folder.
             for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["disposal"] as? String == "trash" {
@@ -368,7 +368,7 @@ extension CommandRouter {
             }
             var outcome = receipt
             try withValidatedDomainTransaction(db) {
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
                 return .commit
             }
             return outcome
@@ -382,7 +382,7 @@ extension CommandRouter {
             }
             var outcome = receipt
             try withValidatedDomainTransaction(db) {
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
                 return .commit
             }
             return outcome
@@ -391,25 +391,31 @@ extension CommandRouter {
             // Publish the resumed exact intent before the first possible unlink.
             // A crash then resumes ordinary pending work, never a path sweep.
             receipt = revised(receipt)
-            try withValidatedDomainTransaction(db) {try self.save(db,receipt,type:"storage_job");return .commit}
+            try withValidatedDomainTransaction(db) {
+                if let page = prepared.page {receipt = try self.saveTicketBytePage(db,receipt:receipt,execution:page)}
+                else {try self.save(db,receipt,type:"storage_job")}
+                return .commit
+            }
         }
-        receipt = try prepareMediaCleanupTrash(db,receipt:receipt)
+        receipt = try prepareMediaCleanupTrash(db,receipt:receipt,page:prepared.page)
         objects = receipt["objects"] as? [JSON] ?? objects
         var attempted: [Int] = [],outcome = receipt
         do {
             try withValidatedDomainTransaction(db) {
                 if let reason = try self.ticketCleanupDeletionBlocker(db,receipt:receipt) {
                     for i in objects.indices where objects[i]["state"] as? String == "pending" {objects[i]["state"] = "retained";objects[i]["reasons"] = [reason]}
-                    outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow);return .commit
+                    outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page);return .commit
                 }
                 let references = prepared.references,mediaAuthorityComplete = prepared.mediaAuthorityComplete,backup = prepared.backup
-                for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
+                for i in objects.indices where prepared.page == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
                     let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
                     if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
                 }
-                var pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)
+                prepared.page?.links.apply(&objects)
+                var pendingTargets = prepared.page?.links.pendingTargets ?? Self.retainTicketObjectDeletionLinkTargets(&objects)
                 let started = ProcessInfo.processInfo.systemUptime
                 for index in objects.indices where objects[index]["state"] as? String == "pending" {
+                    if prepared.page?.links.linksOnly == true,objects[index]["kind"] as? String != "symlink" {continue}
                     guard let path = objects[index]["relative_path"] as? String,prepared.candidatePaths.contains(path),!pendingTargets.contains(path) else {continue}
                     if attempted.count >= 128 || !attempted.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 0.025 {break}
                     attempted.append(index)
@@ -434,11 +440,17 @@ extension CommandRouter {
                         if failures >= 2 {result["state"] = "retained";result["reasons"] = [code]}
                     }
                     objects[index] = result
-                    if object["kind"] as? String == "symlink" {pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)}
+                    if prepared.page == nil,object["kind"] as? String == "symlink" {pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)}
                     try self.recordTicketCleanupAvailability(db,receipt:receipt,object:result)
+                    if prepared.page != nil,object["kind"] as? String == "symlink" {
+                        // Any symlink outcome can change another page's closure.
+                        // Publish it first, then reobserve the complete receipt.
+                        break
+                    }
                 }
-                _ = Self.retainTicketObjectDeletionLinkTargets(&objects)
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                if let page = prepared.page {page.links.apply(&objects)}
+                else {_ = Self.retainTicketObjectDeletionLinkTargets(&objects)}
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
                 return .commit
             }
         } catch {
@@ -451,32 +463,38 @@ extension CommandRouter {
                     objects[index]["failures"] = failures;objects[index]["last_failure"] = code
                     if failures >= 2 {objects[index]["state"] = "retained";objects[index]["reasons"] = [code]}
                 }
-                _ = Self.retainTicketObjectDeletionLinkTargets(&objects)
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow)
+                if let page = prepared.page {page.links.apply(&objects)}
+                else {_ = Self.retainTicketObjectDeletionLinkTargets(&objects)}
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
                 return .commit
             }
         }
         return outcome
     }
 
-    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON],backupGenerationRow: Int64) throws -> JSON {
+    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON],backupGenerationRow: Int64,page: TicketBytePageExecution?) throws -> JSON {
         var receipt = receipt,objects = objects
         if receipt["cause"] as? String == "media_round_delete" {
             for index in objects.indices where strings(objects[index],"reasons").contains("reader_lease") {
                 objects[index]["reader_hold_ids"] = try mediaRoundDeletionReaderHoldIDs(db,object:objects[index])
             }
         }
-        receipt["objects"] = objects
-        receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
-        receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
-        receipt["checked_at"] = now()
-        receipt = revised(receipt)
-        try save(db,receipt,type:"storage_job")
-        if let id = receipt["id"] as? String {
-            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '1')",arguments:["ticket-cleanup-copy-retry-seen:" + id])
-        }
-        if ["task_purge","done_evidence","media_round_delete"].contains(receipt["cause"] as? String ?? ""),let id = receipt["id"] as? String {
-            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(backupGenerationRow)])
+        if let page {
+            receipt["objects"] = objects;receipt["checked_at"] = now()
+            receipt = try saveTicketBytePage(db,receipt:receipt,execution:page,generation:backupGenerationRow)
+        } else {
+            receipt["objects"] = objects
+            receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
+            receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
+            receipt["checked_at"] = now()
+            receipt = revised(receipt)
+            try save(db,receipt,type:"storage_job")
+            if let id = receipt["id"] as? String {
+                try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?, '1')",arguments:["ticket-cleanup-copy-retry-seen:" + id])
+            }
+            if ["task_purge","done_evidence","media_round_delete"].contains(receipt["cause"] as? String ?? ""),let id = receipt["id"] as? String {
+                try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(backupGenerationRow)])
+            }
         }
         if receipt["cause"] as? String == "done_evidence",receipt["state"] as? String == "completed",int(receipt,"cleanup_policy_version") < 2,let project = receipt["project_id"] as? String,let task = receipt["task_id"] as? String {
             // Old pending jobs had incomplete history-owner fingerprints. Keep

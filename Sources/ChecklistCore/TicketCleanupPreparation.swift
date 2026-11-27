@@ -21,12 +21,13 @@ struct TicketCleanupPreparedDeletion: TicketCleanupPrepared {
     let candidatePaths: Set<String>
     let verifications: [String:TicketObjectRemovalVerification]
     let verificationFailures: [String:Error]
+    var page: TicketBytePageExecution? = nil
 }
 
 extension CommandRouter {
     /// Observe only bounded changed rows on the writer; preparation stays on the
     /// separate lane. Relevant changes refuse safely and arm a durable backoff.
-    func withTicketCleanupPreparation<T: TicketCleanupPrepared>(_ prepare: (Database) throws -> T?,continuing: ((Database,T) throws -> T?)? = nil,commit: (Database,ArchiveStoragePermit,T) throws -> Void) throws {
+    func withTicketCleanupPreparation<T: TicketCleanupPrepared>(_ prepare: (Database) throws -> T?,continuing: ((Database,T) throws -> T?)? = nil,writerTiming: ((T,TimeInterval,Bool) -> Void)? = nil,commit: (Database,ArchiveStoragePermit,T) throws -> Void) throws {
         if ticketCleanupRetryAt.map({$0 > Date()}) ?? false {return}
         ticketCleanupPreparingProject = nil
         do {
@@ -59,20 +60,27 @@ extension CommandRouter {
                 throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup will retry a separate read lane; bytes retained.",details:TicketCleanupFailureDiagnostics.details(error))
             }
             while true {
-                try ArchiveStorageGate.withExclusive(root:root) {permit in
-                    try dbQueue.writeWithoutTransaction {db in
-                        try autoreleasepool {
-                            guard try Int.fetchOne(db,sql:"PRAGMA data_version") == generation else {throw CoreError("CLEANUP_CONCURRENT_WRITE","An external writer changed the cleanup snapshot.")}
-                            guard try !StorageSnapshotRetention.isActive(root:root) else {throw CoreError("BACKUP_CAPTURE_ACTIVE","Cleanup deferred for a backup capture.")}
-                            prepared = try prepared.revalidated(db,router:self)
-                            try commit(db,permit,prepared)
-                            var state = try self.ticketCleanupPreparationState(db,project:prepared.fence.projectID)
-                            state["state"] = bool(state,"attempt_refused") ? "deferred" : "committed";state["committed_at"] = now()
-                            if !bool(state,"attempt_refused") {state["next_attempt_at"] = NSNull()}
-                            try self.saveTicketCleanupPreparationState(db,project:prepared.fence.projectID,state:state)
-                            self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil
+                var hold: TimeInterval?, committed = false
+                do {
+                    defer {if let hold {writerTiming?(prepared,hold,committed)}}
+                    try ArchiveStorageGate.withExclusive(root:root) {permit in
+                        try dbQueue.writeWithoutTransaction {db in
+                            let started = ProcessInfo.processInfo.systemUptime
+                            defer {hold = ProcessInfo.processInfo.systemUptime - started}
+                            try autoreleasepool {
+                                guard try Int.fetchOne(db,sql:"PRAGMA data_version") == generation else {throw CoreError("CLEANUP_CONCURRENT_WRITE","An external writer changed the cleanup snapshot.")}
+                                guard try !StorageSnapshotRetention.isActive(root:root) else {throw CoreError("BACKUP_CAPTURE_ACTIVE","Cleanup deferred for a backup capture.")}
+                                prepared = try prepared.revalidated(db,router:self)
+                                try commit(db,permit,prepared)
+                                var state = try self.ticketCleanupPreparationState(db,project:prepared.fence.projectID)
+                                state["state"] = bool(state,"attempt_refused") ? "deferred" : "committed";state["committed_at"] = now()
+                                if !bool(state,"attempt_refused") {state["next_attempt_at"] = NSNull()}
+                                try self.saveTicketCleanupPreparationState(db,project:prepared.fence.projectID,state:state)
+                                self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil
+                            }
                         }
                     }
+                    committed = true
                 }
                 guard let continuing,let next = try readers.read({db in try autoreleasepool {try continuing(db,prepared)}}) else {break}
                 prepared = next
@@ -133,7 +141,7 @@ extension CommandRouter {
         }
     }
     func prepareTicketObjectDeletion(_ db: Database) throws -> TicketCleanupPreparedDeletion? {
-        guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?) ORDER BY rowid LIMIT 1",arguments:[now()]) else {return nil}
+        guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND json_extract(data,'$.descriptor_page_generation') IS NULL AND NOT (" + TicketCleanupDescriptorPages.inlineOverflowSQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?) ORDER BY rowid LIMIT 1",arguments:[now()]) else {return nil}
         var receipt = try GRDBRecordEnvelopeAdapter.decode(raw).object
         try rearmTicketObjectCopyFailures(db,receipt:&receipt)
         let reactivated = receipt["state"] as? String == "completed"
@@ -159,24 +167,26 @@ extension CommandRouter {
         return try prepareTicketObjectDeletionCandidates(db,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:&backup,mediaComplete:mediaComplete,fence:fence)
     }
 
-    func prepareTicketObjectDeletionCandidates(_ db: Database,receipt: JSON,reactivated: Bool,backupGenerationRow: Int64,references: TicketObjectDeletionReferenceIndex,backup: inout StorageBackupRetentionIndex?,mediaComplete: Bool,fence: TicketCleanupFence) throws -> TicketCleanupPreparedDeletion {
+    func prepareTicketObjectDeletionCandidates(_ db: Database,receipt: JSON,reactivated: Bool,backupGenerationRow: Int64,references: TicketObjectDeletionReferenceIndex,backup: inout StorageBackupRetentionIndex?,mediaComplete: Bool,fence: TicketCleanupFence,pageLinks: TicketBytePageLinks? = nil) throws -> TicketCleanupPreparedDeletion {
         if Self.isLegacyDoneEvidenceDeletion(receipt) {
             return .init(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:nil,mediaAuthorityComplete:mediaComplete,candidatePaths:[],verifications:[:],verificationFailures:[:])
         }
         var objects = receipt["objects"] as? [JSON] ?? []
-        for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
+        for i in objects.indices where pageLinks == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
             let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
             if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
         }
-        let targets = Self.retainTicketObjectDeletionLinkTargets(&objects)
+        pageLinks?.apply(&objects)
+        let targets = pageLinks?.pendingTargets ?? Self.retainTicketObjectDeletionLinkTargets(&objects)
         var candidates = Set<String>(),verifications: [String:TicketObjectRemovalVerification] = [:],failures: [String:Error] = [:]
         let started = ProcessInfo.processInfo.systemUptime
         let descriptorReserve = backup?.descriptorAdmissionReserve ?? 108
-        let trashUnavailable = mediaCleanupTrashBindingFailure(receipt) != nil
+        let trashUnavailable = mediaCleanupTrashBindingFailure(receipt,allowUnboundPageTargets:pageLinks != nil && !bool(receipt,"descriptor_legacy_trash_binding")) != nil
         // Amortize the immutable reference/backup observation across a bounded
         // batch. Stop admitting after one second; a single large object's
         // cooperative verification retains the existing sixty-second ceiling.
         for object in objects where object["state"] as? String == "pending" && !targets.contains(object["relative_path"] as? String ?? "") {
+            if pageLinks?.linksOnly == true,object["kind"] as? String != "symlink" {continue}
             if trashUnavailable && object["disposal"] as? String == "trash" {continue}
             if !candidates.isEmpty,backup?.hasDescriptorBudget(reserving:descriptorReserve) == false {break}
             if candidates.count >= 256 || !candidates.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 1 {break}

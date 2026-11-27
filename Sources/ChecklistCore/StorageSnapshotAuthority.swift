@@ -93,8 +93,8 @@ enum StorageSnapshotAuthority {
                 let receipt = try GRDBRecordEnvelopeAdapter.decode(row).object
                 guard cleanedCount < budget.maximumRecords else { throw StorageSnapshotFailure.limit }
                 cleanedCount += 1
-                for object in receipt["objects"] as? [JSON] ?? [] where ["removed","already_missing"].contains(object["state"] as? String ?? "") {
-                    if let path = object["relative_path"] as? String {
+                try CommandRouter.visitTicketObjectDeletionObjects(db,receipt:receipt) {object in
+                    if ["removed","already_missing"].contains(object["state"] as? String ?? ""),let path = object["relative_path"] as? String {
                         cleaned[path,default:[]].insert(.init(sha:object["sha256"] as? String,size:(object["size"] as? NSNumber)?.int64Value,kind:object["kind"] as? String))
                     }
                 }
@@ -221,17 +221,21 @@ enum StorageSnapshotAuthority {
                 case "storage_job":
                     let kind = try text(value, "kind")
                     if kind == CommandRouter.ticketObjectDeletionKind {
-                        guard let entries = value["objects"] as? [JSON],entries.count <= 100000 else {throw StorageSnapshotFailure.unsupportedAuthority}
-                        for entry in entries where ["pending","retained"].contains(entry["state"] as? String ?? "") {
+                        // Inactive pages have no file authority. Active pages
+                        // are enumerated through their exact logical receipt.
+                        if value["cause"] as? String == TicketCleanupDescriptorPages.cause {break}
+                        try CommandRouter.visitTicketObjectDeletionObjects(db,receipt:value) {entry in
+                            try budget.check()
+                            guard ["pending","retained"].contains(entry["state"] as? String ?? "") else {return}
                             if entry["representation"] as? String == "source_build_cache" {
                                 guard let path = entry["relative_path"] as? String else {throw StorageSnapshotFailure.unsupportedAuthority}
                                 let parts = try StorageObjectFiles.parts(path)
                                 guard parts.count >= 2,parts[0] == "source-build-cache",parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
                                 // Rebuildable cache is not required backup payload.
                                 // Preserve its durable ownership/outcome metadata.
-                                unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));continue
+                                unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));return
                             }
-                            guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {continue}
+                            guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {return}
                             guard path.hasPrefix("objects/") || path.hasPrefix("source-captures/"),size >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
                             if try retainedExists(path) {
                                 try add(.init(relativePath:path,kind:try text(entry,"kind"),expectedSHA256:try digest(sha),expectedSize:entry["kind"] as? String == "symlink" ? nil : size,executable:entry["executable"] as? Bool == true,linkTarget:entry["link_target"] as? String,authorities:[authority + ":pending_deletion"]))

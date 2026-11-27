@@ -19,12 +19,21 @@ final class TicketCleanupDeletionCohort: TicketCleanupPrepared {
     var refused: [String:String] = [:]
     var receiptRows: [String:Int64] = [:]
     var newestFirst = false
+    let paged: TicketBytePagePass?
 
     init(entries: [TicketCleanupPreparedDeletion],backup: StorageBackupRetentionIndex?) {
         precondition(!entries.isEmpty)
-        self.entries = entries;self.backup = backup;fence = entries[0].fence
+        self.entries = entries;self.backup = backup;fence = entries[0].fence;paged = nil
+    }
+    init(paged: TicketBytePagePass) {
+        self.paged = paged;fence = paged.fence;entries = [];backup = nil
     }
     func revalidated(_ db: Database,router: CommandRouter) throws -> Self {
+        if let paged {
+            try paged.fence.validate(db)
+            try paged.validatePageJournal(db)
+            return self
+        }
         guard let current else {return self}
         do {try current.fence.validate(db)}
         catch let error as CoreError where error.code == "CLEANUP_CONCURRENT_WRITE" {
@@ -45,9 +54,9 @@ extension CommandRouter {
 
     /// Select a single project's bounded cohort in queue order. A later call
     /// freshly observes all authority; verified manifests never become a cache
-    /// across passes. Oversize receipts retain bytes under the existing bounds.
+    /// across passes. Oversized receipts get a separate descriptor-page turn.
     func prepareTicketObjectDeletionCohort(_ db: Database,observe: ((JSON) -> Void)? = nil) throws -> TicketCleanupDeletionCohort? {
-        let ready = "type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?)"
+        let ready = "type='storage_job' AND ((" + Self.ticketObjectDeletionReadySQL + ") OR (" + TicketCleanupDescriptorPages.readySQL + ")) AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?)"
         let previousProject = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='ticket-cleanup-byte-project'") ?? ""
         // Enumerate project headers through the covering scope index. Sorting
         // full ready receipts here would parse every retained job payload.
@@ -72,7 +81,21 @@ extension CommandRouter {
     }
 
     private func prepareTicketObjectDeletionCohort(_ db: Database,project: String,firstRow: Int64,after: Int64,newestFirst: Bool,observe: ((JSON) -> Void)?) throws -> TicketCleanupDeletionCohort? {
-        let ready = "type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?)"
+        let pageReady = TicketCleanupDescriptorPages.readySQL
+        let order = " ORDER BY CASE WHEN rowid>? THEN 0 ELSE 1 END,rowid LIMIT 1"
+        func preparePaged() throws -> TicketCleanupDeletionCohort? {
+            guard let raw = try Row.fetchOne(db,sql:"SELECT id,rowid AS cleanup_row,json_type(data,'$.descriptor_page_generation') IS NOT NULL AS active FROM records WHERE type='storage_job' AND project_id=? AND (" + pageReady + ")" + order,arguments:[project,after]) else {return nil}
+            let id: String = raw["id"],row: Int64 = raw["cleanup_row"]
+            try dbQueue.writeWithoutTransaction {db in try self.advanceTicketObjectDeletionQueue(db,project:project,row:row)}
+            let pass = raw["active"] as Bool ?
+                try prepareTicketBytePageExecution(db,parent:record(db,id,type:"storage_job"),row:row) :
+                try prepareTicketBytePageConversion(db,id:id,project:project,row:row)
+            return pass.map(TicketCleanupDeletionCohort.init(paged:))
+        }
+        if !newestFirst,
+           let head = try Bool.fetchOne(db,sql:"SELECT (" + pageReady + ") FROM records WHERE type='storage_job' AND project_id=? AND ((" + Self.ticketObjectDeletionReadySQL + ") OR (" + pageReady + "))" + order,arguments:[project,after]),
+           head,let paged = try preparePaged() {return paged}
+        let ready = "type='storage_job' AND (" + Self.ticketObjectDeletionReadySQL + ") AND json_extract(data,'$.descriptor_page_generation') IS NULL AND NOT (" + TicketCleanupDescriptorPages.inlineOverflowSQL + ") AND NOT EXISTS(SELECT 1 FROM metadata m WHERE m.key='ticket-cleanup-preparation:'||records.project_id AND json_valid(m.value) AND json_extract(m.value,'$.next_attempt_at')>?)"
         // These are scheduling positions, never deletion authority. Persist a
         // position even when this project's head cannot be admitted, so another
         // project/receipt gets a fresh preparation on the next byte turn.
@@ -105,6 +128,7 @@ extension CommandRouter {
         if let lastRow,!newestFirst {try dbQueue.writeWithoutTransaction {db in try self.advanceTicketObjectDeletionQueue(db,project:project,row:lastRow)}}
         guard !receipts.isEmpty else {
             if newestFirst {return nil}
+            if let paged = try preparePaged() {return paged}
             if descriptorRefused {try recordTicketCleanupPreparationRefusal(project:project,reason:"individual byte receipt exceeds its descriptor bound")}
             throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected byte receipt exceeds its cohort bound; bytes retained.")
         }
@@ -176,6 +200,13 @@ extension CommandRouter {
     func continueTicketObjectDeletionCohort(_ db: Database,cohort: TicketCleanupDeletionCohort) throws -> TicketCleanupDeletionCohort? {
         guard cohort.turns < TicketCleanupDeletionCohort.continuationLimit,
               cohort.turns == 0 || ProcessInfo.processInfo.systemUptime-cohort.started < TicketCleanupDeletionCohort.continuationSeconds else {return nil}
+        if let paged = cohort.paged {
+            guard let conversion = paged.conversion else {return nil}
+            let next = paged.conversionIndex + 1
+            guard next < conversion.pages.count || next == conversion.pages.count && conversion.canActivate else {return nil}
+            paged.conversionIndex += 1
+            return cohort
+        }
         guard cohort.index < cohort.entries.count else {return nil}
         let entry = cohort.entries[cohort.index]
         if let current = cohort.current {
@@ -208,7 +239,26 @@ extension CommandRouter {
             var selected: TicketCleanupDeletionCohort?
             try withTicketCleanupPreparation({db in
                 let cohort = try self.prepareTicketObjectDeletionCohort(db,observe:observe);selected = cohort;found = found || cohort != nil;return cohort
-            },continuing:{db,cohort in try self.continueTicketObjectDeletionCohort(db,cohort:cohort)}) {db,permit,cohort in
+            },continuing:{db,cohort in try self.continueTicketObjectDeletionCohort(db,cohort:cohort)},writerTiming:{cohort,seconds,committed in
+                guard let paged = cohort.paged else {return}
+                paged.logWriterHold(seconds:seconds,committed:committed)
+            }) {db,permit,cohort in
+                if let paged = cohort.paged {
+                    if let conversion = paged.conversion {
+                        try TicketCleanupChanges.deletionAccounting(db) {
+                            try self.commitTicketBytePageConversion(db,work:conversion,index:paged.conversionIndex)
+                        }
+                        observe?(["phase":paged.conversionIndex < conversion.pages.count ? "descriptor_staged" : "descriptor_activated",
+                                  "receipt_id":conversion.parent["id"] ?? "","descriptor_count":conversion.count])
+                    } else if let prepared = paged.prepared {
+                        let outcome = try TicketCleanupChanges.deletionAccounting(db) {
+                            try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)
+                        }
+                        observe?(["phase":"descriptor_outcome","receipt_id":outcome["id"] ?? "","summary":outcome["summary"] ?? [:],"state":outcome["state"] ?? ""])
+                    }
+                    cohort.turns += 1
+                    return
+                }
                 guard let prepared = cohort.current else {observe?(["phase":"fenced","refused":cohort.refused]);return}
                 observe?(["phase":"candidates","receipt_id":prepared.receipt["id"] ?? "","count":prepared.candidatePaths.count,"verified":prepared.verifications.count,"failures":prepared.verificationFailures.mapValues {String(describing:$0)}])
                 let writerStarted = ProcessInfo.processInfo.systemUptime
@@ -240,7 +290,7 @@ extension CommandRouter {
             // Drain only terminal legacy accounting here. Each batch releases its
             // descriptors before another fresh observation, and no refused/partial
             // receipt gets an immediate retry. Current unlinks retain one cohort.
-            guard let selected,selected.index >= selected.entries.count,selected.refused.isEmpty,
+            guard let selected,selected.paged == nil,selected.index >= selected.entries.count,selected.refused.isEmpty,
                   selected.entries.allSatisfy({Self.isLegacyDoneEvidenceDeletion($0.receipt)}) else {break}
         } while batches < 32 && ProcessInfo.processInfo.systemUptime-started < TicketCleanupDeletionCohort.continuationSeconds
         return found

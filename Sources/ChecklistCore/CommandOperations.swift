@@ -3,6 +3,10 @@ import Dispatch
 import Darwin
 import GRDB
 
+/// Capture closed write admission before a deletion pass. The scheduler
+/// retains the accepted job and starts a fresh observation after capture.
+struct MediaRoundDeletionAdmissionDeferred: Error {}
+
 /// Ticket purge and round deletion advance both keys in their removal
 /// transaction. A legacy store can have only the store-wide key.
 struct CommandOperationPurgeEpoch {
@@ -201,8 +205,8 @@ final class CommandOperations: @unchecked Sendable {
     func resume(router: CommandRouter) {
         lock.withLock {
             guard let queue else {return}
-            // Dispatch only the head of each project. A closed admission gate
-            // can unschedule the head without letting its successor overtake it.
+            // Dispatch only the head of each project. Backup capture can defer
+            // a writer step without letting the next deletion overtake the head.
             for deletions in mediaRoundDeletions.values {
                 guard let job = deletions.first,scheduled.insert(job.id).inserted else {continue}
                 schedule(job,on:mediaRoundDeletionQueue ?? queue,router:router)
@@ -514,13 +518,15 @@ extension CommandRouter {
             return try storageAdmission.withContinuation(job.lease) {
                 // A backup releases admission before beginning its own capture.
                 // Its brief marker and terminal publication still obey admission.
-                if job.method == "backup_create" {return try performReadOperation(job)}
+                // Media deletion admits each writer transaction separately.
+                // A blocked pass returns to this scheduler after capture.
+                if job.method == "backup_create" || job.method == "media_round_delete" {return try performSeparatelyAdmittedOperation(job)}
                 // CL-353 F1: a read method runs exactly as its synchronous read:
                 // read pool, no backup write admission, so a capture never waits
                 // for it and it runs during a capture. A writer continuation inside
                 // it keeps admitWriterDependentRead. Only the operation's own
                 // running marker and terminal-state write take write admission.
-                if Self.readMethods.contains(job.method) {return try performReadOperation(job)}
+                if Self.readMethods.contains(job.method) {return try performSeparatelyAdmittedOperation(job)}
                 return try backupWrites.withImmediateAccess {try performCommandOperation(job)} ?? false
             }
         } catch {
@@ -539,11 +545,18 @@ extension CommandRouter {
         try finishCommandOperation(job,outcome)
         return true
     }
-    /// The finished read reply stays in process memory while a capture or the
+    /// A finished reply stays in process memory while a capture or the
     /// FIFO queue closes write admission. The job then waits for the existing
     /// admission notification, without polling, and writes only its terminal state.
-    private func performReadOperation(_ job: CommandOperations.Job) throws -> Bool {
-        guard let outcome = try commandOperations.heldOutcome(job) ?? executeCommandOperation(job) else {return false}
+    private func performSeparatelyAdmittedOperation(_ job: CommandOperations.Job) throws -> Bool {
+        let outcome: CommandOperations.Outcome
+        if let held = commandOperations.heldOutcome(job) {
+            outcome = held
+        } else {
+            guard let executed = try executeCommandOperation(job) else {return false}
+            outcome = executed
+            if job.method == "media_round_delete" {commandOperations.publicationProbe?(job.id)}
+        }
         guard try backupWrites.withImmediateAccess({try finishCommandOperation(job,outcome)}) != nil else {
             commandOperations.hold(job,outcome);return false
         }
@@ -582,14 +595,16 @@ extension CommandRouter {
                 try self.dbQueue.write {db in
                     guard var value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                     try self.authorizeOperation(db,value,params:params,caller:job.caller)
-                    value["state"] = "running";value["started_at"] = startedAt;value["updated_at"] = now();try self.saveOperation(db,value)
+                    value["state"] = "running"
+                    if job.method != "media_round_delete" || value["started_at"] == nil {value["started_at"] = startedAt}
+                    value["updated_at"] = now();try self.saveOperation(db,value)
                 }
             }
-            if Self.readMethods.contains(job.method) || job.method == "backup_create" {
+            if Self.readMethods.contains(job.method) || job.method == "backup_create" || job.method == "media_round_delete" {
                 // Never write during a capture. A read started while admission is
                 // closed checks authority on the pool; status reports it as running.
                 if try backupWrites.withImmediateAccess(markRunning) == nil {
-                    if job.method == "backup_create" {return nil}
+                    if job.method == "backup_create" || job.method == "media_round_delete" {return nil}
                     try readForPreparation {db in
                         guard let value = try self.operationRecord(db,id:job.id) else {throw CoreError("OPERATION_MISSING","The accepted operation record is missing.")}
                         try self.authorizeOperation(db,value,params:params,caller:job.caller)
@@ -598,7 +613,8 @@ extension CommandRouter {
             } else {try markRunning()}
             commandOperations.executionProbe?(job.id)
             output = try handle(method:job.method,params:params,caller:job.caller)
-        } catch let error as CoreError {failure = StorageFailureReport.annotated(error)}
+        } catch is MediaRoundDeletionAdmissionDeferred where job.method == "media_round_delete" {return nil}
+        catch let error as CoreError {failure = StorageFailureReport.annotated(error)}
         catch {
             let publicError = PublicErrorText.payload(error)
             var details = publicError["details"] as? JSON ?? [:]

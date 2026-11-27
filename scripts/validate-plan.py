@@ -262,6 +262,16 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['accepted']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
     reject('media-round-deletion', bad, 'fabricated result for queued operation')
+    for field, value in (
+            ('state', 'succeeded'),
+            ('finished_at', '2026-11-01T12:00:06Z'),
+            ('result', examples['media-round-deletion']['operation_result']['data']['result'])):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_running']['data'][field] = value
+        reject('media-round-deletion', bad, 'completion claim during a history pass: ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_running']['data'].pop('started_at')
+    reject('media-round-deletion', bad, 'history pass without start time')
     for section in ('accepted', 'operation_result'):
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad[section]['write_admission']['locked'] = 'false'

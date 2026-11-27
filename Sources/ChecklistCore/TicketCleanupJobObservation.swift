@@ -58,27 +58,37 @@ struct TicketCleanupJobObservation {
             }
         }
     }
-    fileprivate mutating func observe(_ job: JSON,project: Data,limits: Limits) {
+    fileprivate mutating func observe(_ db: Database,_ job: JSON,project: Data,limits: Limits) {
         guard job["cause"] as? String == "done_evidence",let task = job["task_id"] as? String else {return}
         let key = Data(task.utf8)
         guard var entry = entries[key],entry.project == project else {return}
         entry.jobs += 1
         guard entry.jobs <= limits.ticketJobs else {fail([key]);return}
         entry.pending = entry.pending || job["state"] as? String == "pending"
-        for object in job["objects"] as? [JSON] ?? [] where object["state"] as? String == "retained" {
+        func observeObject(_ object: JSON) throws {
+            guard object["state"] as? String == "retained" else {return}
             let signature = Signature(object)
-            guard !entry.retained.contains(signature) else {continue}
+            guard !entry.retained.contains(signature) else {return}
             let charge = signature.charge
             guard entry.retained.count < limits.ticketObjects,entry.bytes + charge <= limits.ticketBytes,
                   retainedObjects < limits.totalObjects,retainedBytes + charge <= limits.totalBytes else {
-                // Publish the locally accumulated charges before releasing this
-                // ticket, so aggregate admission remains exact after refusal.
-                entries[key] = entry;fail([key]);return
+                throw Self.limit("Selected cleanup job history exceeds its bound; this ticket is deferred.")
             }
             entry.retained.insert(signature);entry.bytes += charge
             retainedObjects += 1;retainedBytes += charge
         }
-        entries[key] = entry
+        do {
+            if job["descriptor_page_generation"] is String {
+                try CommandRouter.visitTicketObjectDeletionObjects(db,receipt:job,observeObject)
+            } else {
+                for object in job["objects"] as? [JSON] ?? [] {try observeObject(object)}
+            }
+            entries[key] = entry
+        } catch {
+            // Publish the local charges before releasing the refused ticket.
+            // Missing pages cannot be read as an empty history.
+            entries[key] = entry;fail([key])
+        }
     }
 
     fileprivate init(tasks: [JSON],limits: Limits) throws {
@@ -131,7 +141,7 @@ extension CommandRouter {
                     guard text else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
                     let envelope = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job")
                     guard envelope.projectID.map({Data($0.utf8)}) == project else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.identityMismatch))}
-                    result.observe(envelope.object,project:project,limits:limits)
+                    result.observe(db,envelope.object,project:project,limits:limits)
                 }
             }
         }

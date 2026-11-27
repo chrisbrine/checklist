@@ -257,10 +257,22 @@
       }
     }
   },
-  "operation_work_limit": {
+  "operation_running": {
     "data": {
       "operation_id": "00000000-0000-4000-8000-000000000914",
       "command_id": "00000000-0000-4000-8000-000000000915",
+      "method": "media_round_delete",
+      "state": "running",
+      "status_method": "operation_get",
+      "project_id": "00000000-0000-0000-0000-000000000901",
+      "created_at": "2026-11-01T12:00:05Z",
+      "started_at": "2026-11-01T12:00:05Z"
+    }
+  },
+  "operation_work_limit": {
+    "data": {
+      "operation_id": "00000000-0000-4000-8000-000000000916",
+      "command_id": "00000000-0000-4000-8000-000000000917",
       "method": "media_round_delete",
       "state": "failed",
       "status_method": "operation_get",
@@ -270,7 +282,7 @@
       "finished_at": "2026-11-01T12:00:06Z",
       "error": {
         "code": "CLEANUP_INVENTORY_LIMIT",
-        "message": "The round matches more than 4,096 events and command results; nothing was removed.",
+        "message": "A matched history row exceeds the 16 MiB work limit for one pass. The round remains present.",
         "retryable": false,
         "details": {}
       }

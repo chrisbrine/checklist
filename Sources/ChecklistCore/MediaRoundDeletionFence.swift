@@ -18,12 +18,13 @@ struct MediaRoundDeletionChanges {
                 UPDATE \(name)_budget SET units=units+1,bytes=bytes+length(NEW.id)+length(CAST(NEW.principal AS BLOB));
             END;
             """)
-        for (table,kind,key) in [("records",0,"id"),("events",1,"id"),("commands",2,"command_id")] {
+        for (table,kind,key) in [("records",0,"id"),("events",1,"id"),("commands",2,"command_id"),("metadata",3,"key")] {
             for action in ["INSERT","UPDATE","DELETE"] {
                 var body = ""
                 for alias in action == "INSERT" ? ["NEW"] : action == "DELETE" ? ["OLD"] : ["OLD","NEW"] {
                     let principal = kind == 2 ? "\(alias).principal" : "''"
-                    body += "INSERT INTO \(name) SELECT \(kind),CAST(\(alias).\(key) AS BLOB),\(principal) WHERE NOT EXISTS(SELECT 1 FROM \(name)_overflow) ON CONFLICT DO NOTHING;"
+                    let scope = kind == 3 ? " AND \(alias).key GLOB 'command-operation:*'" : ""
+                    body += "INSERT INTO \(name) SELECT \(kind),CAST(\(alias).\(key) AS BLOB),\(principal) WHERE NOT EXISTS(SELECT 1 FROM \(name)_overflow)\(scope) ON CONFLICT DO NOTHING;"
                 }
                 try db.execute(sql:"CREATE TEMP TRIGGER \(name)_\(table)_\(action) AFTER \(action) ON main.\(table) BEGIN \(body) END")
             }
@@ -31,7 +32,7 @@ struct MediaRoundDeletionChanges {
         return try Int64.fetchOne(db,sql:"PRAGMA data_version")!
     }
     func remove(_ db: Database) throws {
-        for table in ["records","events","commands"] {
+        for table in ["records","events","commands","metadata"] {
             for action in ["INSERT","UPDATE","DELETE"] {try db.execute(sql:"DROP TRIGGER IF EXISTS temp.\(name)_\(table)_\(action)")}
         }
         try db.execute(sql:"DROP TABLE IF EXISTS temp.\(name); DROP TABLE IF EXISTS temp.\(name)_overflow; DROP TABLE IF EXISTS temp.\(name)_budget")
@@ -43,9 +44,9 @@ struct MediaRoundDeletionFence {
     let records: [Data:Record]
     let events: [Data:Data]
     let commands: [(String,Data,Data)]
-    let needles: Set<Data>
-    let pendingRequestTasks: Set<Data>
-    let holdDigests: Set<Data>
+    let tokens: String
+    let tasks: String
+    let digests: String
     let filePaths: [String]
     let workspaceProtections: Set<Data>
 
@@ -57,7 +58,7 @@ struct MediaRoundDeletionFence {
         }
         for value in events {
             let id = Data(value.utf8)
-            guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(project_id,entity_id,kind,data) AS BLOB) FROM events WHERE id=CAST(? AS TEXT)",arguments:[id]) else {throw Self.changed("planned_event_missing",type:"event",id:id)}
+            guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(project_id,entity_id,actor,kind,occurred_at,data) AS BLOB) FROM events WHERE id=CAST(? AS TEXT)",arguments:[id]) else {throw Self.changed("planned_event_missing",type:"event",id:id)}
             history[id] = MediaPreparationOverlay.digest(data)
         }
         for (principal,value) in commands {
@@ -65,8 +66,10 @@ struct MediaRoundDeletionFence {
             guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(digest,result) AS BLOB) FROM commands WHERE principal=? AND command_id=CAST(? AS TEXT)",arguments:[principal,id]) else {throw Self.changed("planned_command_missing",type:"command",id:id)}
             receipts.append((principal,id,MediaPreparationOverlay.digest(data)))
         }
-        self.records = records;self.events = history;self.commands = receipts;self.needles = needles;self.holdDigests = holdDigests
-        self.pendingRequestTasks = pendingRequestTasks
+        self.records = records;self.events = history;self.commands = receipts
+        tokens = try jsonString(needles.map {String(decoding:$0,as:UTF8.self)})
+        tasks = try jsonString(pendingRequestTasks.map {String(decoding:$0,as:UTF8.self)})
+        digests = try jsonString(holdDigests.map {String(decoding:$0,as:UTF8.self)})
         self.filePaths = filePaths;workspaceProtections = try Self.workspaceProtections(db,paths:filePaths)
     }
     static func changed(_ check: String,type: String,id: Data) -> CoreError {
@@ -107,13 +110,11 @@ struct MediaRoundDeletionFence {
                   MediaPreparationOverlay.digest(row["data"]) == seen.digest else {throw Self.changed("planned_record_changed",type:String(decoding:seen.type,as:UTF8.self),id:id)}
         }
         for (id,digest) in events {
-            guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(project_id,entity_id,kind,data) AS BLOB) FROM events WHERE id=CAST(? AS TEXT)",arguments:[id]),MediaPreparationOverlay.digest(data) == digest else {throw Self.changed("planned_event_changed",type:"event",id:id)}
+            guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(project_id,entity_id,actor,kind,occurred_at,data) AS BLOB) FROM events WHERE id=CAST(? AS TEXT)",arguments:[id]),MediaPreparationOverlay.digest(data) == digest else {throw Self.changed("planned_event_changed",type:"event",id:id)}
         }
         for (principal,id,digest) in commands {
             guard let data = try Data.fetchOne(db,sql:"SELECT CAST(json_array(digest,result) AS BLOB) FROM commands WHERE principal=? AND command_id=CAST(? AS TEXT)",arguments:[principal,id]),MediaPreparationOverlay.digest(data) == digest else {throw Self.changed("planned_command_changed",type:"command",id:id)}
         }
-        let tokens = try jsonString(needles.map {String(decoding:$0,as:UTF8.self)}),digests = try jsonString(holdDigests.map {String(decoding:$0,as:UTF8.self)})
-        let tasks = try jsonString(pendingRequestTasks.map {String(decoding:$0,as:UTF8.self)})
         // Match complete text atoms AND dictionary keys as in the preparation
         // stream. SQL keeps even a large unrelated changed row out of Swift.
         for (table,kind,key,payload) in [("records",0,"id","data"),("events",1,"id","data"),("commands",2,"command_id","result")] {

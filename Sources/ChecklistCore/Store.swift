@@ -431,10 +431,13 @@ public final class CommandRouter: @unchecked Sendable {
             var admittedWrite = false
             let admittedReply: JSON? = try commandOperations.withAdmission(principal:caller.principal,command:params["command_id"] as? String) {
                 let legacyReserved = backupWrites.hasReservedCommand(params:params,caller:caller)
-                if commandOperations.enabled,Thread.current.threadDictionary[commandOperations.contextKey] == nil,
+                let scheduled = Thread.current.threadDictionary[commandOperations.contextKey] != nil
+                if commandOperations.enabled,!scheduled,
                    try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
                     return try acceptCommandOperation(method:method,params:params,caller:caller)
                 }
+                // The scheduled deletion admits its own bounded writer steps.
+                if scheduled,method == "media_round_delete",!legacyReserved {return nil}
                 // CL-410: a hook confirmation is refused during a capture and never queued. The note repeats at a later tool call.
                 if method == "codex_hook_confirm",!legacyReserved {
                     switch backupWrites.admitWriterDependentRead() {

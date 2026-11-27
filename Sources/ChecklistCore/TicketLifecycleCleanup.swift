@@ -271,11 +271,11 @@ extension CommandRouter {
                         ], Caller(role: "owner", installation: "storage", projectIDs: []), automatic: true, prepared: plan, expiredCommands: prepared.expiredCommands[tid])
                     deletion = try StoredRecord(result, family: "purge_result").object("byte_deletion")
                 } else {
-                    var receipt = try self.enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"done_evidence",plan:plan.byteDeletion)
-                    receipt["owned_record_fingerprints"] = Dictionary(uniqueKeysWithValues:try plan.byteCleanupOwners.map {($0.id,try self.ticketCleanupOwnerFingerprint($0.value,type:$0.type))})
-                    receipt["task_revision"] = (try StoredRecord(task, family: "task").requiredValue("revision"))
-                    receipt["cleanup_policy_version"] = 2
-                    try self.save(db,receipt,type:"storage_job");deletion = receipt
+                    let fields: JSON = [
+                        "owned_record_fingerprints":Dictionary(uniqueKeysWithValues:try plan.byteCleanupOwners.map {($0.id,try self.ticketCleanupOwnerFingerprint($0.value,type:$0.type))}),
+                        "task_revision":try StoredRecord(task,family:"task").requiredValue("revision")
+                    ]
+                    deletion = try self.enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"done_evidence",plan:plan.byteDeletion,additionalFields:fields)
                 }
                 items[index]["byte_deletion_receipt_id"] = (try StoredRecord(deletion, family: "deletion").requiredValue("id"))
             }
@@ -370,7 +370,7 @@ extension CommandRouter {
         var value = receipt,items = receipt["items"] as? [JSON] ?? [],objects: [JSON] = []
         for index in items.indices {
             if let id = items[index]["byte_deletion_receipt_id"] as? String {
-                let deletion = try scoped(db, id, (try StoredRecord(receipt, family: "receipt").string("project_id")), type: "storage_job")
+                let deletion = try ticketObjectDeletionReceiptWithObjects(db,receipt:scoped(db,id,(try StoredRecord(receipt,family:"receipt").string("project_id")),type:"storage_job"))
                 items[index]["byte_deletion"] = deletion;objects += deletion["objects"] as? [JSON] ?? []
             }
         }

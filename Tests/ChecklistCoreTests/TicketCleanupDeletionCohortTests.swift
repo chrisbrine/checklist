@@ -71,6 +71,15 @@ extension TicketLifecycleCleanupTests {
                         let before = try comparison(expected),after = try comparison(actual)
                         XCTAssertEqual(before.0,after.0)
                         XCTAssertEqual(before.1,after.1)
+                        if cause == "media_round_delete" {
+                            let id = uuid()
+                            let prepared = CommandRouter.ticketObjectDeletionReceipt(project:projectID,task:task,cause:cause,plan:plan,id:id,additionalFields:[:])
+                            try self.router.commitPreparedTicketObjectDeletionReceipt(db,PreparedTicketObjectDeletionReceipt(prepared))
+                            try self.router.markTicketObjectDeletionBackupGeneration(db,receipt:id,generation:self.router.ticketCleanupBackupGenerationRow(db))
+                            let stored = try comparison(self.router.record(db,id,type:"storage_job"))
+                            XCTAssertEqual(before.0,stored.0)
+                            XCTAssertEqual(before.1,stored.1)
+                        }
                     }
                 }
             }
@@ -407,5 +416,184 @@ extension TicketLifecycleCleanupTests {
         for object in receipts[0]["objects"] as! [JSON] {
             XCTAssertFalse(FileManager.default.fileExists(atPath:object["stored_path"] as! String))
         }
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testByteReceiptAbove16MiBResumesAcrossPagesAndPreservesTrashAndLinks() throws {
+        let original = try deletionCohortFixture([3])[0]
+        let id = try XCTUnwrap(original["id"] as? String),project = try XCTUnwrap(original["project_id"] as? String)
+        let root = router.root,trash = directory.appendingPathComponent("owned-page-trash")
+        try FileManager.default.createDirectory(at:trash,withIntermediateDirectories:true)
+        router.ticketCleanupTrashRoot = trash
+        let capture = "source-captures/" + project + "/" + uuid() + "/source"
+        let filename = "target.txt",target = capture + "/" + filename,linkPath = capture + "/link.txt"
+        let bytes = Data("cross-page retained target".utf8)
+        let files = try StorageObjectFiles(root:root)
+        try files.writeNew(target,bytes:bytes)
+        try files.writeLink(linkPath,target:filename)
+        let targetObject: JSON = ["relative_path":target,"kind":"file","size":bytes.count,"sha256":ChecklistCore.hash(bytes),"representation":"source_capture","state":"pending"]
+        let link: JSON = ["relative_path":linkPath,"kind":"symlink","size":filename.utf8.count,"sha256":ChecklistCore.hash(Data(filename.utf8)),"link_target":filename,"representation":"source_capture","state":"retained","reasons":["keep_original"]]
+        let originals = (original["objects"] as! [JSON]).map { value -> JSON in
+            var object = value;object["disposal"] = "trash";return object
+        }
+        let filler: JSON = ["representation":"staging","state":"retained","size":0,"reasons":["staging_requires_import_recovery"],"synthetic_padding":String(repeating:"p",count:500_000)]
+        var objects = [targetObject,originals[0]]
+        objects += Array(repeating:filler,count:18)
+        objects += [originals[1]]
+        objects += Array(repeating:filler,count:17)
+        objects += [originals[2],link]
+        var receipt = original
+        receipt["cause"] = "media_round_delete";receipt["objects"] = objects
+        receipt["summary"] = CommandRouter.ticketObjectDeletionSummary(objects)
+        XCTAssertGreaterThan(try jsonString(receipt).utf8.count,16 * 1024 * 1024)
+        try write {db in try self.router.save(db,self.router.revised(receipt),type:"storage_job")}
+
+        // Commit just one staging pass through the production fence and reopen.
+        try router.withTicketCleanupPreparation({try self.router.prepareTicketObjectDeletionCohort($0)}) {db,_,cohort in
+            let conversion = try XCTUnwrap(cohort.paged?.conversion)
+            try TicketCleanupChanges.deletionAccounting(db) {try self.router.commitTicketBytePageConversion(db,work:conversion,index:0)}
+        }
+        let staged = try router.dbQueue.read {db -> JSON in
+            let pageID = try XCTUnwrap(String.fetchOne(db,sql:"SELECT id FROM records WHERE type='storage_job' AND json_extract(data,'$.page_parent')=?",arguments:[id]))
+            return try self.router.record(db,pageID,type:"storage_job")
+        }
+        var crossedFence = false
+        try router.withTicketCleanupPreparation({db in
+            let work = try self.router.prepareTicketObjectDeletionCohort(db)
+            XCTAssertNotNil(work?.paged?.conversion)
+            // Rewrite a previously staged page without a revision change.
+            // It cannot be accepted by the reader's otherwise complete plan.
+            try self.write {writer in
+                var changed = staged
+                changed["fixture_changed"] = true
+                try self.router.save(writer,changed,type:"storage_job")
+            }
+            return work
+        }) {_,_,_ in crossedFence = true}
+        XCTAssertFalse(crossedFence)
+        try write {try self.router.save($0,staged,type:"storage_job")}
+        try expireCleanupBackoff()
+        let before = try deletionCohortReceipt(receipt)
+        XCTAssertNil(before["descriptor_page_generation"])
+        XCTAssertEqual((before["objects"] as? [JSON])?.count,objects.count)
+        XCTAssertNoThrow(try router.dbQueue.read {db in
+            try StorageSnapshotAuthority.inventory(db,root:root,budget:.production(),retainedExists:files.regularOrLinkExists)
+        })
+        try router.closeStore();router = try TestStore.router(root:root)
+        router.ticketCleanupTrashRoot = trash
+
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        let activated = try deletionCohortReceipt(receipt)
+        XCTAssertNotNil(activated["descriptor_page_generation"])
+        XCTAssertEqual((activated["objects"] as? [JSON])?.count,0)
+        XCTAssertEqual(activated["state"] as? String,"pending")
+        XCTAssertNoThrow(try router.dbQueue.read {db in
+            try StorageSnapshotAuthority.inventory(db,root:root,budget:.production(),retainedExists:files.regularOrLinkExists)
+        })
+
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        let first = try deletionCohortReceipt(receipt)
+        XCTAssertEqual(first["state"] as? String,"pending")
+        XCTAssertEqual(int(first["summary"] as? JSON ?? [:],"removed_count"),1)
+        try router.closeStore();router = try TestStore.router(root:root)
+        router.ticketCleanupTrashRoot = trash
+        for _ in 0..<5 {
+            if try deletionCohortReceipt(receipt)["state"] as? String == "completed" {break}
+            XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        }
+        let settled = try router.dbQueue.read {db in
+            try self.router.ticketObjectDeletionReceiptWithObjects(db,receipt:self.router.record(db,id,type:"storage_job"))
+        }
+        XCTAssertEqual(settled["id"] as? String,id)
+        XCTAssertEqual(settled["state"] as? String,"completed")
+        let outcomes = try XCTUnwrap(settled["objects"] as? [JSON])
+        XCTAssertEqual(outcomes.count,objects.count)
+        XCTAssertEqual(try jsonString(settled["summary"] as? JSON ?? [:]),try jsonString(CommandRouter.ticketObjectDeletionSummary(outcomes)))
+        XCTAssertEqual(strings(outcomes[0],"reasons"),["retained_link_target"])
+        XCTAssertEqual(try files.read(target,maximum:1000),bytes)
+        XCTAssertEqual(try files.linkTarget(linkPath),filename)
+        let trashPaths = try outcomes.filter {bool($0,"moved_to_trash")}.map {try XCTUnwrap($0["trash_path"] as? String)}
+        XCTAssertEqual(trashPaths.count,3)
+        XCTAssertEqual(Set(trashPaths.map {URL(fileURLWithPath:$0).deletingLastPathComponent().path}).count,1)
+        for (index,path) in trashPaths.enumerated() {
+            let bytes = try Data(contentsOf:URL(fileURLWithPath:path))
+            XCTAssertEqual(ChecklistCore.hash(bytes),originals[index]["sha256"] as? String)
+        }
+        XCTAssertFalse(try router.runTicketObjectDeletionCohort())
+    }
+
+    func testByteReceiptAboveCohortObjectLimitActivatesBoundedPages() throws {
+        let original = try deletionCohortFixture([1])[0]
+        let pending = (original["objects"] as! [JSON])[0]
+        let filler: JSON = ["state":"retained","reasons":["keep_original"],"size":0]
+        let objects = [pending] + Array(repeating:filler,count:TicketCleanupDeletionCohort.objectLimit)
+        var receipt = original
+        receipt["objects"] = objects;receipt["summary"] = CommandRouter.ticketObjectDeletionSummary(objects)
+        XCTAssertLessThan(try jsonString(receipt).utf8.count,TicketCleanupDeletionCohort.descriptorByteLimit)
+        try write {db in try self.router.save(db,self.router.revised(receipt),type:"storage_job")}
+        for _ in 0..<8 {
+            if try deletionCohortReceipt(receipt)["state"] as? String == "completed" {break}
+            XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        }
+        let settled = try deletionCohortReceipt(receipt)
+        XCTAssertEqual(settled["state"] as? String,"completed")
+        XCTAssertEqual(int(settled,"descriptor_count"),objects.count)
+        XCTAssertEqual(int(settled["summary"] as? JSON ?? [:],"removed_count"),1)
+        let pageCount = try router.dbQueue.read {db in try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM records WHERE type='storage_job' AND json_extract(data,'$.page_parent')=?",arguments:[original["id"] as? String])}
+        XCTAssertEqual(pageCount,(objects.count + TicketCleanupDescriptorPages.countLimit - 1) / TicketCleanupDescriptorPages.countLimit)
+    }
+}
+
+extension TicketLifecycleCleanupTests {
+    func testPagedByteCleanupRechecksAllPagesAfterLinkIdentityChanges() throws {
+        let seed = try deletionCohortFixture([1])[0],project = seed["project_id"] as! String
+        let root = router.root,files = try StorageObjectFiles(root:root)
+        let capture = "source-captures/" + project + "/" + uuid() + "/source"
+        let oldName = "old.txt",newName = "new.txt",linkPath = capture + "/alias.txt"
+        let filesToProtect = try [oldName,newName].map {name -> JSON in
+            let path = capture + "/" + name,bytes = Data(name.utf8)
+            try files.writeNew(path,bytes:bytes)
+            return ["relative_path":path,"kind":"file","size":bytes.count,"sha256":ChecklistCore.hash(bytes),"representation":"source_capture","state":"pending"]
+        }
+        try files.writeLink(linkPath,target:oldName)
+        let link: JSON = ["relative_path":linkPath,"kind":"symlink","size":oldName.utf8.count,"sha256":ChecklistCore.hash(Data(oldName.utf8)),"link_target":oldName,"representation":"source_capture","state":"pending"]
+        let filler: JSON = ["state":"retained","reasons":["keep_original"],"size":0,"synthetic_padding":String(repeating:"p",count:510_000)]
+        let original = (seed["objects"] as! [JSON])[0]
+        let objects = filesToProtect + [filler] + Array(repeating:filler,count:33) + [link,original]
+        try ticketCleanupBackupTemplate(router,objects:filesToProtect + [link,original])
+        var receipt = seed
+        receipt["objects"] = objects;receipt["summary"] = CommandRouter.ticketObjectDeletionSummary(objects)
+        try write {try self.router.save($0,self.router.revised(receipt),type:"storage_job")}
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        let linkURL = root.appendingPathComponent(linkPath)
+        try FileManager.default.moveItem(at:linkURL,to:linkURL.appendingPathExtension("before-fixture-change"))
+        try files.writeLink(linkPath,target:newName)
+
+        // The pending link is stored after both objects. Check it first:
+        // its now-unknown target makes the whole cross-page capture uncertain.
+        XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        let id = seed["id"] as! String
+        let first = try router.dbQueue.read {db in
+            try self.router.ticketObjectDeletionReceiptWithObjects(db,receipt:self.router.record(db,id,type:"storage_job"))
+        }
+        let firstObjects = first["objects"] as! [JSON]
+        XCTAssertEqual(firstObjects[objects.count-2]["last_failure"] as? String,"CLEANUP_IDENTITY_CHANGED")
+        XCTAssertEqual(firstObjects[0]["state"] as? String,"pending")
+        XCTAssertEqual(firstObjects[1]["state"] as? String,"pending")
+        try router.closeStore();router = try TestStore.router(root:root)
+        for _ in 0..<4 {
+            if try deletionCohortReceipt(receipt)["state"] as? String == "completed" {break}
+            XCTAssertTrue(try router.runTicketObjectDeletionCohort())
+        }
+        let settled = try router.dbQueue.read {db in
+            try self.router.ticketObjectDeletionReceiptWithObjects(db,receipt:self.router.record(db,id,type:"storage_job"))
+        }
+        XCTAssertEqual(settled["state"] as? String,"completed")
+        let outcomes = settled["objects"] as! [JSON]
+        for outcome in outcomes.prefix(2) {XCTAssertEqual(strings(outcome,"reasons"),["link_closure_unavailable"])}
+        XCTAssertEqual(try files.linkTarget(linkPath),newName)
+        for object in filesToProtect {XCTAssertTrue(try files.regularOrLinkExists(object["relative_path"] as! String))}
+        XCTAssertEqual(outcomes.last?["state"] as? String,"removed")
     }
 }

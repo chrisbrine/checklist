@@ -102,6 +102,28 @@ struct TicketObjectDeletionPlan {
     var summary: JSON { CommandRouter.ticketObjectDeletionSummary(objects) }
 }
 
+/// Prepare an exact canonical receipt before acquiring the writer. Only fresh
+/// receipt insertion and the fenced replacement of an inline receipt use it.
+struct PreparedTicketObjectDeletionReceipt {
+    let id: String
+    let project: String
+    let revision: Int64
+    let previousRevision: Int64?
+    let bytes: Data
+
+    init(_ receipt: JSON, previous: Row? = nil) throws {
+        let incoming = try GRDBRecordEnvelopeAdapter.incoming(receipt,type:"storage_job")
+        let envelope = try GRDBRecordEnvelopeAdapter.compareSave(incoming:incoming,previous:previous)
+        let oldRevision: Int64? = previous?["revision"]
+        guard let project = envelope.projectID,case .text(let raw) = incoming.data,
+              envelope.revision - 1 == (oldRevision ?? 0) else {
+            throw CoreError("STORAGE_RECEIPT_INVALID","The byte receipt's canonical revision or scope is invalid.")
+        }
+        id = envelope.id;self.project = project;revision = envelope.revision
+        previousRevision = oldRevision;bytes = Data(raw.utf8)
+    }
+}
+
 extension CommandRouter {
     static func isKeptMediaRoundAttachment(_ value: JSON) -> Bool {
         (value["media_capture_history"] as? JSON)?["state"] as? String == "round_deleted"
@@ -119,24 +141,29 @@ extension CommandRouter {
     // The same readiness predicate drives selection and the one-shot deadline.
     // Permanent purge holds observe each completed generation once. Explicit
     // transient errors and one-time legacy-copy recovery need no new backup.
-    static let ticketObjectDeletionReadySQL = """
-        json_valid(records.data) AND json_extract(records.data,'$.kind')='ticket_object_delete' AND (
-            json_extract(records.data,'$.state')='pending' OR (
-                json_extract(records.data,'$.state')='completed' AND json_extract(records.data,'$.cause') IN ('task_purge','done_evidence','media_round_delete')
-                AND EXISTS(SELECT 1 FROM json_each(records.data,'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
+    static let ticketObjectDeletionReadySQL = ticketObjectDeletionReadySQL(
+        data:"records.data",id:"records.id",cause:"json_extract(records.data,'$.cause')",state:"json_extract(records.data,'$.state')")
+    static func ticketObjectDeletionReadySQL(data: String,id: String,cause: String,state: String) -> String {
+        """
+        json_valid(\(data)) AND json_extract(\(data),'$.kind')='ticket_object_delete' AND (
+            \(state)='pending' OR (
+                \(state)='completed' AND \(cause) IN ('task_purge','done_evidence','media_round_delete')
+                AND EXISTS(SELECT 1 FROM json_each(\(data),'$.objects') object WHERE json_extract(object.value,'$.state')='retained'
                     AND json_type(object.value,'$.reasons')='array' AND json_array_length(object.value,'$.reasons')>0
                     AND NOT EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.type!='text' OR (reason.value NOT IN ('backup_authority','remaining_record','backup_required','backup_copy_unavailable','backup_authority_unavailable') AND reason.value NOT GLOB 'backup_index_error:*' AND reason.value NOT GLOB 'backup_copy_unverified:*'))
                     AND (
-                        (json_extract(records.data,'$.cause') IN ('task_purge','media_round_delete') AND (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||records.id),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0)))
-                        OR (COALESCE(json_extract(records.data,'$.cleanup_policy_version'),0)>=2
-                            AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='ticket-cleanup-copy-retry-seen:'||records.id)
+                        (\(cause) IN ('task_purge','media_round_delete') AND (COALESCE(json_extract(\(data),'$.cleanup_policy_version'),0)<2 OR COALESCE((SELECT CAST(value AS INTEGER) FROM metadata WHERE key='ticket-cleanup-backup-seen:'||\(id)),-1)<COALESCE((SELECT MAX(rowid) FROM metadata WHERE key GLOB 'backup-generation:*' AND json_valid(value) AND json_extract(value,'$.state')='complete'),0)))
+                        OR (COALESCE(json_extract(\(data),'$.cleanup_policy_version'),0)>=2
+                            AND NOT EXISTS(SELECT 1 FROM metadata WHERE key='ticket-cleanup-copy-retry-seen:'||\(id))
                             AND EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value='backup_copy_unavailable'))
                         OR EXISTS(SELECT 1 FROM json_each(object.value,'$.reasons') reason WHERE reason.value IN ('backup_copy_unverified:POSIX_24','backup_copy_unverified:POSIX_23','backup_copy_unverified:POSIX_4','backup_copy_unverified:deadline'))
                     ))
-            ) OR (\(mediaRoundDeletionReaderReadySQL)))
+            ) OR (\(cause)='media_round_delete' AND \(state)='completed'
+                AND EXISTS(SELECT 1 FROM json_each(\(data),'$.objects') object WHERE \(mediaRoundDeletionReaderObjectReadySQL))))
         """
-    func rearmTicketObjectCopyFailures(_ db: Database,receipt: inout JSON,backupGenerationRow: Int64? = nil) throws {
-        guard let id = receipt["id"] as? String else {return}
+    }
+    func rearmTicketObjectCopyFailures(_ db: Database,receipt: inout JSON,backupGenerationRow: Int64? = nil,markerID: String? = nil) throws {
+        guard let id = markerID ?? (receipt["id"] as? String) else {return}
         let policy = int(receipt,"cleanup_policy_version")
         var generationRetry = false
         // A pending Done job can already retain one file while its other files
@@ -478,25 +505,48 @@ extension CommandRouter {
         return holds
     }
 
-    func enqueueTicketObjectDeletion(_ db: Database, project: String, task: String, cause: String, plan: TicketObjectDeletionPlan) throws -> JSON {
+    static func ticketObjectDeletionReceipt(project: String, task: String, cause: String, plan: TicketObjectDeletionPlan, id: String, additionalFields: JSON) -> JSON {
+        var receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
+        receipt.merge(additionalFields) {canonical,_ in canonical}
+        return receipt
+    }
+
+    func enqueueTicketObjectDeletion(_ db: Database, project: String, task: String, cause: String, plan: TicketObjectDeletionPlan, id: String = uuid(), additionalFields: JSON = [:]) throws -> JSON {
         guard db.isInsideTransaction else {throw CoreError("STORAGE_TRANSACTION_REQUIRED","Object deletion intent must commit with its semantic command.")}
-        let id = uuid()
         // An empty media receipt is terminal and has no descriptor to rearm.
         let observeBackup = cause != "media_round_delete" || !plan.objects.isEmpty
         let generation = try observeBackup ? ticketCleanupBackupGenerationRow(db) : nil
-        let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
+        let receipt = Self.ticketObjectDeletionReceipt(project:project,task:task,cause:cause,plan:plan,id:id,additionalFields:additionalFields)
         try save(db,receipt,type:"storage_job")
         if let generation,["task_purge","done_evidence","media_round_delete"].contains(cause) {
-            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])
+            try markTicketObjectDeletionBackupGeneration(db,receipt:id,generation:generation)
         }
         return receipt
+    }
+
+    func markTicketObjectDeletionBackupGeneration(_ db: Database,receipt: String,generation: Int64) throws {
+        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + receipt,String(generation)])
+    }
+
+    func commitPreparedTicketObjectDeletionReceipt(_ db: Database,_ receipt: PreparedTicketObjectDeletionReceipt) throws {
+        try requireWriter(db)
+        guard db.isInsideTransaction else {throw CoreError("STORAGE_TRANSACTION_REQUIRED","Object deletion intent must commit with its semantic command.")}
+        if let previous = receipt.previousRevision {
+            // The caller fences the exact source snapshot before this update.
+            // Equality here also rejects a removed or differently scoped row.
+            try executeStoreStatement(db,sql:"UPDATE records SET revision=?,data=CAST(? AS TEXT) WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type='storage_job' AND revision=?",arguments:[receipt.revision,receipt.bytes,Data(receipt.id.utf8),Data(receipt.project.utf8),previous])
+            guard db.changesCount == 1 else {throw CoreError("CLEANUP_CONCURRENT_WRITE","The inline byte receipt changed before activation; bytes retained.")}
+        } else {
+            try executeStoreStatement(db,sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),'storage_job',?,CAST(? AS TEXT))",arguments:[Data(receipt.id.utf8),Data(receipt.project.utf8),receipt.revision,receipt.bytes])
+        }
+        invalidateTaskRecordSelection(db,type:"storage_job")
     }
 
     /// A command retry keeps its original semantic receipt, and observes this
     /// separately durable byte receipt without rewriting the command's intent.
     func addingTicketObjectDeletionReceipt(_ db: Database, output: JSON) throws -> JSON {
         guard var data = output["data"] as? JSON,let id = data["byte_deletion_receipt_id"] as? String else {return output}
-        let receipt = try record(db,id,type:"storage_job")
+        let receipt = try ticketObjectDeletionReceiptWithObjects(db,receipt:record(db,id,type:"storage_job"))
         data["byte_deletion"] = receipt
         data["managed_bytes_action"] = receipt["state"] as? String == "completed" ? "completed" : "pending"
         if var counts = data["counts"] as? JSON {counts["managed_bytes_deleted"] = (receipt["summary"] as? JSON)?["removed_bytes"] ?? 0;data["counts"] = counts}

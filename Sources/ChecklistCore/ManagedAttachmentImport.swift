@@ -132,8 +132,15 @@ extension CommandRouter {
         // identity is principal+command, across project/kind/target.
         try access.write { db in
             try self.withValidatedDomainTransaction(db) {
+            // A replayable result may have committed or expired after the
+            // read-lane check. A known identity cannot acquire a new job.
+            if try self.managedImportReceipt(db,principal:c.principal,command:command,digest:digest) != nil { replay = true; return .commit }
             do { job = try self.record(db,key,type:"storage_job") }
             catch let error as CoreError where error.code == "NOT_FOUND" {
+                if let mediaOwner {
+                    let anchor = try self.mediaAttachmentOwner(db,project:pid,owner:mediaOwner,caller:c,write:true)
+                    guard anchor["state"] as? String == "active" else { throw CoreError("ATTACHMENT_OWNER_STALE", "The current media owner no longer accepts this import.") }
+                }
                 let id = uuid(), suffix = sourceURL.pathExtension.range(of:"^[A-Za-z0-9]{1,16}$",options:.regularExpression) != nil ? "." + sourceURL.pathExtension : ""
                 // Physical namespace only. SQL project identity remains the exact
                 // opaque original; no normalization, filename identity or dedup grant.
@@ -146,6 +153,7 @@ extension CommandRouter {
             return .commit
             }
         }
+        if replay { return nil }
         func saveProgress(_ next: JSON) throws {
             try access.write { db in try self.withValidatedDomainTransaction(db) { try self.saveManagedImportProgress(db,next); return .commit } }
         }

@@ -16,7 +16,10 @@ extension CommandRouter {
         rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND json_valid(data)
         AND json_extract(data,'$.kind')='ticket_object_delete' AND json_extract(data,'$.cause')='done_evidence' AND json_extract(data,'$.state') IN ('pending','completed')
         AND COALESCE(json_extract(data,'$.updated_at'),json_extract(data,'$.created_at'))>?
-        AND EXISTS(SELECT 1 FROM json_each(data,'$.objects') object,json_each(object.value,'$.reasons') reason WHERE json_extract(object.value,'$.state')='retained' AND reason.value='backup_required')
+        AND (
+            (json_extract(data,'$.descriptor_page_generation') IS NOT NULL AND json_extract(data,'$.summary.retained_reasons.backup_required.count')>0)
+            OR EXISTS(SELECT 1 FROM json_each(data,'$.objects') object,json_each(object.value,'$.reasons') reason WHERE json_extract(object.value,'$.state')='retained' AND reason.value='backup_required')
+        )
         """
     /// The capture start, not the completion: a file added during a capture is
     /// absent from that backup, so its job must still count as waiting.

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://checklist.local/contracts/media-round-deletion.schema.json",
-  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450, CL-516, CL-518)",
+  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450, CL-516, CL-518, CL-519)",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -112,6 +112,29 @@
         "data"
       ]
     },
+    "operation_running": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A history pass has started. The round remains readable until the last pass commits.",
+      "properties": {
+        "data": {
+          "allOf": [
+            {"$ref": "#/$defs/operation"},
+            {
+              "properties": {
+                "state": {"const": "running"},
+                "finished_at": false
+              },
+              "required": ["started_at"]
+            }
+          ]
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": ["data"]
+    },
     "operation_expired": {
       "type": "object",
       "additionalProperties": false,
@@ -162,7 +185,7 @@
     "operation_work_limit": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional failed-operation example for a bound on work retained for the selected round. The message identifies the exceeded work bound.",
+      "description": "Optional failed-operation example for a graph, import or indivisible history bound. Aggregate matched history count and identity bytes can continue across passes.",
       "properties": {
         "data": {
           "allOf": [

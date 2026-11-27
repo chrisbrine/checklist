@@ -103,28 +103,6 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertEqual(observations,0)
     }
 
-    func testMatchedHistoryWorkLimitRefusesBeforeRemovingRoundRecords() throws {
-        let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
-        let roundID = try XCTUnwrap(round["id"] as? String)
-        try f.router.dbQueue.write {db in
-            try db.execute(sql:"""
-                WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4097)
-                INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data)
-                SELECT printf('00000000-0000-0000-0000-%012d',i),?,?,'fixture','media_item_created','2026-01-01T00:00:00Z','{}' FROM n
-                """,arguments:[f.project,roundID])
-        }
-        let parameters = try input(f,round)
-        XCTAssertThrowsError(try worker(f,"media_round_delete",parameters)) {error in
-            XCTAssertEqual((error as? CoreError)?.code,"CLEANUP_INVENTORY_LIMIT")
-            XCTAssertEqual((error as? CoreError)?.message,"The round matches more than 4,096 events and command results; nothing was removed.")
-        }
-        XCTAssertEqual(try f.get(round)["state"] as? String,"canceled")
-        XCTAssertEqual(try f.router.dbQueue.read {db in
-            try Int.fetchOne(db,sql:"SELECT count(*) FROM events WHERE entity_id=? AND actor='fixture'",arguments:[roundID])
-        },4097)
-        XCTAssertThrowsError(try deletion(f,round))
-    }
-
     func testDeletionRequiresCurrentGrantWorkspaceRevisionReasonCommandAndSetting() throws {
         let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
         let p = try input(f,round)
