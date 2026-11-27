@@ -529,7 +529,7 @@ fencing. A malformed table or corrupted shared inode cannot pass verification.
 The object ceiling rises from 200,000 to **500,000 logical managed paths**, allowing
 capture growth after the observed 170,344-path store. Other bounds stay unchanged:
 logical published bytes bounded by free space since CL-340 (8 GiB before; duplicates still count), 512 MiB manifest,
-524,288,000 bytes per managed file, 100,000 records and a shared 1,800-second
+524,288,000 bytes per managed file (no fixed record-count limit since CL-514, 22 Nov 2026) and a shared 1,800-second
 cooperative deadline covering capture, durable copying, both verification passes
 and publication. Deduplication saves allocated storage and full-device flushes;
 it does not disguise logical-byte accounting or claim exclusive APFS savings.

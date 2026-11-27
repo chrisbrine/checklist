@@ -86,7 +86,8 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         XCTAssertEqual(budget.maximumObjects, 500_000)
         XCTAssertEqual(budget.maximumManifestBytes, 512 * 1_048_576)
         XCTAssertEqual(budget.maximumObjectBytes, 524_288_000)
-        XCTAssertEqual(budget.maximumRecords, 100_000)
+        // CL-514: no fixed record-count ceiling; time, manifest bytes and objects bound the work.
+        XCTAssertEqual(budget.maximumRecords, .max)
         let after = ProcessInfo.processInfo.systemUptime
         XCTAssertGreaterThanOrEqual(budget.deadlineUptime, before + 1_800)
         XCTAssertLessThanOrEqual(budget.deadlineUptime, after + 1_800)

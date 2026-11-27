@@ -35,6 +35,10 @@ struct StorageSnapshotBudget {
     static let freeSpaceMinimumMarginBytes: Int64 = 1_073_741_824
     static let objectLimit = 500_000
     static let manifestByteLimit = 512 * 1_048_576
+    // CL-514 (22 Nov 2026): no fixed record-count ceiling. The store passed 100,000 records on
+    // 19 Nov 2026 and every backup failed with BACKUP_CAPACITY_EXCEEDED. The shared deadline,
+    // the manifest-byte and object limits and free space still bound each backup.
+    static let recordLimit = Int.max
     static let productionSeconds: TimeInterval = 1_800
     static func production() -> Self {
         .init(deadlineUptime: ProcessInfo.processInfo.systemUptime + productionSeconds, canceled: { false })
@@ -49,7 +53,7 @@ struct StorageSnapshotBudget {
     var maximumObjectBytes: Int64 = 524_288_000
     var maximumObjects: Int = Self.objectLimit
     var maximumManifestBytes: Int = Self.manifestByteLimit
-    var maximumRecords: Int = 100_000
+    var maximumRecords: Int = Self.recordLimit
     var parallelism: Int = 4
     var pagesPerStep: Int32 = 64
     var folderAccess = StorageFolderAccess()
