@@ -6,6 +6,7 @@ Session cleanup preserves unique evidence and Git metadata. Released fingerprint
 qualification runs retire whole after their evidence is preserved externally.
 """
 import argparse
+import ctypes
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -19,8 +20,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
-from retire_old_bundles import TRASH_TOOL, previous_timestamp, trash
+from retire_old_bundles import previous_timestamp
 
 REPO = Path(__file__).resolve().parents[1]
 BUILD_NAMES = {'.build', 'CompilationCache.noindex', 'CompilationCache', 'module-cache'}
@@ -32,7 +34,7 @@ TICKET = re.compile(r'[A-Z][A-Z0-9]*-\d+')
 # Status categories that end a ticket's work; its registered folders may retire (CL-359).
 FINISHED = {'done', 'canceled', 'cancelled'}
 DEFAULT_BUDGET_GB = 50.0
-# Bound memory and argv while amortizing process inspection and native Trash startup.
+# Bound decision memory while sharing process observations across moves.
 ITEM_BATCH_SIZE = 32
 MOVE_BATCH_SIZE = 256
 MOVE_BATCH_BYTES = 64 * 1024
@@ -40,41 +42,78 @@ MOVE_BATCH_BYTES = 64 * 1024
 PREVIEW_WORKERS = 8
 
 
-def trash_paths(paths):
-    """Yield confirmed receipts, including successes before a partial failure."""
-    if os.environ.get('CHECKLIST_TRASH_DIR') is not None:
-        for path in paths:
-            yield path, trash(path)
-        return
-    if TRASH_TOOL.exists():
-        result = subprocess.run([str(TRASH_TOOL), '--stopOnError', '--verbose', *map(str, paths)],
-                                text=True, capture_output=True)
-        cursor = 0
-        for index, path in enumerate(paths):
-            prefix = '# Moved "' + str(path) + '" to "'
-            if not result.stdout.startswith(prefix, cursor):
-                break  # Partial failure: retain preceding confirmed receipts.
-            start = cursor + len(prefix)
-            next_prefix = ('"\n# Moved "' + str(paths[index + 1]) + '" to "'
-                           if index + 1 < len(paths) else None)
-            end = result.stdout.find(next_prefix, start) if next_prefix else -1
-            if end < 0:
-                end = result.stdout.rfind('"\n', start)
-            if end < 0:
-                raise ValueError('Trash receipt unrecognized; inspect paths before retry')
-            # Use known source boundaries, not splitlines: filenames can contain
-            # quotes and newlines. The destination is a flat Trash basename.
-            yield path, Path(result.stdout[start:end])
-            cursor = end + 2
-    else:
-        # Preserve the established single-path compatibility route on systems
-        # without the native batch tool; current macOS uses one call per batch.
-        for path in paths:
-            yield path, trash(path)
-        return
-    if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, result.args,
-                                            output=result.stdout, stderr=result.stderr)
+class ScratchTrash:
+    """Prepare same-volume Trash paths before validation and rename in process."""
+
+    def __init__(self):
+        self.test_directory = os.environ.get('CHECKLIST_TRASH_DIR')
+        if self.test_directory == '':
+            raise ValueError('CHECKLIST_TRASH_DIR must name a temporary Trash folder.')
+        self.directories = {}
+        self.rename = ctypes.CDLL(None, use_errno=True).renamex_np
+        self.rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        self.rename.restype = ctypes.c_int
+
+    def directory(self, path, directory, *, create=True):
+        if self.test_directory is not None:
+            result = Path(self.test_directory).expanduser().resolve()
+            result.mkdir(parents=True, exist_ok=True)
+            return result
+
+        # Use the system Trash lookup so external volumes use their own Trash.
+        # Resolve the destination before observing whether the move is safe.
+        ctypes.CDLL('/System/Library/Frameworks/Foundation.framework/Foundation')
+        objc = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+        pointer = ctypes.c_void_p
+        objc.objc_getClass.argtypes = objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_getClass.restype = objc.sel_registerName.restype = pointer
+
+        def message(receiver, selector, result, *arguments):
+            types, values = zip(*arguments) if arguments else ((), ())
+            send = ctypes.CFUNCTYPE(result, pointer, pointer, *types)(('objc_msgSend', objc))
+            return send(receiver, objc.sel_registerName(selector), *values)
+
+        pool_class = objc.objc_getClass(b'NSAutoreleasePool')
+        pool = message(message(pool_class, b'alloc', pointer), b'init', pointer)
+        try:
+            url = message(objc.objc_getClass(b'NSURL'),
+                          b'fileURLWithFileSystemRepresentation:isDirectory:relativeToURL:', pointer,
+                          (ctypes.c_char_p, os.fsencode(path)), (ctypes.c_bool, directory), (pointer, None))
+            manager = message(objc.objc_getClass(b'NSFileManager'), b'defaultManager', pointer)
+            trash = message(manager, b'URLForDirectory:inDomain:appropriateForURL:create:error:', pointer,
+                            (ctypes.c_ulong, 102), (ctypes.c_ulong, 1),  # NSTrashDirectory, NSUserDomainMask
+                            (pointer, url), (ctypes.c_bool, create), (pointer, None))
+            if not trash:
+                raise OSError('could not locate Trash for ' + str(path))
+            location = message(trash, b'fileSystemRepresentation', ctypes.c_char_p)
+            if not location:
+                raise OSError('Trash has no filesystem path for ' + str(path))
+            return Path(os.fsdecode(location)).resolve()
+        finally:
+            message(pool, b'drain', None)
+
+    def prepare(self, path, entry):
+        device, _, mode = entry[:3]
+        if device not in self.directories:
+            directory = self.directory(path, stat.S_ISDIR(mode))
+            if directory.stat().st_dev != device:
+                raise ValueError('Trash is on a different volume; retained: ' + str(path))
+            self.directories[device] = directory
+        name = f'{path.stem}-{uuid.uuid4().hex}{path.suffix}'
+        if len(os.fsencode(name)) > 255:
+            name = uuid.uuid4().hex
+        destination = self.directories[device] / name
+        src, dest = os.fsencode(path), os.fsencode(destination)
+
+        def move():
+            # RENAME_EXCL | RENAME_NOFOLLOW_ANY. Never replace an existing entry
+            # or follow a substituted path component.
+            if self.rename(src, dest, 0x04 | 0x10):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), str(path))
+            return destination
+
+        return move
 
 
 def move_batches(entries):
@@ -114,6 +153,22 @@ def blob_id(path):
     return digest.hexdigest()
 
 
+def metadata_stamp(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def path_stamp(path, *, follow_symlinks=False):
+    try:
+        return metadata_stamp(os.stat(path, follow_symlinks=follow_symlinks))
+    except FileNotFoundError:
+        return None
+
+
+def stamps_match(expected):
+    return all(path_stamp(path) == value for path, value in expected.items())
+
+
 def inventory(root):
     """lstat every entry, including directories; never walk through links.
 
@@ -125,8 +180,7 @@ def inventory(root):
     lstat, scandir, is_dir = os.lstat, os.scandir, stat.S_ISDIR
     def visit(path, text):
         metadata = lstat(text)
-        result[path] = (metadata.st_dev, metadata.st_ino, metadata.st_mode,
-                        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+        result[path] = metadata_stamp(metadata)
         if is_dir(metadata.st_mode):
             with scandir(text) as entries:
                 names = sorted(entry.name for entry in entries)
@@ -685,24 +739,52 @@ def installed_fingerprint(path):
         return None
 
 
-def rollback_fingerprint(installed_info):
-    """Read the immediate rollback bundle beside a standard installed bundle."""
+def rollback_directory(installed_info):
     installed_info = installed_info.absolute()
-    if (installed_info.parts[-3:] != ('Contents', 'Resources', 'build-info.json')
-            or installed_info.parents[2].suffix != '.app'):
-        return None
+    if (installed_info.parts[-3:] == ('Contents', 'Resources', 'build-info.json')
+            and installed_info.parents[2].suffix == '.app'):
+        return installed_info.parents[3]
+    return None
+
+
+def rollback_receipt(directory):
     bundles = sorted((previous_timestamp(bundle) or '', bundle)
-                     for bundle in installed_info.parents[3].iterdir()
+                     for bundle in directory.iterdir()
                      if bundle.name.startswith('.Checklist-previous-') and bundle.suffix == '.app')
     if not bundles:
         return None
     stamp, bundle = bundles[-1]
     if not bundles[0][0] or bundle.is_symlink() or (len(bundles) > 1 and bundles[-2][0] == stamp):
         raise ValueError('previous installed identity unavailable; qualified-copy retention unresolved')
-    fingerprint = installed_fingerprint(bundle / 'Contents/Resources/build-info.json')
-    if fingerprint is None:
-        raise ValueError('previous installed identity unavailable; qualified-copy retention unresolved')
-    return fingerprint
+    return bundle / 'Contents/Resources/build-info.json'
+
+
+def observe_fingerprint(path, expected):
+    stamp = expected[(path, False)] = path_stamp(path)
+    if stamp is None:
+        return None
+    # Record both the link and the effective receipt. A link farther along the
+    # chain can be redirected without changing the first link or old target.
+    if stat.S_ISLNK(stamp[2]):
+        stamp = expected[(path, True)] = path_stamp(path, follow_symlinks=True)
+    return installed_fingerprint(path) if stamp and stat.S_ISREG(stamp[2]) else None
+
+
+def installation_observation(installed_info):
+    """Record receipt metadata and the directory that selects the rollback bundle."""
+    expected = {}
+    current = observe_fingerprint(installed_info, expected)
+    previous = None
+    directory = rollback_directory(installed_info)
+    if current and directory is not None:
+        stamp = expected[(directory, False)] = path_stamp(directory)
+        if stamp and stat.S_ISLNK(stamp[2]):
+            expected[(directory, True)] = path_stamp(directory, follow_symlinks=True)
+        if receipt := rollback_receipt(directory):
+            previous = observe_fingerprint(receipt, expected)
+            if previous is None:
+                raise ValueError('previous installed identity unavailable; qualified-copy retention unresolved')
+    return current, previous, expected
 
 
 def build_identity_hold(paths, fingerprint, previous):
@@ -730,12 +812,14 @@ def shared_rounds(items):
 
 
 def shared_round_receipts(root, workspaces):
-    """Scan parent-owned files once without entering independent workspace trees."""
+    """Observe shared directories and identity receipts outside independent workspaces."""
     pending = [os.fspath(root)]
     while pending:
         folder = pending.pop()
-        if os.path.islink(folder):
-            raise ValueError('linked shared round directory: ' + str(folder))
+        stamp = path_stamp(folder)
+        if stamp is None or not stat.S_ISDIR(stamp[2]):
+            raise ValueError('shared round directory changed: ' + str(folder))
+        yield folder, stamp
         with os.scandir(folder) as entries:
             for entry in entries:
                 if entry.path in workspaces:
@@ -743,16 +827,27 @@ def shared_round_receipts(root, workspaces):
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(entry.path)
                 elif entry.name in BUILD_IDENTITY_NAMES and entry.is_file(follow_symlinks=False):
-                    yield Path(entry.path)
+                    stamp = path_stamp(entry.path)
+                    if stamp is None or not stat.S_ISREG(stamp[2]):
+                        raise ValueError('shared round receipt changed: ' + entry.path)
+                    yield entry.path, stamp
 
 
-def shared_round_holds(rounds, fingerprint, previous):
+def shared_round_holds(rounds, fingerprint, previous, snapshots=None):
     holds = {}
     if fingerprint is None:  # The normal planner already retains every uncertain item.
         return holds
+
+    def receipts(parent, workspaces):
+        for path, stamp in shared_round_receipts(parent, workspaces):
+            if snapshots is not None:
+                snapshots.setdefault(parent, {})[path] = stamp
+            if stat.S_ISREG(stamp[2]):
+                yield Path(path)
+
     for parent, workspaces in rounds.items():
         try:
-            reason = build_identity_hold(shared_round_receipts(parent, workspaces), fingerprint, previous)
+            reason = build_identity_hold(receipts(parent, workspaces), fingerprint, previous)
         except (OSError, ValueError) as error:
             reason = ValueError('unreadable shared round identity; retained: ' + str(error))
         if reason:
@@ -836,7 +931,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
         # An owner's root release authorizes one rename of the checked tree.
         # Do not classify/hash its managed objects or split at Git/legacy paths:
         # nested unreleased markers, use, quiet time and installed identity were
-        # checked above. Apply inventories the tree once more before that rename.
+        # checked above. Apply revalidates the recorded inventory before that rename.
         category = ('ticket_bytes' if ticket_retire else
                     'qualification_bytes' if retire_run else 'released_bytes')
         why = ('tickets Done or canceled; released folder retires whole' if ticket_retire else
@@ -1015,6 +1110,8 @@ def writable_directory(path, expected, root, modes):
         raise ValueError('directory changed before permission adjustment: ' + str(path))
     if metadata.st_mode & stat.S_IWUSR:
         return
+    if expected is not None and metadata_stamp(metadata) != expected:
+        raise ValueError('directory changed before permission adjustment: ' + str(path))
     if root is None or not within(path, root):
         raise PermissionError('read-only directory outside caller permission scope; retained: ' + str(path))
     # Do not traverse a linked ancestor while adjusting a directory's mode.
@@ -1026,8 +1123,7 @@ def writable_directory(path, expected, root, modes):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         observed = os.fstat(descriptor)
-        if (observed.st_dev, observed.st_ino, observed.st_mode) != (
-                metadata.st_dev, metadata.st_ino, metadata.st_mode):
+        if metadata_stamp(observed) != metadata_stamp(metadata):
             raise ValueError('directory changed before permission adjustment: ' + str(path))
         modes.setdefault(path, (stat.S_IMODE(observed.st_mode), (observed.st_dev, observed.st_ino)))
         os.fchmod(descriptor, observed.st_mode | stat.S_IWUSR)
@@ -1048,144 +1144,176 @@ def restore_modes(modes, destinations):
             os.close(descriptor)
 
 
-def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
-                session_id, include_released, *, previous=None, rounds=None):
+def validate_move(decision, path, used, installations, shared, round_hold, keep,
+                  session_id, include_released, modes):
+    """Check only named paths and observations. The caller can rename on return."""
+    item = Path(decision['path'])
+    if item in used:
+        raise ValueError('running process began using item; stopped')
+    if any(overlap(item, folder) for folder in keep):
+        raise ValueError('explicitly retained qualified copy or persistent build slot')
+    before = decision['inventory']
+    inventory_unchanged = stamps_match(before)
+    shared_unchanged = stamps_match(shared)
+    if not in_scope(item, decision['kind'], session_id, include_released) or not stamps_match(decision['markers']):
+        raise ValueError('workspace ownership/release changed; stopped')
+    if not inventory_unchanged:
+        raise ValueError('item changed during inspection/Trash moves; stopped')
+    if round_hold:
+        raise ValueError(str(round_hold) + '; stopped before Trash')
+    if not shared_unchanged:
+        raise ValueError('shared round contents changed during inspection; stopped')
+    if any(path_stamp(file, follow_symlinks=follow) != stamp for (file, follow), stamp in installations.items()):
+        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
+
+    root = permission_root(item, decision['kind'], session_id)
+    writable_directory(path.parent, before.get(path.parent) or shared.get(os.fspath(path.parent)), root, modes)
+    if stat.S_ISDIR(before[path][2]):
+        writable_directory(path, before[path], root, modes)
+    expected = before[path]
+    observed = path_stamp(path)
+    if path in modes:
+        # Our own chmod may change only mode and ctime.
+        valid = observed is not None and observed[:5] == (*expected[:2], expected[2] | stat.S_IWUSR, *expected[3:5])
+    else:
+        valid = observed == expected
+    if not valid:
+        raise ValueError('item changed during inspection/Trash moves; stopped')
+
+
+def record_move(decision, path, destination):
+    receipt = {'source': str(path), 'trash': str(destination), 'bytes': decision['move_bytes'][path]}
+    decision['public']['destinations'].append(receipt)
+    decision['public']['moved_count'] += 1
+    decision['public']['moved_bytes'] += receipt['bytes']
+    print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
+
+
+def note_directory_changes(expected, shared, directories):
+    """Update only the parent/mode entries directly changed by our move."""
+    for directory in directories:
+        for observations, key in ((expected, directory), (shared, os.fspath(directory))):
+            if key not in observations:
+                continue
+            current = path_stamp(directory)
+            if current is None or current[:3] != observations[key][:3]:
+                raise ValueError('remaining directory changed during Trash move: ' + str(directory))
+            observations[key] = current
+
+
+def apply_batch(batch, installations, fingerprint, process_reader, mover,
+                session_id, include_released, *, previous, rounds, shared_snapshots, keep, trash):
     batch = [(d, p) for d, p in batch if not d.get('stopped')]
     if not batch:
         return
-    decisions = list({id(decision): decision for decision, _ in batch}.values())
-    # Inspect processes before the filesystem so changes during lsof are also fenced.
+    decisions = list({id(d): d for d, _ in batch}.values())
+    prepared = {}
+    if mover is None:
+        for decision, path in batch:
+            try:
+                prepared[path] = trash.prepare(path, decision['inventory'][path])
+            except (OSError, ValueError) as error:
+                move_error(decision, error, path)
     try:
-        processes = process_reader()
+        # The first observation also fences paths reported before the shared scan.
+        processes = list(process_reader())
+        parents = {Path(d['path']).parent for d in decisions}
+        shared_rounds_in_batch = {parent: items for parent, items in rounds.items() if parent in parents}
+        round_holds = shared_round_holds(shared_rounds_in_batch, fingerprint, previous)
+        if shared_rounds_in_batch:
+            processes.extend(process_reader())
+        used = used_items(processes, (Path(d['path']) for d in decisions))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         for decision in decisions:
             move_error(decision, error, stop=True)
         return
-    used = used_items(processes, (Path(d['path']) for d in decisions))
-    # Recheck each shared tree once. Revalidate child inventories and installed
-    # identities afterward, so a slow shared scan cannot make those checks stale.
-    parents = {Path(d['path']).parent for d in decisions}
-    shared_rounds_in_batch = {parent: items for parent, items in (rounds or {}).items() if parent in parents}
-    round_holds = shared_round_holds(shared_rounds_in_batch, fingerprint, previous)
-    for decision in decisions:
-        item = Path(decision['path'])
+
+    moved = {}
+    retry = []
+    for offset, (decision, path) in enumerate(batch):
+        if decision.get('stopped') or (mover is None and path not in prepared):
+            continue
+        shared = shared_snapshots.get(Path(decision['path']).parent, {})
+        hold = round_holds.get(Path(decision['path']).parent)
+        modes = {}
+        destination = None
         try:
-            if item in used:
-                raise ValueError('running process began using item; stopped')
-            if not in_scope(item, decision['kind'], session_id, include_released):
-                raise ValueError('workspace ownership/release changed; stopped')
-            if inventory(item) != decision['inventory']:
-                raise ValueError('item changed during inspection/Trash moves; stopped')
-            if workspace_protection(item, decision['inventory']):
-                raise ValueError('workspace ownership/release changed; stopped')
-            if hold := round_holds.get(item.parent):
-                raise ValueError(str(hold) + '; stopped before Trash')
-        except (OSError, ValueError) as error:
-            move_error(decision, error, stop=True)
-    if (installed_fingerprint(installed_info) != fingerprint
-            or rollback_fingerprint(installed_info) != previous):
-        for decision in decisions:
-            if not decision.get('stopped'):
-                move_error(decision, ValueError('installed round changed; rerun preview with its qualified copy retained'), stop=True)
-        return
-    batch = [(d, p) for d, p in batch if not d.get('stopped')]
-    modes, selected = {}, []
-    for decision, path in batch:
-        try:
-            root = permission_root(Path(decision['path']), decision['kind'], session_id)
-            writable_directory(path.parent, decision['inventory'].get(path.parent), root, modes)
-            if stat.S_ISDIR(decision['inventory'][path][2]):
-                writable_directory(path, decision['inventory'][path], root, modes)
-            selected.append((decision, path))
-        except (OSError, ValueError) as error:
-            move_error(decision, error, path)
-    paths = [path for _, path in selected]
-    by_path = {path: decision for decision, path in selected}
-    confirmed = set()
-    destinations, retry = {}, []
-    try:
-        if paths and shared_rounds_in_batch:
-            # Shared receipt scans can take long enough for a worker to open a
-            # checkout without changing its inventory. Refresh before handing
-            # any paths from this batch to the Trash backend.
-            ready = {Path(d['path']): d for d, _ in selected}
             try:
-                active = used_items(process_reader(), ready)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                for decision in ready.values():
-                    move_error(decision, error, stop=True)
-            else:
-                for item, decision in ready.items():
-                    if item in active:
-                        move_error(decision, ValueError('running process began using item; stopped'), stop=True)
-            paths = [path for path in paths if not by_path[path].get('stopped')]
-        if paths:
-            for path, destination in mover(paths):
-                # stopOnError receipts must be an ordered prefix. Unknown or
-                # incomplete receipts cannot authorize retrying uncertain paths.
-                if len(confirmed) >= len(paths) or path != paths[len(confirmed)]:
-                    raise ValueError('unexpected or duplicate Trash receipt; stopped')
-                confirmed.add(path)
-                destinations[path] = destination
-                decision = by_path[path]
-                receipt = {'source': str(path), 'trash': str(destination),
-                           'bytes': decision['move_bytes'][path]}
-                decision['public']['destinations'].append(receipt)
-                decision['public']['moved_count'] += 1
-                decision['public']['moved_bytes'] += receipt['bytes']
-                print(json.dumps({'action': 'trash_move', **receipt}), flush=True)
-            for path in paths[len(confirmed):]:
-                move_error(by_path[path], ValueError('Trash receipts incomplete; inspect paths before retry'), path)
-    except (OSError, subprocess.SubprocessError) as error:
-        remaining = paths[len(confirmed):]
-        if remaining:
-            # The first unconfirmed move failed. Later paths were not attempted
-            # by stopOnError; re-fence them after accounting for confirmed moves.
-            move_error(by_path[remaining[0]], error, remaining[0])
-            retry = [(by_path[path], path) for path in remaining[1:]]
-        elif paths:
-            move_error(by_path[paths[-1]], ValueError('Trash backend failed after confirmed moves: ' + str(error)))
-    except ValueError as error:
-        for path in paths[len(confirmed):]:
-            move_error(by_path[path], error, path, stop=True)
-        if paths and len(confirmed) == len(paths):
-            move_error(by_path[paths[-1]], error, stop=True)
-    finally:
-        # Restore retained parents and moved folders alike; never chmod a
-        # replacement pathname or follow a link returned in place of a receipt.
-        for path, value in modes.items():
-            try:
-                restore_modes({path: value}, destinations)
+                validate_move(decision, path, used, installations, shared, hold, keep,
+                              session_id, include_released, modes)
+            except PermissionError as error:
+                move_error(decision, error, path)
+                continue
             except (OSError, ValueError) as error:
-                for decision, selected_path in batch:
-                    if path in {selected_path, selected_path.parent}:
-                        move_error(decision, error, path, stop=True)
-    for decision in decisions:
-        item = Path(decision['path'])
+                move_error(decision, error, path, stop=True)
+                continue
+            if mover is None:
+                destination = prepared[path]()
+            else:
+                # Test adapters get one source and must return one receipt for it.
+                receipts = iter(mover([path]))
+                receipt = next(receipts, None)
+                if receipt is None:
+                    raise ValueError('Trash receipts incomplete; inspect paths before retry')
+                source, reported_destination = receipt
+                if source != path:
+                    raise ValueError('unexpected or duplicate Trash receipt; stopped')
+                destination = reported_destination
+        except (OSError, subprocess.SubprocessError) as error:
+            move_error(decision, error, path)
+            retry = batch[offset + 1:]
+        except ValueError as error:
+            move_error(decision, error, path, stop=True)
+        finally:
+            try:
+                restore_modes(modes, {path: destination} if destination is not None else {})
+                changed_dirs = set(modes)
+                expected = decision['inventory']
+                if destination is not None:
+                    moved[id(decision)] = decision
+                    changed_dirs.discard(path)
+                    changed_dirs.add(path.parent)
+                note_directory_changes(expected, shared, changed_dirs)
+                if destination is not None:
+                    if path == Path(decision['path']):
+                        expected.clear()
+                    else:
+                        prefix = os.fspath(path) + '/'
+                        for entry in [entry for entry in expected if entry == path or os.fspath(entry).startswith(prefix)]:
+                            del expected[entry]
+            except (OSError, ValueError) as error:
+                move_error(decision, error, path, stop=True)
+        if destination is not None:
+            record_move(decision, path, destination)
+            if mover is not None:
+                try:
+                    if next(receipts, None) is not None:
+                        raise ValueError('unexpected or duplicate Trash receipt; stopped')
+                except (OSError, subprocess.SubprocessError) as error:
+                    move_error(decision, ValueError('Trash backend failed after confirmed moves: ' + str(error)), path)
+                except ValueError as error:
+                    move_error(decision, error, path, stop=True)
+        if retry:
+            break
+
+    # Receipt reporting and post-move inventories stay outside the rename gate.
+    for decision in moved.values():
         if decision.get('stopped'):
             continue
-        removed = {p for d, p in batch if d is decision and p in confirmed}
-        remaining = {p: e for p, e in decision['inventory'].items()
-                     if not any(parent in removed for parent in (p, *p.parents))}
+        item = Path(decision['path'])
         try:
-            after = inventory(item) if item not in removed else {}
-            # Moving a child updates directory timestamps, never remaining file bytes
-            # or directory identity/mode. Do not silently adopt an exchanged directory.
-            if set(after) != set(remaining) or any(
-                after[p] != e if not stat.S_ISDIR(e[2]) else after[p][:3] != e[:3]
-                for p, e in remaining.items()
-            ):
+            actual = inventory(item) if decision['inventory'] or path_stamp(item) is not None else {}
+            if actual != decision['inventory']:
                 raise ValueError('remaining files changed during Trash move; stopped')
-            decision['inventory'] = after
         except (OSError, ValueError) as error:
             move_error(decision, error, stop=True)
     if retry:
-        apply_batch(retry, installed_info, fingerprint, process_reader, mover,
-                    session_id, include_released, previous=previous, rounds=rounds)
+        apply_batch(retry, installations, fingerprint, process_reader, mover, session_id, include_released,
+                    previous=previous, rounds=rounds, shared_snapshots=shared_snapshots, keep=keep, trash=trash)
 
 
 def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
-          process_reader=running_paths, mover=trash_paths, clock=time.time,
+          process_reader=running_paths, mover=None, clock=time.time,
           session_id=None, include_released=False, after_inspection=None, preview_pool=None):
     if not session_id:
         raise ValueError('caller session unknown; supply --session-id for your own session')
@@ -1209,19 +1337,20 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
             failed = True
     items = list(candidates(sessions, qualification, session_id, include_released))
     objects = git_objects(repo) if items else set()
-    fingerprint = installed_fingerprint(installed_info)
-    previous = rollback_fingerprint(installed_info) if items and fingerprint else None
+    fingerprint, previous, installations = installation_observation(installed_info) if items else (None, None, {})
     rounds = shared_rounds(items)
     processes = process_reader() if items else []
-    # Background du starts only after process inspection: its own command
-    # arguments must never read as a running process using an item.
-    sizer = after_inspection() if after_inspection else None
     used = used_items(processes, (item for item, _ in items))
-    round_holds = shared_round_holds(rounds, fingerprint, previous)
+    shared_snapshots = {} if apply else None
+    round_holds = shared_round_holds(rounds, fingerprint, previous, shared_snapshots)
     if not apply:
+        # Background du starts after process inspection so its own path arguments
+        # are never observed as a process using an item.
+        sizer = after_inspection() if after_inspection else None
         return 1 if preview_items(items, objects, used, fingerprint, keep, clock, session_id,
                                   include_released, executor=preview_pool, sizer=sizer,
                                   previous=previous, round_holds=round_holds) or failed else 0
+    trash = None
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
@@ -1229,22 +1358,34 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
                 # An old --preview is never an executable deletion plan.
                 if not in_scope(item, kind, session_id, include_released):
                     raise ValueError('workspace ownership/release changed; retained')
+                markers = {folder / WORKSPACE_MARKER: path_stamp(folder / WORKSPACE_MARKER)
+                           for folder in (item, *item.parents)}
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock(),
                                 previous=previous, round_hold=round_holds.get(item.parent))
                 public = preview_public(decision)
                 if decision['moves']:
                     public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)
                     decision['public'] = public
+                    decision['markers'] = markers
+                    # Use planned metadata for nested marker identity as well.
+                    for path, stamp in decision['inventory'].items():
+                        if path.name == WORKSPACE_MARKER:
+                            markers.setdefault(path, stamp)
                     pending.append(decision)
                 else:
                     print(json.dumps(public, sort_keys=True))
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
                 failed = True
+        if pending and after_inspection:
+            after_inspection()  # Optional synchronous sizing, before the pre-move observations.
+            after_inspection = None
         for batch in move_batches((d, p) for d in pending for p in d['moves']):
             try:
-                apply_batch(batch, installed_info, fingerprint, process_reader, mover,
-                            session_id, include_released, previous=previous, rounds=rounds)
+                if mover is None and trash is None:
+                    trash = ScratchTrash()
+                apply_batch(batch, installations, fingerprint, process_reader, mover, session_id, include_released,
+                            previous=previous, rounds=rounds, shared_snapshots=shared_snapshots, keep=keep, trash=trash)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 for decision in {id(d): d for d, _ in batch}.values():
                     move_error(decision, error, stop=True)

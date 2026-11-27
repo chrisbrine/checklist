@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
 import clean_scratch as cleanup
+from retire_old_bundles import trash
 
 
 class CleanScratchTests(unittest.TestCase):
@@ -653,11 +654,9 @@ class CleanScratchTests(unittest.TestCase):
         (item / '.git').mkdir()
         expected = {item / name for name in ['.build', 'CompilationCache.noindex', 'module-cache', 'src']}
         self.assertEqual(set(self.plan(item)['moves']), expected)
-        with patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover:
-            result, records = self.run_cleanup(apply=True, mover=mover)
+        result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0)
-        self.assertEqual(set(mover.call_args.args[0]), expected)
-        self.assertEqual(mover.call_count, 1)
+        self.assertEqual({Path(r['source']) for r in records if r['action'] == 'trash_move'}, expected)
         self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 4)
         self.assertTrue((item / '.git').is_dir())
         self.assertEqual((item / 'unique-note').read_bytes(), b'keep')
@@ -754,18 +753,16 @@ class CleanScratchTests(unittest.TestCase):
             self.write(item, 'mixed/unique.py', b'unlanded')
             self.write(item, '.build/deep/object')
             expected.add(item / '.build')
-        with patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover:
-            result, records = self.run_cleanup(apply=True, mover=mover)
+        result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0)
-        self.assertEqual(mover.call_count, 1)
-        self.assertEqual(set(mover.call_args.args[0]), expected)
+        self.assertEqual({Path(r['source']) for r in records if r['action'] == 'trash_move'}, expected)
         self.assertEqual(len([r for r in records if r['action'] == 'trashed']), 5)
         self.assertEqual(len([r for r in records if r['action'] == 'trash_move']), 10)
         for item, _ in cleanup.candidates(self.sessions, self.qualification, 'session'):
             self.assertEqual((item / 'mixed/unique.py').read_bytes(), b'unlanded')
             self.assertFalse((item / 'mixed/old.py').exists())
 
-    def test_batch_bounds_count_and_encoded_argv_bytes(self):
+    def test_batch_bounds_count_and_encoded_path_bytes(self):
         entries = [(None, Path('/tmp/' + 'é' * i)) for i in range(1, 9)]
         with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3), patch.object(cleanup, 'MOVE_BATCH_BYTES', 40):
             batches = list(cleanup.move_batches(entries))
@@ -774,40 +771,39 @@ class CleanScratchTests(unittest.TestCase):
             self.assertLessEqual(len(batch), 3)
             self.assertLessEqual(sum(len(os.fsencode(p)) + 1 for _, p in batch), 40)
 
-    def test_native_trash_is_one_call_and_retains_partial_success_receipts(self):
-        paths = [Path('/fixture/a'), Path('/fixture/b')]
-        for code, stdout, count in [(0, '# Moved "/fixture/a" to "/Trash/a"\n# Moved "/fixture/b" to "/Trash/b"\n', 2),
-                                    (1, '# Moved "/fixture/a" to "/Trash/a"\n', 1)]:
-            result = subprocess.CompletedProcess(['trash'], code, stdout=stdout, stderr='failure' if code else '')
-            receipts = []
-            with patch.dict(os.environ, {}, clear=True), patch.object(cleanup, 'TRASH_TOOL') as tool, \
-                 patch.object(cleanup.subprocess, 'run', return_value=result) as runner:
-                tool.exists.return_value = True
-                tool.__str__.return_value = '/usr/bin/trash'
-                try:
-                    receipts.extend(cleanup.trash_paths(paths))
-                except subprocess.CalledProcessError:
-                    self.assertEqual(code, 1)
-                self.assertEqual(runner.call_count, 1)
-                self.assertEqual(runner.call_args.args[0], ['/usr/bin/trash', '--stopOnError', '--verbose', *map(str, paths)])
-            self.assertEqual(len(receipts), count)
+    def test_prepared_trash_rename_never_replaces_existing_destination(self):
+        item = self.item('source')
+        source = self.write(item, 'payload', b'keep original')
+        existing = self.trash / ('payload-' + 'f' * 32)
+        existing.write_bytes(b'keep destination')
+        with patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
+             patch.object(cleanup.uuid, 'uuid4', return_value=cleanup.uuid.UUID('f' * 32)):
+            move = cleanup.ScratchTrash().prepare(source, cleanup.path_stamp(source))
+        with self.assertRaises(FileExistsError):
+            move()
+        self.assertEqual(source.read_bytes(), b'keep original')
+        self.assertEqual(existing.read_bytes(), b'keep destination')
 
-    def test_native_receipts_preserve_quotes_and_newlines_in_path_names(self):
-        paths = [Path('/fixture/a"\nline'), Path('/fixture/b\n"line')]
-        destinations = [Path('/Trash/a"\nline'), Path('/Trash/b\n"line')]
-        output = ''.join(f'# Moved "{p}" to "{d}"\n' for p, d in zip(paths, destinations))
-        result = subprocess.CompletedProcess(['trash'], 0, stdout=output, stderr='')
-        with patch.dict(os.environ, {}, clear=True), patch.object(cleanup, 'TRASH_TOOL') as tool, \
-             patch.object(cleanup.subprocess, 'run', return_value=result):
-            tool.exists.return_value = True
-            self.assertEqual(list(cleanup.trash_paths(paths)), list(zip(paths, destinations)))
+    def test_prepared_trash_preserves_special_path_names_without_subprocess(self):
+        item = self.item('source')
+        source = self.write(item, 'quote"and\nnewline.txt', b'payload')
+        with patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
+             patch.object(cleanup.subprocess, 'run', side_effect=AssertionError('Trash subprocess')):
+            move = cleanup.ScratchTrash().prepare(source, cleanup.path_stamp(source))
+            destination = move()
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.parent, self.trash)
+        self.assertEqual(destination.read_bytes(), b'payload')
+        self.assertTrue(destination.name.startswith(source.stem + '-'))
 
     def test_partial_batch_failure_reports_moved_and_unmoved_item_bytes(self):
         first = self.item('a');self.write(first, '.build/object')
         second = self.item('b');self.write(second, '.build/object')
         def partial(paths):
-            yield paths[0], cleanup.trash(paths[0])
-            raise OSError('partial failure')
+            path, = paths
+            if path == second:
+                raise OSError('partial failure')
+            yield path, trash(path)
         result, records = self.run_cleanup(apply=True, mover=partial)
         self.assertEqual(result, 1)
         self.assertFalse(first.exists());self.assertTrue(second.exists())
@@ -834,10 +830,10 @@ class CleanScratchTests(unittest.TestCase):
             for path in paths:
                 if path == item / 'b':
                     raise OSError('fixture folder move failed')
-                yield path, cleanup.trash(path)
+                yield path, trash(path)
         result, records = self.run_cleanup(apply=True, mover=partial)
         self.assertEqual(result, 1)
-        self.assertEqual(calls, [[item / name for name in ['a', 'b', 'c']], [item / 'c']])
+        self.assertEqual(calls, [[item / name] for name in ['a', 'b', 'c']])
         moves = [r for r in records if r['action'] == 'trash_move']
         summary = records[-1]
         self.assertEqual([r['bytes'] for r in moves], [len(b'first build'), len(b'old source\n')])
@@ -922,7 +918,7 @@ class CleanScratchTests(unittest.TestCase):
                 self.assertTrue(path.parent.stat().st_mode & stat.S_IWUSR, str(path.parent))
                 if path.is_dir():
                     self.assertTrue(path.stat().st_mode & stat.S_IWUSR, str(path))
-                destination = cleanup.trash(path)
+                destination = trash(path)
                 moved.append(path)
                 yield path, destination
         with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3):
@@ -952,7 +948,7 @@ class CleanScratchTests(unittest.TestCase):
                 if path == protected:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o555)
                     raise PermissionError('foreign read-only directory')
-                yield path, cleanup.trash(path)
+                yield path, trash(path)
         result, records = self.run_cleanup(apply=True, include_released=True, mover=enforce_permissions)
         self.assertTrue(protected.exists())
         self.assertEqual(stat.S_IMODE(protected.stat().st_mode), 0o555)
@@ -974,7 +970,7 @@ class CleanScratchTests(unittest.TestCase):
             for path in paths:
                 if path == failed:
                     raise PermissionError('fixture permission denied')
-                yield path, cleanup.trash(path)
+                yield path, trash(path)
         with patch.object(cleanup, 'MOVE_BATCH_SIZE', 3):
             result, records = self.run_cleanup(apply=True, mover=fail_one)
         self.assertEqual(result, 1)
@@ -1052,7 +1048,7 @@ class CleanScratchTests(unittest.TestCase):
         def requiring_write(paths):
             for path in paths:
                 self.assertTrue(path.parent.stat().st_mode & stat.S_IWUSR)
-                yield path, cleanup.trash(path)
+                yield path, trash(path)
         with patch.object(cleanup, 'MOVE_BATCH_SIZE', 4):
             result, records = self.run_cleanup(apply=True, mover=requiring_write)
         self.assertEqual(result, 0)
@@ -1070,7 +1066,7 @@ class CleanScratchTests(unittest.TestCase):
                 if path == failed:
                     self.assertTrue(path.stat().st_mode & stat.S_IWUSR)
                     raise PermissionError('one fixture move failed')
-                yield path, cleanup.trash(path)
+                yield path, trash(path)
         result, records = self.run_cleanup(apply=True, mover=failing_folder)
         self.assertEqual(result, 1)
         self.assertTrue((failed / 'object').exists());self.assertFalse(source.exists())
@@ -1137,7 +1133,7 @@ class CleanScratchTests(unittest.TestCase):
                 item = self.item(name);self.write(item, '.build/object')
                 def terminal_failure(paths):
                     for path in paths:
-                        destination = cleanup.trash(path)
+                        destination = trash(path)
                         yield path, destination
                     if name == 'backend':
                         raise subprocess.CalledProcessError(5, ['fixture-trash'])
@@ -1171,8 +1167,10 @@ class CleanScratchTests(unittest.TestCase):
                         self.installed.write_text(json.dumps({'source_fingerprint': 'b' * 64}))
                     return []
                 def partial(paths):
-                    yield paths[0], cleanup.trash(paths[0])
-                    raise PermissionError('fixture second move failed')
+                    path, = paths
+                    if path == items[1]:
+                        raise PermissionError('fixture second move failed')
+                    yield path, trash(path)
                 result, records = self.run_cleanup(apply=True, session_id=session,
                                                    process_reader=reader, mover=partial)
                 self.assertEqual(result, 1)
@@ -1198,15 +1196,13 @@ class CleanScratchTests(unittest.TestCase):
             self.write(item, 'note.md', b'private evidence')
         started = time.monotonic()
         with patch.object(cleanup, 'inventory', wraps=cleanup.inventory) as inspected, \
-             patch.object(cleanup, 'trash_paths', wraps=cleanup.trash_paths) as mover, \
              patch.object(cleanup, 'running_paths', return_value=[]) as processes:
-            result, records = self.run_cleanup(apply=True, mover=mover, process_reader=processes)
+            result, records = self.run_cleanup(apply=True, process_reader=processes)
         elapsed = time.monotonic() - started
         self.assertEqual(result, 0)
         self.assertLess(elapsed, 60, f'large tree apply took {elapsed:.2f}s')
-        self.assertEqual(mover.call_count, 8)  # One batch per 32-item window.
-        self.assertEqual(processes.call_count, 9)
-        self.assertEqual(inspected.call_count, 750)  # Plan, pre-move, post-move per item.
+        self.assertEqual(processes.call_count, 9)  # One observation per 32-item window, plus planning.
+        self.assertEqual(inspected.call_count, 500)  # Plan and post-move walks, no walk in the final gate.
         summaries = [r for r in records if r['action'] == 'trashed']
         self.assertEqual(len(summaries), 250)
         self.assertEqual(sum(r['build_bytes'] for r in summaries), 11_000_032_000)
@@ -1529,10 +1525,123 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(scans, 2)
         self.assertEqual(len(rows), 1)
-        self.assertIn('changed during inspection', rows[0]['reason'])
+        self.assertEqual(rows[0]['reason'], 'workspace ownership/release changed; stopped')
         self.assertTrue(payload.is_file())
         self.assertFalse(cleanup.read_marker(workspace)['released'])
         self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_apply_refuses_injected_changes_after_slow_observations(self):
+        change_cases = {
+            're-marked persistent': 'workspace ownership/release changed; stopped',
+            'release withdrawn': 'workspace ownership/release changed; stopped',
+            'installed matches receipt': 'installed round changed; rerun preview with its qualified copy retained',
+            'rollback matches receipt': 'installed round changed; rerun preview with its qualified copy retained',
+            'new process': 'running process began using item; stopped',
+            'new inventory file': 'item changed during inspection/Trash moves; stopped',
+            'new explicit keep': 'explicitly retained qualified copy or persistent build slot',
+            'shared receipt matches installed': 'qualified copy of latest installed round (matching source fingerprint); stopped before Trash',
+        }
+        round_wide = {'installed matches receipt', 'rollback matches receipt', 'shared receipt matches installed'}
+        stages = ('shared scan', 'process refresh', 'size walk')
+        for stage_index, stage in enumerate(stages):
+            for case_index, (case, expected_reason) in enumerate(change_cases.items()):
+                with self.subTest(stage=stage, change=case):
+                    session = f'fixture-{stage_index}-{case_index}'
+                    container = self.item('round', session=session)
+                    self.write(container, '.build/CACHEDIR.TAG')
+                    checkout = container / 'checkout'
+                    sibling = container / 'idle'
+                    payload = self.write(checkout, 'src/work.py', b'original payload')
+                    self.write(sibling, 'src/work.py')
+                    for workspace in (checkout, sibling):
+                        self.mark(workspace, session=session, release=True)
+                    identity = lambda value: json.dumps({'source_fingerprint': value}).encode()
+                    next_build = 'b' * 64
+                    receipt = self.write(container, 'staged/Checklist.app/Contents/Resources/build-info.json',
+                                         identity(next_build))
+                    applications = self.root / f'Applications-{stage_index}-{case_index}'
+                    self.installed = self.write(applications, 'Checklist.app/Contents/Resources/build-info.json',
+                                                identity(self.fingerprint))
+                    def switch_installed():
+                        self.installed.write_bytes(identity(next_build))
+
+                    if stage == 'process refresh' and case == 'installed matches receipt':
+                        installed_target = self.installed.with_name('installed-target.json')
+                        self.installed.rename(installed_target)
+                        link = self.installed.with_name('receipt-link.json')
+                        link.symlink_to(installed_target)
+                        self.installed.symlink_to(link)
+                        new_target = self.write(installed_target.parent, 'new-build.json', identity(next_build))
+
+                        def switch_installed():
+                            moved_link = link.with_name('old-receipt-link.json')
+                            link.rename(moved_link)
+                            link.symlink_to(new_target)
+                    self.write(applications, '.Checklist-previous-20261127T000000Z-1.app/'
+                                             'Contents/Resources/build-info.json', identity('c' * 64))
+                    processes, keeps, injected = [], [], []
+                    changes = {
+                        're-marked persistent': lambda: cleanup.write_marker(
+                            checkout, session, 'opened another ticket', tickets=['CL-21']),
+                        'release withdrawn': lambda: (checkout / cleanup.WORKSPACE_MARKER).rename(
+                            self.root / f'withdrawn-{session}.json'),
+                        'installed matches receipt': switch_installed,
+                        'rollback matches receipt': lambda: self.write(
+                            applications, '.Checklist-previous-20261127T000001Z-2.app/'
+                                          'Contents/Resources/build-info.json', identity(next_build)),
+                        'new process': lambda: processes.append(payload),
+                        'new inventory file': lambda: self.write(checkout, 'src/new.py', b'new source'),
+                        'new explicit keep': lambda: keeps.append(checkout),
+                        'shared receipt matches installed': lambda: receipt.write_bytes(identity(self.fingerprint)),
+                    }
+
+                    def inject(point):
+                        if point == stage:
+                            changes[case]()
+                            injected.append(point)
+
+                    scans, reads = 0, 0
+                    scan_receipts, size_reader = cleanup.shared_round_receipts, cleanup.du_sizes
+
+                    def scan(root, workspaces):
+                        nonlocal scans
+                        scans += 1
+                        if scans == 2:
+                            inject('shared scan')
+                        yield from scan_receipts(root, workspaces)
+
+                    def process_reader():
+                        nonlocal reads
+                        reads += 1
+                        if reads == 3:
+                            inject('process refresh')
+                        return list(processes)
+
+                    def size_walk(paths):
+                        inject('size walk')
+                        return size_reader(paths)
+
+                    with patch.object(cleanup, 'shared_round_receipts', side_effect=scan), \
+                         patch.object(cleanup, 'du_sizes', side_effect=size_walk):
+                        code, rows = self.run_cleanup(
+                            apply=True, session_id=session, keep=keeps, process_reader=process_reader,
+                            after_inspection=lambda: cleanup.du_sizes([container]))
+                    self.assertEqual(injected, [stage])
+                    self.assertEqual(code, 1)
+                    by_path = {row['path']: row for row in rows if 'path' in row}
+                    held = by_path[str(checkout)]
+                    self.assertEqual(held['action'], 'kept_error')
+                    reason = expected_reason
+                    if case == 'shared receipt matches installed' and stage == 'process refresh':
+                        reason = 'shared round contents changed during inspection; stopped'
+                    self.assertEqual(held['reason'], reason)
+                    self.assertEqual(held['moved_count'], 0)
+                    self.assertEqual(held['destinations'], [])
+                    self.assertEqual(payload.read_bytes(), b'original payload')
+                    expected_moves = [] if case in round_wide else [str(sibling)]
+                    self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                                     expected_moves)
+                    self.assertEqual(sibling.is_dir(), not expected_moves)
 
     def test_build_cache_container_respects_parent_and_foreign_scope(self):
         protected = self.item('marked-parent')

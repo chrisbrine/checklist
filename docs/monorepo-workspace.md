@@ -409,8 +409,21 @@ private-copy indicator, scratch cleanup previews each marked child with its own
 reason. A protected child can stay while eligible released siblings move to the
 Trash. The parent cache, loose evidence and unmarked children stay. When a
 receipt in the shared files identifies the installed or immediate rollback build,
-every workspace in the round stays. Apply rechecks shared receipts before each
-Trash batch. See the
+every workspace in the round stays. Apply prepares same-volume Trash destinations
+and takes its process observations in bounded groups. In a split round, it
+refreshes process use after scanning shared receipts. Immediately before each
+move, it checks the recorded inventory entries and directory timestamps,
+workspace markers, explicit keeps, installed and rollback receipts, and the
+latest process result. Directory timestamps cover additions and removals.
+Shared receipts and the directory that selects the rollback bundle also have
+recorded metadata. A change refuses the affected move.
+
+The final check uses the paths already recorded. Once it passes, apply calls an
+exclusive, no-follow rename in the same process. The gap contains no scan,
+directory walk or subprocess. Process use can change after its last observation,
+and another writer can change a path after its final metadata check. The
+observations do not lock other processes or make the checks and rename atomic.
+See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 
 Size budget (CL-359): each `clean_builds.py` and `clean_scratch.py` run ends with
