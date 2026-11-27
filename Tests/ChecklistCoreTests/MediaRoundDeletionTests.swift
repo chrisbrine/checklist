@@ -90,6 +90,19 @@ final class MediaRoundDeletionTests: XCTestCase {
         }
     }
 
+    func testFilelessDeletionDoesNotOpenTheBackupIndex() throws {
+        let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
+        let backup = StorageBackupAccountingCache.shared(root:f.root)
+        var observations = 0
+        backup.cleanupLookupObserver = {_,_ in observations += 1}
+        defer {backup.cleanupLookupObserver = nil}
+        let result = try worker(f,"media_round_delete",input(f,round))
+        XCTAssertEqual(result["deleted"] as? Bool,true)
+        XCTAssertEqual(result["cleanup_state"] as? String,"completed")
+        XCTAssertTrue(try XCTUnwrap(result["files"] as? [JSON]).isEmpty)
+        XCTAssertEqual(observations,0)
+    }
+
     func testMatchedHistoryWorkLimitRefusesBeforeRemovingRoundRecords() throws {
         let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
         let roundID = try XCTUnwrap(round["id"] as? String)

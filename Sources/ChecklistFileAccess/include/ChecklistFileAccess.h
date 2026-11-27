@@ -9,4 +9,7 @@ void checklist_reap_idle_folder_helper(void);
 // Lexical skip after complete JSON validation. Returns 1 and the exclusive end
 // offset on success, 0 on missing/truncated input. Reads only within count.
 int checklist_json_value_end(const uint8_t *bytes, size_t count, size_t start, size_t *end);
+// A sufficient (not necessary) Foundation compatibility check for an object
+// already accepted by SQLite json_valid. Zero asks the caller to parse it.
+int checklist_json_is_plain_object(const uint8_t *bytes, size_t count);
 #endif

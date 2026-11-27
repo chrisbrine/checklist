@@ -34,8 +34,8 @@ struct CommandOperationPurgeEpoch {
 /// Scheduling state is process-local. Acceptance lives in durable journals;
 /// terminal state is canonical in SQLite. Successful replies live exclusively
 /// in the ordinary command journal, with byte-free attachment read descriptors.
-/// The service supplies its own concurrent command-operation queue, separate from
-/// storage maintenance. In-process domain callers may
+/// The service supplies operation queues separate from storage maintenance.
+/// In-process domain callers may
 /// keep the synchronous router without installing a service scheduler.
 final class CommandOperations: @unchecked Sendable {
     struct Job: @unchecked Sendable {
@@ -49,7 +49,9 @@ final class CommandOperations: @unchecked Sendable {
     }
     private let lock = NSLock()
     private var queue: DispatchQueue?
+    private var mediaRoundDeletionQueue: DispatchQueue?
     private var jobs: [String:Job] = [:]
+    private var mediaRoundDeletions: [String] = []
     private var scheduled = Set<String>()
     private var recoveryRequired = Set<String>()
     private var executing = Set<String>()
@@ -170,39 +172,60 @@ final class CommandOperations: @unchecked Sendable {
     func recordRecoveryRequired(_ id: String) {lock.withLock {_ = recoveryRequired.insert(id)}}
     func needsRecovery(_ id: String) -> Bool {lock.withLock {recoveryRequired.contains(id)}}
     var enabled: Bool {lock.withLock {queue != nil}}
-    func configure(queue: DispatchQueue,completion: @escaping @Sendable (String,Bool) -> Void) {
-        lock.withLock {self.queue = queue;self.completion = completion}
+    func configure(queue: DispatchQueue,mediaRoundDeletionQueue: DispatchQueue?,completion: @escaping @Sendable (String,Bool) -> Void) {
+        lock.withLock {
+            self.queue = queue
+            self.mediaRoundDeletionQueue = mediaRoundDeletionQueue
+            self.completion = completion
+        }
     }
     func add(_ job: Job,router: CommandRouter) {
-        lock.withLock {jobs[job.id] = job;recoveryRequired.remove(job.id);held.removeValue(forKey:job.id)}
+        lock.withLock {
+            if job.method == "media_round_delete",mediaRoundDeletionQueue != nil,jobs[job.id] == nil {
+                mediaRoundDeletions.append(job.id)
+            }
+            jobs[job.id] = job
+            recoveryRequired.remove(job.id)
+            held.removeValue(forKey:job.id)
+        }
         resume(router:router)
     }
     func resume(router: CommandRouter) {
-        let pending: [(DispatchQueue,Job)] = lock.withLock {
-            guard let queue else {return []}
-            return jobs.values.filter {scheduled.insert($0.id).inserted}.map {(queue,$0)}
-        }
-        for (queue,job) in pending {
-            queue.async { [self,router] in
-                let finished = router.runCommandOperation(job)
-                let callback = lock.withLock { () -> (@Sendable (String,Bool) -> Void)? in
-                    scheduled.remove(job.id)
-                    if finished,jobs[job.id]?.attempt == job.attempt {jobs.removeValue(forKey:job.id)}
-                    return completion
+        lock.withLock {
+            guard let queue else {return}
+            if let mediaRoundDeletionQueue {
+                for id in mediaRoundDeletions {
+                    guard let job = jobs[id],scheduled.insert(id).inserted else {continue}
+                    schedule(job,on:mediaRoundDeletionQueue,router:router)
                 }
-                if finished {job.lease.finish();callback?(job.method,true)}
-                if router.writeAdmissionStatus["locked"] as? Bool != true {resume(router:router)}
-                // A blocked job retains its admitted lease and waits for the
-                // existing backup admission notification, without polling.
             }
+            for job in jobs.values where scheduled.insert(job.id).inserted {schedule(job,on:queue,router:router)}
+        }
+    }
+    private func schedule(_ job: Job,on queue: DispatchQueue,router: CommandRouter) {
+        queue.async { [self,router] in
+            let finished = router.runCommandOperation(job)
+            let callback = lock.withLock { () -> (@Sendable (String,Bool) -> Void)? in
+                scheduled.remove(job.id)
+                if finished,jobs[job.id]?.attempt == job.attempt {
+                    jobs.removeValue(forKey:job.id)
+                    if job.method == "media_round_delete" {mediaRoundDeletions.removeAll {$0 == job.id}}
+                }
+                return completion
+            }
+            if finished {job.lease.finish();callback?(job.method,true)}
+            // A blocked job retains its admitted lease and waits for the
+            // existing backup admission notification, without polling.
+            if router.writeAdmissionStatus["locked"] as? Bool != true {resume(router:router)}
         }
     }
 }
 
 extension CommandRouter {
-    /// Called once by the lifecycle owner, using its existing maintenance lane.
-    public func configureCommandOperations(on queue: DispatchQueue,completion: @escaping @Sendable (String,Bool) -> Void = {_,_ in}) {
-        commandOperations.configure(queue:queue,completion:completion)
+    /// Called once by the lifecycle owner with its off-request operation queues.
+    public func configureCommandOperations(on queue: DispatchQueue,mediaRoundDeletionQueue: DispatchQueue? = nil,
+                                           completion: @escaping @Sendable (String,Bool) -> Void = {_,_ in}) {
+        commandOperations.configure(queue:queue,mediaRoundDeletionQueue:mediaRoundDeletionQueue,completion:completion)
     }
     public func resumeCommandOperations() {commandOperations.resume(router:self)}
 

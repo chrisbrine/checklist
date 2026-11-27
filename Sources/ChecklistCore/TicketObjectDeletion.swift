@@ -481,10 +481,14 @@ extension CommandRouter {
     func enqueueTicketObjectDeletion(_ db: Database, project: String, task: String, cause: String, plan: TicketObjectDeletionPlan) throws -> JSON {
         guard db.isInsideTransaction else {throw CoreError("STORAGE_TRANSACTION_REQUIRED","Object deletion intent must commit with its semantic command.")}
         let id = uuid()
-        let generation = try ticketCleanupBackupGenerationRow(db)
+        // An empty media receipt is terminal and has no descriptor to rearm.
+        let observeBackup = cause != "media_round_delete" || !plan.objects.isEmpty
+        let generation = try observeBackup ? ticketCleanupBackupGenerationRow(db) : nil
         let receipt: JSON = ["id":id,"project_id":project,"task_id":task,"kind":Self.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
         try save(db,receipt,type:"storage_job")
-        if ["task_purge","done_evidence","media_round_delete"].contains(cause) {try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])}
+        if let generation,["task_purge","done_evidence","media_round_delete"].contains(cause) {
+            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])
+        }
         return receipt
     }
 

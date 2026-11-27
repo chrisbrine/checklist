@@ -6,6 +6,93 @@ import XCTest
 @testable import ChecklistCore
 
 extension MediaRoundDeletionTests {
+    func testParallelDeletionReadersShareThePinnedSnapshot() throws {
+        let f = try Fixture()
+        let witness = uuid()
+        try f.router.dbQueue.write {db in
+            try db.execute(sql:"""
+                WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<8193)
+                INSERT INTO records(id,type,revision,data)
+                SELECT printf('00000000-0000-0000-0000-%012d',n+200000),'profile',1,'{}' FROM fixture
+                """)
+            try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?, 'before')",arguments:[witness])
+        }
+        var configuration = Configuration()
+        configuration.readonly = true
+        configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
+        let reader = try DatabaseQueue(path:f.root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
+        try reader.read {source in
+            let sql = "SELECT value FROM metadata WHERE key=?"
+            XCTAssertEqual(try String.fetchOne(source,sql:sql,arguments:[witness]),"before")
+            try f.router.dbQueue.write {db in
+                try db.execute(sql:"UPDATE metadata SET value='after' WHERE key=?",arguments:[witness])
+            }
+            let pieces = try XCTUnwrap(MediaRoundDeletionReadWork.perform(source) {db,_ in
+                var result = MediaRoundDeletionHistory()
+                result.events = [try XCTUnwrap(String.fetchOne(db,sql:sql,arguments:[witness]))]
+                return .history(result,0)
+            })
+            XCTAssertEqual(pieces.count,MediaRoundDeletionReadWork.partitions + 1)
+            for piece in pieces {
+                guard case .history(let result,_) = piece else {return XCTFail("Expected the observation from a snapshot reader")}
+                XCTAssertEqual(result.events,["before"])
+            }
+            XCTAssertEqual(try f.router.dbQueue.read {try String.fetchOne($0,sql:sql,arguments:[witness])},"after")
+        }
+    }
+
+    func testCachedMediaAuthorityMatchesPreviousClosureValidation() throws {
+        let f = try Fixture(),type = try f.type(checks.schema())
+        for itemCount in [1,2,7] {
+            let round = try f.round(type)
+            for index in 0..<itemCount { _ = try f.item(round,title:"Shared type dependency \(index)") }
+            _ = try cancel(f,round)
+        }
+        try f.router.dbQueue.read {db in
+            try self.previousMediaAuthorityValidation(db)
+            try f.router.ticketCleanupValidateMediaAuthority(db)
+        }
+        try f.router.dbQueue.write {db in
+            let candidate = try XCTUnwrap(f.router.records(db,type:"media_candidate",project:f.project).first)
+            let id = try XCTUnwrap(candidate["id"] as? String)
+            try db.execute(sql:"UPDATE records SET data=json_set(data,'$.record_references',json(?)) WHERE id=?",
+                arguments:[try jsonString([["id":uuid(),"type":"media_item_target","revision":1]]),id])
+        }
+        try f.router.dbQueue.read {db in
+            XCTAssertThrowsError(try self.previousMediaAuthorityValidation(db)) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_CAPTURE_INCOMPLETE")}
+            XCTAssertThrowsError(try f.router.ticketCleanupValidateMediaAuthority(db)) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_CAPTURE_INCOMPLETE")}
+        }
+    }
+
+    func testSmallHistorySelectionAgreesWithPreviousScan() throws {
+        let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
+        let id = try XCTUnwrap(round["id"] as? String)
+        let tokens = try jsonString([id])
+        let owned = Set([Data(id.utf8)])
+        try f.router.dbQueue.write {db in
+            for index in 0..<137 {
+                let entity = index.isMultiple(of:7) ? id : uuid()
+                let kind = index.isMultiple(of:2) ? "media_fixture_history" : "message_saved"
+                let result = try jsonString(index.isMultiple(of:3) ? [id:"exact key"] : ["text":index.isMultiple(of:5) ? id : id + "-suffix"])
+                try db.execute(sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES(?,?,?,'fixture',?,?,?)",
+                    arguments:[uuid(),f.project,entity,kind,now(),result])
+                try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES('fixture',?,'digest',?)",arguments:[uuid(),result])
+            }
+        }
+        try f.router.dbQueue.read {db in
+            func oldMatch(_ payload: String) -> String {
+                "EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(\(payload)) THEN CASE WHEN json_type(\(payload))='object' THEN \(payload) ELSE '{}' END ELSE '{}' END) j WHERE (j.type='text' AND CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))) OR (typeof(j.key)='text' AND CAST(j.key AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
+            }
+            let oldEventRows = try Row.fetchAll(db,sql:"SELECT id,entity_id,CASE WHEN kind GLOB 'media_*' THEN " + oldMatch("data") + " ELSE 0 END AS media_reference FROM events WHERE project_id=CAST(? AS TEXT)",arguments:[tokens,tokens,Data(f.project.utf8)])
+            let oldCommandRows = try Row.fetchAll(db,sql:"SELECT principal,command_id," + oldMatch("result") + " AS media_reference FROM commands",arguments:[tokens,tokens])
+            let oldEvents = oldEventRows.filter {owned.contains(Data(($0["entity_id"] as String? ?? "").utf8)) || $0["media_reference"] as Bool}.map {$0["id"] as String}
+            let oldCommands = oldCommandRows.filter {$0["media_reference"] as Bool}.map {[$0["principal"] as String,$0["command_id"] as String]}
+            let current = try MediaRoundDeletionHistory.select(db,project:f.project,owned:owned)
+            XCTAssertEqual(Set(current.events),Set(oldEvents))
+            XCTAssertEqual(Set(current.commands.map {[$0.0,$0.1]}),Set(oldCommands))
+        }
+    }
+
     /// The failed field check had an actual image import and its mutable storage
     /// bookkeeping. A text-only round has none of those rows.
     func testF2ImageFenceAllows180SameProjectNotesEventsAndReceiptsDuringPreparation() throws {
@@ -360,5 +447,42 @@ extension MediaRoundDeletionTests {
             }
         }
         print("F2 final-fence query seconds=\(durations)")
+    }
+}
+
+private extension MediaRoundDeletionTests {
+    func previousMediaAuthorityValidation(_ db: Database) throws {
+        let types = (MediaRecordRegistry.families.union(["storage_job","storage_hold"])).sorted()
+        let placeholders = types.map {_ in "?"}.joined(separator:",")
+        // Known deletion receipts are accounting, never media roots. Their
+        // complete canonical payload was already validated by the corpus stream;
+        // a large receipt must not make every unrelated media observation fail.
+        let cursor = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type IN (" + placeholders + ") AND NOT (type='storage_job' AND json_valid(data) AND COALESCE(json_extract(data,'$.kind')='ticket_object_delete',0)) ORDER BY rowid",arguments:StatementArguments(types))
+        while let root = try cursor.next() {
+            try autoreleasepool {
+                var selected: [Data:DecodedEnvelope] = [:],pending: [String] = [],bytes = 0
+                func add(_ raw: Row) throws {
+                    let rawBytes: Data = raw["_envelope_data_bytes"]
+                    bytes += rawBytes.count
+                    guard rawBytes.count <= TicketCleanupInventory.rowByteLimit,bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Media authority exceeds the cleanup memory bound.")}
+                    let envelope = try GRDBRecordEnvelopeAdapter.decode(raw),key = Data(envelope.id.utf8)
+                    guard selected[key] == nil else {return}
+                    selected[key] = envelope
+                    pending += (envelope.object["record_references"] as? [JSON] ?? []).compactMap {$0["id"] as? String}
+                    if envelope.type == "storage_hold",envelope.object["kind"] as? String == "media_reference" {
+                        pending += [envelope.object["owner_id"] as? String,envelope.object["attachment_id"] as? String].compactMap {$0}
+                    }
+                    if envelope.type == "storage_job",let id = envelope.object["attachment_owner_id"] as? String {pending.append(id)}
+                    if envelope.type == "attachment",CommandRouter.isKeptMediaRoundAttachment(envelope.object),let id = envelope.object["task_id"] as? String {pending.append(id)}
+                }
+                try add(root)
+                while let id = pending.popLast() {
+                    if selected[Data(id.utf8)] != nil {continue}
+                    guard let raw = try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A required media dependency is unavailable.")}
+                    try add(raw)
+                }
+                try MediaRecordRegistry.validate(Array(selected.values))
+            }
+        }
     }
 }

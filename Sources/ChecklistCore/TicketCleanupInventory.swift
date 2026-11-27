@@ -1,4 +1,5 @@
 import Foundation
+import ChecklistFileAccess
 import OSLog
 import GRDB
 
@@ -86,13 +87,13 @@ struct TicketCleanupInventory {
 }
 
 extension CommandRouter {
-    /// Unrelated payloads above 16 KiB use canonical/ownership headers. Preserve
-    /// full Foundation JSON validation through 4 MiB; larger payloads retain the
-    /// existing 64 KiB UTF-8 streaming path. SQLite matches complete references.
-    func streamTicketCleanupRows(_ db: Database,needles: Set<Data> = [],holdDigests: Set<Data> = [],prefixes: Set<String> = [],fullPayloads: Bool = false,_ body: (PurgeRow,Int) throws -> Void) throws {
+    /// Unrelated payloads above 16 KiB use canonical/ownership headers. Check
+    /// compatibility with Foundation through 4 MiB; larger payloads retain the
+    /// 64 KiB UTF-8 streaming path. SQLite matches complete references.
+    func streamTicketCleanupRows(_ db: Database,needles: Set<Data> = [],holdDigests: Set<Data> = [],prefixes: Set<String> = [],fullPayloads: Bool = false,partition: (index: Int, count: Int)? = nil,_ body: (PurgeRow,Int) throws -> Void) throws {
         let keys = "'id','project_id','revision','kind','project_ids','owner_id','owner_kind','attachment_id','expires_at','task_id','source_task_id','message_id','attempt_id','parent_attempt_id','request_id','review_request_id','manifest_id','membership_id','delegation_id','conversation_id','source_capture_id'"
         let projection = "(SELECT '{'||COALESCE(group_concat(json_quote(key)||':'||CASE WHEN key='project_ids' THEN CASE WHEN type='array' AND NOT EXISTS(SELECT 1 FROM json_each(CASE WHEN type='array' THEN value ELSE '[]' END) grant_value WHERE grant_value.type!='text' OR length(CAST(grant_value.value AS BLOB))=0) THEN '[]' ELSE 'null' END WHEN length(CAST(records.data -> fullkey AS BLOB))>65536 THEN 'null' WHEN key='revision' THEN records.data -> fullkey WHEN type='true' THEN 'true' WHEN type='false' THEN 'false' ELSE json_quote(value) END),'')||'}' FROM json_each(records.data) WHERE key IN (" + keys + "))"
-        let bounded = "CASE WHEN length(CAST(records.data AS BLOB))<=\(TicketCleanupInventory.projectionByteLimit) THEN records.data WHEN json_valid(records.data) AND json_type(records.data)='object' THEN " + projection + " ELSE '{}' END"
+        let bounded = "CASE WHEN octet_length(records.data)<=\(TicketCleanupInventory.projectionByteLimit) THEN records.data WHEN json_valid(records.data) AND json_type(records.data)='object' THEN " + projection + " ELSE '{}' END"
         // Keep each lookup's array separate and build prefix bounds once. Empty
         // ownership scans need no reference traversal; a prefix match requires
         // the slash separator in the complete value or key.
@@ -102,21 +103,22 @@ extension CommandRouter {
         func matches(_ field: String) -> String {
             "(CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) OR (instr(\(field),'/')>0 AND EXISTS(SELECT 1 FROM cleanup_prefixes p WHERE CAST(\(field) AS BLOB)>=p.lo AND CAST(\(field) AS BLOB)<p.hi)) OR (records.type='storage_hold' AND CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
         }
+        let partitionFilter = partition.map {" WHERE ((records.rowid % \($0.count)) + \($0.count)) % \($0.count) = \($0.index)"} ?? ""
         let sql = """
             WITH cleanup_prefixes AS MATERIALIZED (SELECT CAST(value||'/' AS BLOB) lo,CAST(value||'0' AS BLOB) hi FROM json_each(?))
-            SELECT CASE WHEN length(CAST(id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN id END AS id,
-                CASE WHEN length(CAST(project_id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN project_id END AS project_id,
-                CASE WHEN length(CAST(type AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN type END AS type,revision,\(bounded) AS data,
-                CASE WHEN length(CAST(id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(id AS BLOB) END AS _envelope_id_bytes,
-                CASE WHEN length(CAST(project_id AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(project_id AS BLOB) END AS _envelope_project_id_bytes,
-                CASE WHEN length(CAST(type AS BLOB))<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(type AS BLOB) END AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes,
-                length(CAST(records.data AS BLOB)) AS original_size,typeof(records.data) AS original_type,json_valid(records.data) AS valid_json,
-                CASE WHEN \(!needles.isEmpty || !prefixes.isEmpty || !holdDigests.isEmpty ? 1 : 0) AND length(CAST(records.data AS BLOB))>\(fullPayloads ? TicketCleanupInventory.rowByteLimit : TicketCleanupInventory.projectionByteLimit) AND json_valid(records.data) THEN
+            SELECT CASE WHEN octet_length(id)<=\(TicketCleanupInventory.rowByteLimit) THEN id END AS id,
+                CASE WHEN octet_length(project_id)<=\(TicketCleanupInventory.rowByteLimit) THEN project_id END AS project_id,
+                CASE WHEN octet_length(type)<=\(TicketCleanupInventory.rowByteLimit) THEN type END AS type,revision,\(bounded) AS data,
+                CASE WHEN octet_length(id)<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(id AS BLOB) END AS _envelope_id_bytes,
+                CASE WHEN octet_length(project_id)<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(project_id AS BLOB) END AS _envelope_project_id_bytes,
+                CASE WHEN octet_length(type)<=\(TicketCleanupInventory.rowByteLimit) THEN CAST(type AS BLOB) END AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes,
+                octet_length(records.data) AS original_size,typeof(records.data) AS original_type,json_valid(records.data) AS valid_json,
+                CASE WHEN \(!needles.isEmpty || !prefixes.isEmpty || !holdDigests.isEmpty ? 1 : 0) AND octet_length(records.data)>\(fullPayloads ? TicketCleanupInventory.rowByteLimit : TicketCleanupInventory.projectionByteLimit) AND json_valid(records.data) THEN
                 CASE WHEN records.type='storage_job' AND json_extract(records.data,'$.kind')='ticket_object_delete' THEN 0 ELSE EXISTS(
                     SELECT 1 FROM json_tree(records.data) j WHERE
                     (j.type='text' AND \(matches("j.atom")))
                     OR (typeof(j.key)='text' AND \(matches("j.key")))
-                ) END ELSE 0 END AS large_match FROM records ORDER BY rowid
+                ) END ELSE 0 END AS large_match FROM records\(partitionFilter) ORDER BY rowid
             """
         let cursor = try Row.fetchCursor(db,sql:sql,arguments:[paths,tokens,digests,tokens,digests])
         while let raw = try cursor.next() {
@@ -128,25 +130,30 @@ extension CommandRouter {
                 if size > TicketCleanupInventory.projectionByteLimit {
                     let id = envelope.id
                     if size <= TicketCleanupInventory.rowByteLimit {
-                        // Foundation already requires the complete bounded row.
-                        // Read it once: repeated substr(CAST(data AS BLOB),...) loads
-                        // and copies the whole SQLite value for every 64 KiB slice.
-                        guard let bytes = try Data.fetchOne(db,sql:"SELECT CAST(data AS BLOB) FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]),
-                              bytes.count == size,String(data:bytes,encoding:.utf8) != nil else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
-                        do {
-                            guard let decoded = try JSONSerialization.jsonObject(with:bytes) as? JSON else {throw EnvelopeFailure(.jsonObject)}
-                            if fullPayloads {
-                                // The projected envelope has already checked raw
-                                // revision/duplicate headers and SQL ownership.
-                                // Bind the returned Foundation object to it too.
-                                guard let id = decoded["id"] as? String,EnvelopeStorageIdentity.equal(id,envelope.id),
-                                      EnvelopeStorageIdentity.equal(decoded["project_id"] as? String,envelope.projectID),
-                                      let revision = decoded["revision"] as? NSNumber,
-                                      try EnvelopeInteger.positiveExact(revision.stringValue) == envelope.revision else {throw EnvelopeFailure(.identityMismatch)}
-                                value = decoded
-                            }
-                        } catch let error as EnvelopeFailure {throw GRDBRecordEnvelopeAdapter.failure(error)}
-                        catch {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.jsonObject))}
+                        // Load the bounded payload once. SQLite already checked
+                        // its complete syntax. Plain ASCII objects need no
+                        // Foundation allocation when only the projection leaves.
+                        let statement = try db.cachedStatement(sql:"SELECT CAST(data AS BLOB) FROM records WHERE id=CAST(? AS TEXT)")
+                        guard let bytes = try Data.fetchOne(statement,arguments:[Data(id.utf8)]),
+                              bytes.count == size else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
+                        if fullPayloads || !bytes.withUnsafeBytes({raw in
+                            checklist_json_is_plain_object(raw.bindMemory(to:UInt8.self).baseAddress,raw.count) != 0
+                        }) {
+                            guard String(data:bytes,encoding:.utf8) != nil else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
+                            do {
+                                guard let decoded = try JSONSerialization.jsonObject(with:bytes) as? JSON else {throw EnvelopeFailure(.jsonObject)}
+                                if fullPayloads {
+                                    // Bind the returned object to the validated
+                                    // projected envelope and original revision.
+                                    guard let id = decoded["id"] as? String,EnvelopeStorageIdentity.equal(id,envelope.id),
+                                          EnvelopeStorageIdentity.equal(decoded["project_id"] as? String,envelope.projectID),
+                                          let revision = decoded["revision"] as? NSNumber,
+                                          try EnvelopeInteger.positiveExact(revision.stringValue) == envelope.revision else {throw EnvelopeFailure(.identityMismatch)}
+                                    value = decoded
+                                }
+                            } catch let error as EnvelopeFailure {throw GRDBRecordEnvelopeAdapter.failure(error)}
+                            catch {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.jsonObject))}
+                        }
                     } else {
                         // Oversized rows retain the bounded UTF-8 stream and exact
                         // SQL reference matcher; they can never cross admission.
@@ -272,14 +279,22 @@ extension CommandRouter {
         // complete canonical payload was already validated by the corpus stream;
         // a large receipt must not make every unrelated media observation fail.
         let cursor = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type IN (" + placeholders + ") AND NOT (type='storage_job' AND json_valid(data) AND COALESCE(json_extract(data,'$.kind')='ticket_object_delete',0)) ORDER BY rowid",arguments:StatementArguments(types))
+        // A target, candidate or anchor can belong to many overlapping
+        // closures. Reuse those exact decoded rows only in this SQLite
+        // snapshot. Each root still walks its complete closure and pays its
+        // own byte budget, including dependencies served from the cache.
+        let dependencyStatement = try db.cachedStatement(sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT)")
+        var dependencies: [Data:(envelope: DecodedEnvelope, bytes: Int)] = [:]
+        var cachedBytes = 0
         while let root = try cursor.next() {
             try autoreleasepool {
                 var selected: [Data:DecodedEnvelope] = [:],pending: [String] = [],bytes = 0
-                func add(_ raw: Row) throws {
-                    let rawBytes: Data = raw["_envelope_data_bytes"]
-                    bytes += rawBytes.count
-                    guard rawBytes.count <= TicketCleanupInventory.rowByteLimit,bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Media authority exceeds the cleanup memory bound.")}
-                    let envelope = try GRDBRecordEnvelopeAdapter.decode(raw),key = Data(envelope.id.utf8)
+                func charge(_ count: Int) throws {
+                    bytes += count
+                    guard count <= TicketCleanupInventory.rowByteLimit,bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Media authority exceeds the cleanup memory bound.")}
+                }
+                func add(_ envelope: DecodedEnvelope) {
+                    let key = Data(envelope.id.utf8)
                     guard selected[key] == nil else {return}
                     selected[key] = envelope
                     pending += (envelope.object["record_references"] as? [JSON] ?? []).compactMap {$0["id"] as? String}
@@ -289,11 +304,28 @@ extension CommandRouter {
                     if envelope.type == "storage_job",let id = envelope.object["attachment_owner_id"] as? String {pending.append(id)}
                     if envelope.type == "attachment",Self.isKeptMediaRoundAttachment(envelope.object),let id = envelope.object["task_id"] as? String {pending.append(id)}
                 }
-                try add(root)
+                try charge((root["_envelope_data_bytes"] as Data).count)
+                try add(GRDBRecordEnvelopeAdapter.decode(root))
                 while let id = pending.popLast() {
-                    if selected[Data(id.utf8)] != nil {continue}
-                    guard let raw = try Row.fetchOne(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A required media dependency is unavailable.")}
-                    try add(raw)
+                    let key = Data(id.utf8)
+                    if selected[key] != nil {continue}
+                    if let cached = dependencies[key] {
+                        try charge(cached.bytes)
+                        add(cached.envelope)
+                        continue
+                    }
+                    guard let raw = try Row.fetchOne(dependencyStatement,arguments:[key]) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A required media dependency is unavailable.")}
+                    let size = (raw["_envelope_data_bytes"] as Data).count
+                    try charge(size)
+                    let envelope = try GRDBRecordEnvelopeAdapter.decode(raw)
+                    let cost = size + key.count + 256
+                    if cachedBytes + cost > 8 * 1024 * 1024 {
+                        dependencies.removeAll(keepingCapacity:true)
+                        cachedBytes = 0
+                    }
+                    dependencies[key] = (envelope,size)
+                    cachedBytes += cost
+                    add(envelope)
                 }
                 try MediaRecordRegistry.validate(Array(selected.values))
             }

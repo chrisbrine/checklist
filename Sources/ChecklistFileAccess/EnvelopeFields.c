@@ -48,3 +48,43 @@ int checklist_json_value_end(const uint8_t *bytes, size_t count, size_t start, s
     *end = index;
     return index > start;
 }
+
+int checklist_json_is_plain_object(const uint8_t *bytes, size_t count) {
+    if (bytes == NULL || count == 0 || bytes[0] != '{') return 0;
+    size_t depth = 0;
+    int in_string = 0;
+    for (size_t index = 0; index < count; ++index) {
+        uint8_t byte = bytes[index];
+        if (byte == 0 || byte >= 0x80) return 0;
+        // JSON1 can stop at an embedded NUL. Check the complete byte value.
+        if (index > 0 && depth == 0) {
+            if (byte != ' ' && byte != '\t' && byte != '\n' && byte != '\r') return 0;
+            continue;
+        }
+        if (in_string) {
+            if (byte < 0x20) return 0;
+            if (byte == '\\') {
+                // SQLite and Foundation can disagree on escaped Unicode.
+                if (++index >= count || bytes[index] < 0x20 || bytes[index] == 'u' || bytes[index] >= 0x80) return 0;
+            } else if (byte == '"') in_string = 0;
+        } else if (byte == '"') {
+            in_string = 1;
+        } else if (byte == '{' || byte == '[') {
+            if (++depth > 64) return 0;
+        } else if (byte == '}' || byte == ']') {
+            if (depth == 0) return 0;
+            --depth;
+        } else if (byte == '-' || (byte >= '0' && byte <= '9')) {
+            size_t start = index;
+            // A short plain decimal has no overflow or unrepresentable exponent.
+            while (index + 1 < count) {
+                uint8_t next = bytes[index + 1];
+                if (next == 'e' || next == 'E') return 0;
+                if (next != '.' && (next < '0' || next > '9')) break;
+                ++index;
+                if (index - start >= 18) return 0;
+            }
+        }
+    }
+    return depth == 0 && !in_string;
+}

@@ -4,6 +4,57 @@ import XCTest
 @testable import ChecklistCore
 
 extension TicketLifecycleCleanupTests {
+    func testCL518ProjectedCleanupMatchesPreviousLargeRowStream() throws {
+        let (project,_,_) = try independentFixture(backed:false)
+        let projectID = project["id"] as! String
+        let needle = Data("exact-reference".utf8)
+        try write {db in
+            for (index,suffix) in ["ASCII", "café", "escaped \"quotes\" and \\ and \n"].enumerated() {
+                let record: JSON = ["id":uuid(),"project_id":projectID,"revision":1,
+                    "body":[index.isMultiple(of:2) ? "exact-reference" : "unrelated":String(repeating:"projection ",count:2000) + suffix],
+                    "sample":[-2.25,3,0]]
+                try self.router.save(db,record,type:"message")
+            }
+        }
+        try XCTUnwrap(router.readers).read {db in
+            var before: [String] = [],after: [String] = []
+            try self.router.legacyStreamTicketCleanupRows(db,needles:[needle]) {row,bytes in
+                before.append(try jsonString([row.id,row.type,bytes,row.value]))
+            }
+            try self.router.streamTicketCleanupRows(db,needles:[needle]) {row,bytes in
+                after.append(try jsonString([row.id,row.type,bytes,row.value]))
+            }
+            XCTAssertEqual(after,before)
+            var partitioned: [String] = []
+            for index in 0..<MediaRoundDeletionReadWork.partitions {
+                try self.router.streamTicketCleanupRows(db,needles:[needle],partition:(index,MediaRoundDeletionReadWork.partitions)) {row,bytes in
+                    partitioned.append(try jsonString([row.id,row.type,bytes,row.value]))
+                }
+            }
+            XCTAssertEqual(partitioned.sorted(),before.sorted())
+        }
+    }
+
+    func testCL518ProjectedCleanupRefusesAValidJSONPrefixWithNULTrailer() throws {
+        let (project,_,_) = try independentFixture(backed:false)
+        let projectID = project["id"] as! String,id = uuid()
+        let payload = try jsonString(["id":id,"project_id":projectID,"revision":1,
+                                      "body":String(repeating:"x",count:20_000)])
+        let raw = Data(payload.utf8) + Data([0]) + Data("{\"hidden\":true}".utf8)
+        try write {db in
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'message',1,CAST(? AS TEXT))",
+                arguments:[id,projectID,raw])
+        }
+        try XCTUnwrap(router.readers).read {db in
+            XCTAssertThrowsError(try self.router.legacyStreamTicketCleanupRows(db) {_,_ in}) {
+                XCTAssertEqual(($0 as? CoreError)?.code,"CANONICAL_RECORD_INVALID")
+            }
+            XCTAssertThrowsError(try self.router.streamTicketCleanupRows(db) {_,_ in}) {
+                XCTAssertEqual(($0 as? CoreError)?.code,"CANONICAL_RECORD_INVALID")
+            }
+        }
+    }
+
     func testCL516OldAndNewCleanupSelectSameOwnedAndReferencedRows() throws {
         for count in [32, 128, 512] {
             let (project,task,attachment) = try independentFixture(backed:false)

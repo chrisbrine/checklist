@@ -98,6 +98,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
     let workHealthQueue = DispatchQueue(label:"org.checklist.work-health",qos:.utility,autoreleaseFrequency:.workItem)
     let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
+    let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.userInitiated,autoreleaseFrequency:.workItem)
     var storageRunning = false
     var storageWakePlanning = false
     var storageWakeReplan = false
@@ -134,9 +135,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         self.expectedOwnerHash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data
         super.init()
         router.nativeReplyListenerStatus = relayListenerStatus(state:nativeRelayPolicy.enabled ? .notStarted : .disabled)
-        // Operations only decouple the reply; each runs on its own worker as the
-        // synchronous request did, never queued behind backups or maintenance.
-        router.configureCommandOperations(on:commandOperationQueue) { [weak self] _,_ in
+        // Each deletion can split its store-sized scan across readers. Admit
+        // one at a time so two scans cannot swamp request and CLI scheduling.
+        router.configureCommandOperations(on:commandOperationQueue,mediaRoundDeletionQueue:mediaRoundDeletionQueue) { [weak self] _,_ in
             guard let self else {return}
             self.queue.async { [self] in
                 changed()

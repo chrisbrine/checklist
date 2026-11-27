@@ -5,6 +5,78 @@ import Darwin
 @testable import ChecklistCore
 
 extension TicketLifecycleCleanupTests {
+    func testMediaReceiptWithoutObjectsNeedsNoBackupGeneration() throws {
+        let workspace = directory.appendingPathComponent("empty-media-receipt")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let project = try call("project_create",["name":"Empty media receipt fixture","key_prefix":"EM","root_path":workspace.path])
+        let projectID = try XCTUnwrap(project["id"] as? String)
+        var id = ""
+        try write {db in
+            var backupQueries = 0
+            db.trace {event in
+                if case .statement(let statement) = event,statement.sql.contains("backup-generation:*") {backupQueries += 1}
+            }
+            defer {db.trace(nil)}
+            let receipt = try self.router.enqueueTicketObjectDeletion(db,project:projectID,task:uuid(),cause:"media_round_delete",plan:TicketObjectDeletionPlan(objects:[]))
+            id = try XCTUnwrap(receipt["id"] as? String)
+            XCTAssertEqual(receipt["state"] as? String,"completed")
+            XCTAssertEqual((receipt["objects"] as? [JSON])?.count,0)
+            XCTAssertEqual((receipt["summary"] as? JSON)?["pending_count"] as? Int,0)
+            XCTAssertEqual(backupQueries,0)
+            XCTAssertNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-backup-seen:" + id]))
+        }
+        try router.dbQueue.read {db in
+            XCTAssertNil(try String.fetchOne(db,sql:"SELECT id FROM records WHERE id=? AND (" + CommandRouter.ticketObjectDeletionReadySQL + ")",arguments:[id]))
+        }
+    }
+
+    func testSmallByteReceiptEnqueueMatchesLegacyProjectionAndBackupMarker() throws {
+        let workspace = directory.appendingPathComponent("small-byte-legacy")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let project = try call("project_create",["name":"Byte receipt comparison fixture","key_prefix":"BR","root_path":workspace.path])
+        let projectID = try XCTUnwrap(project["id"] as? String)
+
+        func legacyEnqueue(_ db: Database,task: String,cause: String,plan: TicketObjectDeletionPlan) throws -> JSON {
+            let id = uuid()
+            let generation = try router.ticketCleanupBackupGenerationRow(db)
+            let receipt: JSON = ["id":id,"project_id":projectID,"task_id":task,"kind":CommandRouter.ticketObjectDeletionKind,"cause":cause,"state":plan.objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed","revision":1,"created_at":now(),"objects":plan.objects,"summary":plan.summary,"cleanup_policy_version":2]
+            try router.save(db,receipt,type:"storage_job")
+            if ["task_purge","done_evidence","media_round_delete"].contains(cause) {
+                try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-backup-seen:" + id,String(generation)])
+            }
+            return receipt
+        }
+
+        try write {db in
+            for cause in ["task_purge","done_evidence","media_round_delete"] {
+                for count in (cause == "media_round_delete" ? 1...5 : 0...5) {
+                    for mixed in [false,true] {
+                        let task = uuid()
+                        let objects: [JSON] = (0..<count).map {index in
+                            let retained = mixed && index % 2 == 0
+                            var object: JSON = ["relative_path":"objects/item-\(index)","kind":"file","representation":"original","size":index + 1,"state":retained ? "retained" : "pending"]
+                            if retained {object["reasons"] = ["keep_original"]}
+                            return object
+                        }
+                        let plan = TicketObjectDeletionPlan(objects:objects)
+                        let expected = try legacyEnqueue(db,task:task,cause:cause,plan:plan)
+                        let actual = try self.router.enqueueTicketObjectDeletion(db,project:projectID,task:task,cause:cause,plan:plan)
+                        func comparison(_ receipt: JSON) throws -> (String,String?) {
+                            let id = try XCTUnwrap(receipt["id"] as? String)
+                            var value = receipt
+                            value.removeValue(forKey:"id");value.removeValue(forKey:"created_at")
+                            let marker = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-backup-seen:" + id])
+                            return (try jsonString(value),marker)
+                        }
+                        let before = try comparison(expected),after = try comparison(actual)
+                        XCTAssertEqual(before.0,after.0)
+                        XCTAssertEqual(before.1,after.1)
+                    }
+                }
+            }
+        }
+    }
+
     private func deletionCohortFixture(_ counts: [Int]) throws -> [JSON] {
         let workspace = directory.appendingPathComponent("cohort-workspace")
         try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)

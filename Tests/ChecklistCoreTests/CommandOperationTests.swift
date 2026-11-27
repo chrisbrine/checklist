@@ -116,6 +116,57 @@ final class CommandOperationTests: XCTestCase {
         XCTAssertEqual(try jsonString(data(again)["result"]!),try jsonString(result))
     }
 
+    func testMediaRoundDeletionsQueueInOrderWhileOtherOperationsRun() throws {
+        let checks = MediaRoundDeletionTests(),f = try MediaFrozenIntakeTests.Fixture()
+        let type = try f.type(MediaRoundTests().schema())
+        let rounds = try (1...2).map {_ in try checks.cancel(f,f.round(type))}
+        let router = f.router!
+        let registration = try f.record(f.worker.sessionID!,"session")
+        let worker = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),
+                            projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
+        let otherOperations = DispatchQueue(label:"test-other-operations")
+        let deletionQueue = DispatchQueue(label:"test-media-round-deletions")
+        router.configureCommandOperations(on:otherOperations,mediaRoundDeletionQueue:deletionQueue)
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.mediaRoundDeletionPreparationProbe = {
+            entered.signal()
+            guard release.wait(timeout:.now()+10) == .success else {throw CoreError("TEST_TIMEOUT","Paused deletion was not released.")}
+        }
+        defer {
+            release.signal();release.signal()
+            let finished = DispatchSemaphore(value:0)
+            deletionQueue.async {finished.signal()}
+            XCTAssertEqual(finished.wait(timeout:.now()+15),.success)
+            router.mediaRoundDeletionPreparationProbe = nil
+        }
+        let operationIDs = try rounds.map {round -> String in
+            var params = try checks.input(f,round)
+            params["project_id"] = f.project;params["command_id"] = uuid()
+            let reply = try router.handle(method:"media_round_delete",params:params,caller:worker)
+            XCTAssertEqual(reply["command_outcome"] as? String,"accepted")
+            return try XCTUnwrap(data(reply)["operation_id"] as? String)
+        }
+        func state(_ index: Int) throws -> String? {
+            try data(router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":operationIDs[index]],caller:worker))["state"] as? String
+        }
+        XCTAssertEqual(entered.wait(timeout:.now()+10),.success)
+        XCTAssertEqual(try state(0),"running")
+        XCTAssertEqual(try state(1),"queued")
+        let free = DispatchSemaphore(value:0)
+        otherOperations.async {free.signal()}
+        XCTAssertEqual(free.wait(timeout:.now()+1),.success)
+        XCTAssertNotNil(try router.handle(method:"service_info",params:["project_id":f.project],caller:worker)["data"])
+        release.signal()
+        XCTAssertEqual(entered.wait(timeout:.now()+10),.success)
+        XCTAssertEqual(try state(0),"succeeded")
+        XCTAssertEqual(try state(1),"running")
+        release.signal()
+        let finished = DispatchSemaphore(value:0)
+        deletionQueue.async {finished.signal()}
+        XCTAssertEqual(finished.wait(timeout:.now()+10),.success)
+        XCTAssertEqual(try state(1),"succeeded")
+    }
+
     func testMediaRoundDeleteReplayKeepsFirstInterruptedOutcome() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),pid = project["id"] as! String,router = f.router!
         let lane = HeldLane(router);defer {lane.finish()}
