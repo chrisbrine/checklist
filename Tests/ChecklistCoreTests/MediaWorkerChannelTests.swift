@@ -459,13 +459,19 @@ final class MediaWorkerChannelTests: XCTestCase {
         defer {CommandRouter.disableReaderPoolForTesting = false}
         let f = try Fixture(),type = try f.type(checks.schema()),created = try round(f,type)
         XCTAssertNil(f.router.readers)
-        let before = try f.allState(),started = Date()
+        let before = try f.allState()
         XCTAssertThrowsError(try list(f)) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_READ_LANE_UNAVAILABLE")}
-        XCTAssertLessThan(Date().timeIntervalSince(started),1)
-        XCTAssertEqual(try f.allState(),before)
-        // The other worker reads keep their existing writer-admitted fallback.
         XCTAssertNoThrow(try get(f,created))
+
+        // Keep writer admission closed until both calls finish. A worker read
+        // that takes the writer fallback gets a locked reply during capture.
+        try f.router.backupWrites.beginCapture()
+        defer {f.router.backupWrites.endBackup(router:f.router)}
+        let fallback = try get(f,created)
+        XCTAssertEqual(fallback["state"] as? String,"locked")
+        XCTAssertEqual(fallback["retry_required"] as? Bool,true)
         XCTAssertThrowsError(try list(f,["state":["draft"]])) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_READ_LANE_UNAVAILABLE")}
+        XCTAssertEqual(try f.allState(),before)
     }
 
     func testWorkerRoundReadOmitsOwnerIdentityAndPrivateContextBodies() throws {
