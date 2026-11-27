@@ -397,6 +397,13 @@ command sends each note to its ticket with `message_send` (an agent action) befo
 the folder moves. If a note fails, the folder stays and the run reports an error.
 Evidence of open tickets stays.
 
+An unmarked round folder with its own `.build` can still hold independently
+registered workspaces (CL-524). When the cache is the parent folder's only
+private-copy indicator, scratch cleanup previews each marked child with its own
+reason. A protected child can stay while eligible released siblings move to the
+Trash. The parent cache, loose evidence and unmarked children stay. See the
+[scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
+
 Size budget (CL-359): each `clean_builds.py` and `clean_scratch.py` run ends with
 one `size_report` JSON line. It gives the `du -sk` sizes of the session scratch
 folders, `.local/evidence`, `.local/build` and

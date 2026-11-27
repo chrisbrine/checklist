@@ -588,11 +588,12 @@ def in_scope(item, kind, session_id, include_released=False):
         return False
 
 
-def private_copy(path):
+def private_copy(path, *, allow_build_only=True):
     """Recognize layouts, not names; links never establish a container child."""
     if path.is_symlink() or not path.is_dir():
         return False
-    return ((path / '.build').is_dir() or (path / '.git').exists() or (path / 'src/.git').exists()
+    return ((allow_build_only and (path / '.build').is_dir())
+            or (path / '.git').exists() or (path / 'src/.git').exists()
             or (path / 'capture-manifest.json').is_file()
             or (path / 'source-manifest.json').is_file()
             or (path / 'build-info.json').is_file())
@@ -604,9 +605,13 @@ def session_items(item):
     # whole-item protections (including malformed markers failing closed).
     try:
         if (item.is_symlink() or not item.is_dir() or read_marker(item) is not None
-                or re.fullmatch(r'ws[a-z]*\d+', item.name) or private_copy(item)):
+                or re.fullmatch(r'ws[a-z]*\d+', item.name) or private_copy(item, allow_build_only=False)):
             return [item]
-        # A ticket-registered child (CL-359) is its own candidate, like a private copy.
+        # A round container can have its own .build. In that case only marked
+        # children establish separate workspaces, and the remaining tree stays.
+        if (item / '.build').is_dir():
+            return [child for child in children(item) if not child.is_symlink() and child.is_dir()
+                    and os.path.lexists(child / WORKSPACE_MARKER)] or [item]
         copies = [child for child in children(item)
                   if private_copy(child) or os.path.lexists(child / WORKSPACE_MARKER)]
         return copies or [item]

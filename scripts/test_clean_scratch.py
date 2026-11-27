@@ -1333,6 +1333,96 @@ class CleanScratchTests(unittest.TestCase):
         self.assertNotIn('released_for_tickets', cleanup.read_marker(unknown))
         self.assertFalse(cleanup.ticket_released(unknown))
 
+    def test_session_container_with_own_build_cache_trashes_only_released_workspaces(self):
+        container = self.item('p11')
+        self.write(container, '.build/CACHEDIR.TAG')
+        loose_evidence = self.write(container, 'evidence/hand-in.md', b'uncommitted evidence')
+        unmarked_output = self.write(container, 'unmarked-copy/.build/object')
+        opened = container / 'open-workspace'
+        uncommitted = self.write(opened, 'src/source.py', b'uncommitted work')
+        open_build = self.write(opened, '.build/object')
+        cleanup.write_marker(opened, 'session', 'open ticket', tickets=['CL-1'])
+        released = [container / f'released-{index}' for index in range(3)]
+        for index, folder in enumerate(released, start=2):
+            self.write(folder, 'src/.git/config')
+            cleanup.write_marker(folder, 'session', 'finished ticket', tickets=[f'CL-{index}'])
+        statuses = {'CL-1': 'active', 'CL-2': 'done', 'CL-3': 'done', 'CL-4': 'canceled'}
+        with redirect_stdout(io.StringIO()):
+            roots = cleanup.ticket_roots(self.sessions, self.qualification, 'session')
+            self.assertEqual(cleanup.release_finished(roots, 'session',
+                lambda keys: {key: statuses[key] for key in keys}), 0)
+        self.assertFalse(cleanup.read_marker(opened)['released'])
+        held = cleanup.inventory(opened)
+
+        result, records = self.run_cleanup()
+        self.assertEqual(result, 0)
+        by_path = {Path(row['path']): row for row in records}
+        self.assertEqual(set(by_path), {opened, *released})
+        self.assertEqual(by_path[opened]['eligible_paths'], [])
+        for folder in released:
+            self.assertEqual(by_path[folder]['eligible_paths'], [str(folder)])
+            self.assertTrue(folder.is_dir())
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+        result, records = self.run_cleanup(apply=True)
+        self.assertEqual(result, 0)
+        moves = [row for row in records if row['action'] == 'trash_move']
+        self.assertEqual([Path(row['source']) for row in moves], released)
+        self.assertEqual(set(self.trash.iterdir()), {Path(row['trash']) for row in moves})
+        for row in moves:
+            self.assertFalse(Path(row['source']).exists())
+            self.assertTrue((Path(row['trash']) / 'src/.git/config').is_file())
+        self.assertEqual(cleanup.inventory(opened), held)
+        self.assertEqual(uncommitted.read_bytes(), b'uncommitted work')
+        self.assertEqual(loose_evidence.read_bytes(), b'uncommitted evidence')
+        self.assertTrue(open_build.is_file())
+        self.assertTrue(unmarked_output.is_file())
+        self.assertTrue((container / '.build/CACHEDIR.TAG').is_file())
+
+    def test_build_cache_container_preview_names_each_workspace_hold(self):
+        container = self.item('p11')
+        self.write(container, '.build/CACHEDIR.TAG')
+        assigned, installed, running, invalid, explicit = (
+            container / name for name in ['assigned', 'installed', 'running', 'invalid', 'explicit'])
+        for folder in (assigned, installed, running, invalid, explicit):
+            self.write(folder, 'notes.md')
+            self.mark(folder, release=folder != assigned)
+        self.write(installed, 'staged-app/build-info.json',
+                   json.dumps({'source_fingerprint': self.fingerprint}).encode())
+        self.write(invalid, cleanup.WORKSPACE_MARKER, b'{')
+        options = {'keep': [explicit], 'process_reader': lambda: [running / 'notes.md']}
+        result, records = self.run_cleanup(**options)
+        self.assertEqual(result, 0)
+        self.assertEqual({row['path']: row['reason'] for row in records}, {
+            str(assigned): f'persistent workspace marker; retained: {assigned}',
+            str(installed): 'qualified copy of latest installed round (matching source fingerprint)',
+            str(running): 'running process uses this item',
+            str(invalid): f'invalid/unreadable workspace marker; retained: {invalid}',
+            str(explicit): 'explicitly retained qualified copy or persistent build slot',
+        })
+        self.assertTrue(all(row['eligible_paths'] == [] for row in records))
+        self.assertEqual(self.run_cleanup(apply=True, **options)[0], 0)
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_build_cache_container_respects_parent_and_foreign_scope(self):
+        protected = self.item('marked-parent')
+        legacy = self.item('ws123')
+        qualified = self.item('qualified-parent')
+        foreign = self.item('foreign-parent', session='other-session')
+        self.write(qualified, 'build-info.json',
+                   json.dumps({'source_fingerprint': self.fingerprint}).encode())
+        self.mark(protected)
+        for parent in (protected, legacy, qualified, foreign):
+            self.write(parent, '.build/CACHEDIR.TAG')
+            child = parent / 'released-child'
+            self.write(child, 'notes.md')
+            self.mark(child, session='other-session' if parent == foreign else 'session', release=True)
+        result, records = self.run_cleanup(apply=True, include_released=True)
+        self.assertEqual(result, 0)
+        self.assertEqual({Path(row['path']) for row in records}, {protected, legacy, qualified})
+        self.assertTrue(all(row['eligible_paths'] == [] for row in records))
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_hand_release_retires_whole_folder(self):
         item = self.ticket_item('P-hand', ['CL-1'])
         self.mark(item, release=True)
