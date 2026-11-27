@@ -60,12 +60,12 @@ def is_refusal(error):
 
 
 class ServiceReadiness:
-    """Retry the first complete status read while a newly installed service starts.
+    """Retry the health probe while a newly installed service starts.
 
     The CLI reader must use ``call_timeout`` before *each* subprocess so a stuck
     call, project resolution and multiple ticket reads share the same deadline.
     Only an unready service is retried: a definite refusal stops at once (CL-372).
-    Once one full read succeeds, ordinary status errors are returned immediately,
+    Once the probe succeeds, ordinary status errors are returned immediately,
     and all reads share ``total_seconds``, because the installer waits for them.
     This object never writes release markers or changes service data.
     """
@@ -121,21 +121,13 @@ class ServiceReadiness:
             event['code'] = code
         self.report(event)
 
-    def read(self, reader, keys):
-        if self.failure is not None:
-            raise self.failure
-        if self.ready:
-            if self._total_remaining() <= 0:
-                self.failure = self._budget_error()
-                self._report('read_budget_exhausted', self.failure)
-                raise self.failure
-            return reader(keys)
+    def _wait(self, probe):
         if self.started is None:
             self.started = self.clock()
         while True:
             self.attempts += 1
             try:
-                result = reader(keys)
+                result = probe()
             except READ_ERRORS as error:
                 if is_refusal(error):
                     self.failure = error
@@ -158,3 +150,20 @@ class ServiceReadiness:
                 self.ready = True
                 self._report('ready')
                 return result
+
+    def read(self, reader, keys, *, probe=None):
+        if self.failure is not None:
+            raise self.failure
+        if not self.ready:
+            if probe is None:
+                return self._wait(lambda: reader(keys))
+            self._wait(probe)
+        if self._total_remaining() <= 0:
+            self.failure = self._budget_error()
+            self._report('read_budget_exhausted', self.failure)
+            raise self.failure
+        try:
+            return reader(keys)
+        except READ_ERRORS as error:
+            self.failure = error
+            raise

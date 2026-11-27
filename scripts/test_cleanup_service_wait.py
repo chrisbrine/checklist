@@ -184,12 +184,70 @@ class PostInstallServiceReadinessTests(unittest.TestCase):
         clean_scratch.write_marker(path, 'installer', 'CL-372 temporary fixture', tickets=[key])
         return path
 
-    def release(self, reader):
+    def release(self, reader=None, environ=None):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), patch.object(clean_builds, 'ServiceReadiness', return_value=self.wait):
-            result = clean_builds.release_done(self.root, environ={'CODEX_THREAD_ID': 'installer'},
+            result = clean_builds.release_done(self.root, environ=environ or {'CODEX_THREAD_ID': 'installer'},
                 reader=reader, sessions_root=self.sessions, qualification_root=self.qualification)
         return result, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_healthy_service_probe_precedes_scoped_reads_in_registered_workspace(self):
+        marker = self.marked('finished', 'CL-372')
+        checkout = self.root / 'registered'
+        checkout.mkdir()
+        calls = []
+
+        def run(arguments, **kwargs):
+            calls.append(tuple(arguments[1:3]))
+            if arguments[1] == 'service':
+                self.assertNotIn('cwd', kwargs)
+            else:
+                self.assertEqual(kwargs['cwd'], checkout)
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(1, arguments, stderr='Checklist: SERVICE_UNAVAILABLE: starting')
+            if arguments[1] == 'service':
+                self.assertEqual(kwargs['timeout'], 10.0)
+                data = {'name': 'Checklist', 'version': '1', 'capabilities': ['durable_store']}
+            elif arguments[2] == 'project_resolve':
+                self.assertEqual(json.loads(arguments[3]), {'workspace_path': str(checkout)})
+                data = {'projects': [{'id': 'fixture-project'}]}
+            else:
+                self.assertEqual(json.loads(arguments[3]), {'project_id': 'fixture-project', 'key': 'CL-372'})
+                data = {'key': 'CL-372', 'status_category': 'done'}
+            return SimpleNamespace(stdout=json.dumps({'data': data}))
+
+        with patch.object(clean_builds.subprocess, 'run', side_effect=run):
+            result, events = self.release(environ={'CODEX_THREAD_ID': 'installer', 'CHECKLIST_WORKSPACE': str(checkout)})
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [('service', 'status'), ('service', 'status'),
+                                 ('call', 'project_resolve'), ('call', 'task_get')])
+        self.assertEqual(self.clock.sleeps, [1.0])
+        self.assertEqual(events[0]['status'], 'ready')
+        self.assertTrue(clean_scratch.ticket_released(marker))
+
+    def test_scoped_refusal_after_healthy_probe_is_reported_once_and_preserves_markers(self):
+        markers = [self.marked('first', 'CL-372'), self.marked('second', 'CL-367')]
+        calls = []
+
+        def run(arguments, **kwargs):
+            calls.append(tuple(arguments[1:3]))
+            if arguments[1] == 'service':
+                return SimpleNamespace(stdout=json.dumps({
+                    'data': {'name': 'Checklist', 'version': '1', 'capabilities': ['durable_store']},
+                }))
+            self.assertEqual(arguments[2], 'project_resolve')
+            raise subprocess.CalledProcessError(1, arguments, stderr='Checklist: NATIVE_SESSION_MISMATCH: wrong workspace')
+
+        errors = io.StringIO()
+        with patch.object(clean_builds.subprocess, 'run', side_effect=run), contextlib.redirect_stderr(errors):
+            result, events = self.release()
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [('service', 'status'), ('call', 'project_resolve')])
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(events[0]['status'], 'ready')
+        self.assertEqual(events[-1]['code'], 'NATIVE_SESSION_MISMATCH')
+        self.assertIn('NATIVE_SESSION_MISMATCH: wrong workspace', errors.getvalue())
+        self.assertTrue(all(not clean_scratch.ticket_released(path) for path in markers))
 
     def test_post_install_releases_after_reader_fails_twice(self):
         done = self.marked('finished', 'CL-372')

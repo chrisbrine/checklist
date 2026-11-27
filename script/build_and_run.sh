@@ -462,6 +462,13 @@ PYRELEASE
     2) echo "Warning: post-install release skipped (no session exported); report: $cleanup_log" >&2 ;;
     *) echo "Warning: post-install release failed and kept its markers; the install is not affected; report: $cleanup_log" >&2 ;;
   esac
+  if [ "$release_status" = 2 ]; then
+    printf '%s\n' 'Set INSTALLING_SESSION_ID to the actual installing session ID. Run this from its registered Checklist project folder.' \
+      '  python3 script/clean_scratch.py --release-done --repo "$PWD" --session-id "$INSTALLING_SESSION_ID"' >&2
+  elif [ "$release_status" != 0 ]; then
+    printf '%s\n' 'Run this from your registered Checklist project folder in the installing session.' \
+      '  python3 script/clean_scratch.py --release-done --repo "$PWD"' >&2
+  fi
 }
 post_install_cleanup
 # Interactive modes can wait indefinitely; retire older bundles before entering them.

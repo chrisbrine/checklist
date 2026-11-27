@@ -18,7 +18,8 @@ import sys
 
 from clean_scratch import (DEFAULT_BUDGET_GB, FINISHED, OWNER_RECORD, SESSION_VARIABLES, WORKSPACE_MARKER, background_sizes, cli_status_reader, du_sizes, inventory, native_session, read_owner_record, release_finished, running_paths, storage_groups, storage_report, ticket_roots, within, workspace_protection)
 from retire_old_bundles import trash, trash_many
-from cleanup_service_wait import ServiceReadiness, error_code
+from cleanup_service_wait import CLICallError, ServiceReadiness, error_code
+from verify_install import healthy_status
 import test_instances as slots
 
 REPO = Path(__file__).resolve().parents[1]
@@ -987,19 +988,36 @@ def finish(cleaner):
 
 
 def release_workspace(repo, environ):
-    """The registered project folder for the release status reads: CHECKLIST_WORKSPACE,
-    else the local origin checkout of an integration copy (installs built from a clone),
-    else the repo itself. The CLI binds its project scope to its working folder."""
+    """Choose the native CLI workspace for the release status reads."""
     if environ.get('CHECKLIST_WORKSPACE'):
         return Path(environ['CHECKLIST_WORKSPACE']).resolve()
+    repo = Path(repo).resolve()
+    if (repo / '.git').exists():
+        try:
+            origin = subprocess.run(['git', '-C', str(repo), 'remote', 'get-url', 'origin'],
+                                    capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            origin = ''
+        if origin and os.path.isabs(origin) and (Path(origin) / '.git').exists():
+            return Path(origin).resolve()
+    else:
+        # git archive has no origin. The orchestrator can invoke the archive's
+        # installer from the registered Checklist checkout.
+        caller = Path.cwd()
+        if (caller / '.git').exists() and (caller / 'script/clean_scratch.py').is_file():
+            return caller
+    return repo
+
+
+def probe_service(cli, timeout):
+    command = [str(cli), 'service', 'status']
     try:
-        origin = subprocess.run(['git', '-C', str(repo), 'remote', 'get-url', 'origin'],
-                                capture_output=True, text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        origin = ''
-    if origin and os.path.isabs(origin) and (Path(origin) / '.git').exists():
-        return Path(origin).resolve()
-    return Path(repo).resolve()
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, check=True, timeout=timeout())
+    except subprocess.CalledProcessError as error:
+        raise CLICallError(error.returncode, command, error.output, error.stderr) from error
+    if not healthy_status(json.loads(result.stdout)):
+        raise ValueError('Checklist service status did not report a healthy service')
 
 
 def release_done(repo, environ=None, reader=None, sessions_root=None, qualification_root=None):
@@ -1012,25 +1030,32 @@ def release_done(repo, environ=None, reader=None, sessions_root=None, qualificat
     session = native_session(environ)
     if not session or session in {'.', '..'} or '/' in session:
         print(json.dumps({'action': 'release_done', 'status': 'skipped',
-                          'reason': 'no caller session exported; run clean_scratch.py --release-done'}), flush=True)
+                          'reason': 'no caller session exported'}), flush=True)
         print('WARNING: POST-INSTALL RELEASE SKIPPED: no caller session (' + ', '.join(SESSION_VARIABLES)
-              + ') is exported; run clean_scratch.py --release-done.', file=sys.stderr, flush=True)
+              + ') is exported.', file=sys.stderr, flush=True)
         return 2
     try:
         readiness = ServiceReadiness()
-        reader = reader or cli_status_reader(Path('/Applications/Checklist.app/Contents/MacOS/checklist'),
-                                             release_workspace(repo, environ), environ.get('CHECKLIST_PROJECT_ID'),
-                                             timeout=readiness.call_timeout)
+        probe = None
+        if reader is None:
+            cli = Path('/Applications/Checklist.app/Contents/MacOS/checklist')
+            workspace = release_workspace(repo, environ)
+            reader = cli_status_reader(cli, workspace, environ.get('CHECKLIST_PROJECT_ID'),
+                                       timeout=readiness.call_timeout)
+
+            def probe():
+                probe_service(cli, readiness.call_timeout)
+
         roots = ticket_roots(Path(sessions_root or f'/private/tmp/claude-{os.getuid()}'),
                              Path(qualification_root or Path.home() / 'Library/Caches/ChecklistQualification'), session)
-        status = release_finished(roots, session, lambda keys: readiness.read(reader, keys))
+        status = release_finished(roots, session, lambda keys: readiness.read(reader, keys, probe=probe))
         if readiness.failure is not None:
             # The report and the installer's own output name the CLI's real error.
             print(json.dumps({'action': 'release_done', 'status': 'failed', 'code': error_code(readiness.failure) or error_code(readiness.failure.__cause__),
                               'reason': str(readiness.failure), 'attempts': readiness.attempts,
                               'waited_seconds': round(readiness.waited_seconds, 3)}), flush=True)
-            print(f'WARNING: POST-INSTALL RELEASE FAILED: {readiness.failure}; markers kept; '
-                  'run clean_scratch.py --release-done from the session.', file=sys.stderr, flush=True)
+            print(f'WARNING: POST-INSTALL RELEASE FAILED: {readiness.failure}; remaining markers kept.',
+                  file=sys.stderr, flush=True)
         return status
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(json.dumps({'action': 'release_done', 'status': 'failed', 'reason': str(error)}), flush=True)

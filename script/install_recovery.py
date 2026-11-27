@@ -22,6 +22,7 @@ REGISTRATION_RETRIES = 2
 SERVICE_LABEL = 'org.checklist.coordination'
 TERM_GRACE_SECONDS = 5
 KILL_GRACE_SECONDS = 5
+SHUTDOWN_PASSES = 2
 LSREGISTER = ('/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework'
               '/Versions/Current/Support/lsregister')
 INSTALL_ERRORS = (OSError, ValueError, KeyError, subprocess.SubprocessError)
@@ -122,20 +123,25 @@ def _stop_bundle_processes(destination, bundle, deadline, runner, processes, clo
     """Stop processes at exact executable paths and guard against PID reuse."""
     executables = {str(destination / 'Contents/MacOS' / name) for name in names}
 
+    def require_bundle():
+        if identity(destination) != bundle:
+            raise ValueError(f'{role.capitalize()} bundle changed during shutdown at {destination}.')
+
     def targets():
+        require_bundle()
         found = {}
         for pid, path in processes(runner, min(5, time_left(deadline, clock))):
             if path in executables:
                 instance = inspect(pid)
                 if instance is not None and instance[0] == path:
                     found[pid] = instance
+        require_bundle()
         return found
 
     def send_to_current(pending, sig):
         for pid, instance in pending.items():
             time_left(deadline, clock)
-            if identity(destination) != bundle:
-                raise ValueError(f'{role.capitalize()} bundle changed during shutdown at {destination}.')
+            require_bundle()
             if inspect(pid) == instance:
                 try:
                     send(pid, sig)
@@ -157,18 +163,25 @@ def _stop_bundle_processes(destination, bundle, deadline, runner, processes, clo
         return pending
 
     pending = targets()
-    send_to_current(pending, signal.SIGTERM)
-    pending = wait_for_exit(pending, TERM_GRACE_SECONDS)
+    for attempt in range(SHUTDOWN_PASSES):
+        if not pending:
+            return
+        if attempt:
+            print(f'{role.capitalize()} processes started during shutdown; stopping the newly observed instances.',
+                  file=sys.stderr, flush=True)
+        send_to_current(pending, signal.SIGTERM)
+        pending = wait_for_exit(pending, TERM_GRACE_SECONDS)
+        if pending:
+            send_to_current(pending, signal.SIGKILL)
+            survivors = wait_for_exit(pending, KILL_GRACE_SECONDS)
+            if survivors:
+                details = ', '.join(f'PID {pid} ({path})' for pid, (path, _) in sorted(survivors.items()))
+                raise TimeoutError(f'{role.capitalize()} processes survived SIGKILL after {KILL_GRACE_SECONDS} seconds: '
+                                   f'{details}. Bundles were kept in place.')
+        pending = targets()
     if pending:
-        send_to_current(pending, signal.SIGKILL)
-        survivors = wait_for_exit(pending, KILL_GRACE_SECONDS)
-        if survivors:
-            details = ', '.join(f'PID {pid} ({path})' for pid, (path, _) in sorted(survivors.items()))
-            raise TimeoutError(f'{role.capitalize()} processes survived SIGKILL after {KILL_GRACE_SECONDS} seconds: '
-                               f'{details}. Bundles were kept in place.')
-    if restarted := targets():
-        details = ', '.join(map(str, sorted(restarted)))
-        raise ValueError(f'{role.capitalize()} processes are running after shutdown: {details}. Bundles were kept in place.')
+        details = ', '.join(map(str, sorted(pending)))
+        raise ValueError(f'{role.capitalize()} processes kept restarting during shutdown: {details}. Bundles were kept in place.')
 
 
 def launch_job_state(deadline, runner, clock):

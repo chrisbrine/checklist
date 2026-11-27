@@ -79,7 +79,7 @@ python3 -m unittest discover -s scripts -p test_test_instances.py
 
 See [test instances](test-instances.md) for the four isolated identities, backup-seeding limits and mandatory same-build backup check before promotion. `./script/build_and_run.sh --install-stage CAPTURE_DIR` verifies and installs an existing original stage through the ordinary install path. Before staging an install from a new `git archive` workspace, including a hotfix, copy the private `.local/build/signing-identity` with mode 0600. An ad hoc install-scope stage warns if the installed app is team-signed. Before stopping Checklist, `script/install_signer_guard.py` refuses a stage whose ChecklistService signing team differs from the installed one. The registered launch agent keeps the installed team's launch constraint. `CHECKLIST_ALLOW_SIGNER_CHANGE=1` permits a deliberate signer change.
 
-`--install-stage`, `--verify` and `--install` require the exact installed app process and a healthy service reply for that build. On a same-schema install, the installer starts recovery after at most 60 seconds from the stop request if the new service fails to answer and the previous bundle is available. It gives recovery up to 180 seconds to stop the candidate, put the previous bundle back, refresh its launch agent registration and verify a healthy reply. Within that budget, shutdown allows up to five seconds after SIGTERM and five more after SIGKILL for matched candidate processes. If a candidate stays running, both bundles stay in place. If the reopened app's service gives no healthy answer in 20 seconds and launchd still shows a nonrunning or absent job, recovery can refresh the registration and reopen the app up to twice. Recovery exits non-zero and reports the measured outage or elapsed time without a healthy answer. For a store upgrade, the installer keeps the upgrade wait and guides the operator to the protected pre-upgrade generation on failure. See [failure and rollback](self-hosting.md#failure-and-rollback).
+`--install-stage`, `--verify` and `--install` require the exact installed app process and a healthy service reply for that build. On a same-schema install, the installer starts recovery after at most 60 seconds from the stop request if the new service fails to answer and the previous bundle is available. It gives recovery up to 180 seconds to stop the candidate, put the previous bundle back, refresh its launch agent registration and verify a healthy reply. Within that budget, shutdown allows up to five seconds after SIGTERM and five more after SIGKILL for matched candidate processes. It checks and stops newly started candidate processes in at most one extra pass. If a candidate survives SIGKILL or keeps restarting, both bundles stay in place. If the reopened app's service gives no healthy answer in 20 seconds and launchd still shows a nonrunning or absent job, recovery can refresh the registration and reopen the app up to twice. Recovery exits non-zero and reports the measured outage or elapsed time without a healthy answer. For a store upgrade, the installer keeps the upgrade wait and guides the operator to the protected pre-upgrade generation on failure. See [failure and rollback](self-hosting.md#failure-and-rollback).
 
 Every test slot starts with native relays off, including slots seeded from a live
 backup. Notes save for pickup; the Claude peer relay, Codex app queue and native
@@ -220,15 +220,21 @@ marked folder of that session whose tickets are all Done or canceled is released
 Release changes only the marker. The folder moves to the Trash at the next
 `clean_scratch.py --apply`, which still keeps a folder that a running process
 uses. Folders of open or unknown tickets stay marked. With no exported session
-the hook reports `release_done` as skipped and prints a warning; a status read failure is reported in
-the same log and on the installer's stderr, and keeps every marker. A release failure never fails the install. The release step retries its first complete
-ticket status read for up to 60 seconds only while the new service is unready (`UNREADY_CODES` in
-`script/cleanup_service_wait.py`, a CLI timeout, a CLI exit with no code or a bad reply), with each
-startup CLI call capped at 10 seconds and the remaining shared deadline. A definite refusal, for example
-`NATIVE_SESSION_MISMATCH` or `SETUP_REQUIRED`, stops at once with no retry. Its
-`release_done_service_wait` log reports the status (`ready`, `unavailable`, `refused`, `read_budget_exhausted`), attempts,
-measured elapsed seconds and the CLI's `code` and `reason` from stderr, bounded and with secrets
-removed; failure retains markers. All status reads share the 90-second limit. The foreground step ends with a
+the hook reports `release_done` as skipped. A status read failure keeps the remaining
+markers and prints the CLI's refusal code when available. Either result prints the
+command to run later from the registered project folder in the installing session.
+A release failure never fails the install.
+
+The release step waits up to 60 seconds for `checklist service status`, which does
+not require a project or native session. Each probe gets at most 10 seconds
+and a definite refusal stops the wait immediately. After a healthy answer,
+the hook reads project and ticket status once per request through the native
+session. A scoped refusal such as `NATIVE_SESSION_MISMATCH` ends the release with
+the original code. The hook uses `CHECKLIST_WORKSPACE` if set, then a local clone
+origin if available. For a Git archive, invoke the installer from the registered
+Checklist checkout or set `CHECKLIST_WORKSPACE` to that checkout. The
+`release_done_service_wait` log records the probe result, attempts and elapsed
+seconds. The probe and all status reads share the 90-second limit. The foreground step ends with a
 `post_install_release` line and the background step with a `post_install_build` line, in either order;
 each reports its own result. `clean_builds.post_install` runs both steps for a run by hand from a session, and
 its `post_install` line reports both results; a failure of either returns 1.

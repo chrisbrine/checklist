@@ -59,6 +59,7 @@ class InstallRecoveryTests(unittest.TestCase):
         self.signals = []
         self.survive_kill = False
         self.replace_after_term = {}
+        self.restart_after_kill = False
         self.events = []
         self.output, self.errors = io.StringIO(), io.StringIO()
 
@@ -98,9 +99,11 @@ class InstallRecoveryTests(unittest.TestCase):
     def send(self, pid, sig):
         self.signals.append((pid, sig, self.now))
         if sig == signal.SIGTERM and pid in self.replace_after_term:
-            self.candidate[pid] = self.replace_after_term[pid]
+            self.candidate[pid] = self.replace_after_term.pop(pid)
         if sig == signal.SIGKILL and not self.survive_kill:
-            self.candidate.pop(pid)
+            path, started = self.candidate.pop(pid)
+            if self.restart_after_kill:
+                self.candidate[pid + 1] = (path, started + 1)
 
     def inspect_restored(self, pid):
         return next(((path, 333) for number, path in self.processes(None, 5) if number == pid), None)
@@ -314,16 +317,30 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.number(self.installed), 328)
         self.assertEqual(self.number(self.rejected), 331)
 
-    def test_reused_pid_at_same_path_is_never_sent_sigkill(self):
+    def test_reused_pid_at_same_path_gets_its_own_term_grace(self):
         executable = str(self.installed / 'Contents/MacOS/ChecklistApp')
         self.candidate = {42: (executable, 111)}
         self.replace_after_term[42] = (executable, 222)
         self.assertFalse(self.install())
-        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060)])
-        self.assertIn('Candidate processes are running after shutdown: 42', self.errors.getvalue())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060), (42, signal.SIGTERM, 1060),
+                                        (42, signal.SIGKILL, 1065)])
+        self.assertIn('stopping the newly observed instances', self.errors.getvalue())
+        self.assertEqual(self.number(self.installed), 328)
+        self.assertEqual(self.number(self.rejected), 331)
+        self.assertIn('verified its service', self.output.getvalue())
+
+    def test_candidate_that_keeps_restarting_is_bounded(self):
+        executable = str(self.installed / 'Contents/MacOS/ChecklistApp')
+        self.candidate = {42: (executable, 111)}
+        self.restart_after_kill = True
+        self.assertFalse(self.install())
+        self.assertEqual(self.signals, [(42, signal.SIGTERM, 1060), (42, signal.SIGKILL, 1065),
+                                        (43, signal.SIGTERM, 1065), (43, signal.SIGKILL, 1070)])
+        self.assertIn('Candidate processes kept restarting during shutdown: 44', self.errors.getvalue())
         self.assertEqual(self.number(self.installed), 331)
         self.assertEqual(self.number(self.previous), 328)
         self.assertFalse(self.rejected.exists())
+        self.assertEqual(self.now, 1070)
 
     def test_candidate_surviving_sigkill_leaves_bundles_in_place_and_reports_failure(self):
         executable = str(self.installed / 'Contents/MacOS/ChecklistApp')

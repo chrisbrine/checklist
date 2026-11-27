@@ -882,35 +882,38 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse((self.build/'.build-lock').exists())
 
     def test_shell_hook_returns_before_cleanup_and_logs_failure(self):
-        source=(ROOT/'script/build_and_run.sh').read_text()
-        start=source.index('post_install_cleanup()');stop=source.index('# Interactive modes',start)
-        helper=self.repo/'script';helper.mkdir()
-        capture=self.build/self.ids[0];capture.mkdir()
-        (self.build/'.build-lock').mkdir()
-        (helper/'clean_builds.py').write_text("import time\ndef post_install_build(repo, capture):\n time.sleep(1)\n print('fixture failure',flush=True)\n return 1\ndef post_install_release(repo):\n print('fixture release',flush=True)\n return 0\n")
-        began=time.monotonic()
-        result=subprocess.run(['/bin/bash','-c',source[start:stop]],env=dict(os.environ,
-            ROOT_DIR=str(self.repo),BUILD_ROOT=str(self.build),CAPTURE_DIR=str(capture)),capture_output=True,text=True)
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertLess(time.monotonic()-began,0.8)
-        self.assertIn('Build cleanup started in background',result.stdout)
-        self.assertFalse((self.build/'.build-lock').exists())
-        # Bound this fixture wait; the actual hook owns no recurring runtime.
-        deadline=time.monotonic()+4
-        log=capture/'post-install-cleanup.jsonl'
-        while time.monotonic()<deadline and (not log.exists() or 'fixture failure' not in log.read_text()):
-            time.sleep(0.05)
-        self.assertIn('fixture failure',log.read_text())
-        self.assertIn('fixture release',log.read_text())
+        result,capture,log=self.hook_run(" print('fixture release',flush=True)\n return 0",
+                                         " print('fixture failure',flush=True)\n return 1", hold_build=True)
+        try:
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('Build cleanup started in background',result.stdout)
+            self.assertFalse((self.build/'.build-lock').exists())
+            self.assertIn('fixture release',log.read_text())
+            self.assertNotIn('fixture failure',log.read_text())
+        finally:
+            (capture/'allow-build-cleanup').touch()
+        self.assert_cleanup_report(log, 'fixture failure')
 
-    def hook_run(self,release_body,build_body=" return 0"):
+    def assert_cleanup_report(self, log, message):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and message not in log.read_text():
+            time.sleep(0.05)
+        self.assertIn(message, log.read_text())
+
+    def hook_run(self,release_body,build_body=" return 0",*,hold_build=False):
         """Run the real hook source with a stub clean_builds.py. Returns the result, capture and log."""
         source=(ROOT/'script/build_and_run.sh').read_text()
         start=source.index('post_install_cleanup()');stop=source.index('# Interactive modes',start)
         helper=self.repo/'script';helper.mkdir(exist_ok=True)
         capture=self.build/self.ids[0];capture.mkdir(exist_ok=True)
         (self.build/'.build-lock').mkdir(exist_ok=True)
-        (helper/'clean_builds.py').write_text("import os,sys,time\n"
+        if hold_build:
+            build_body = (" gate = Path(capture)/'allow-build-cleanup'\n"
+                          " deadline = time.monotonic() + 40\n"
+                          " while not gate.exists():\n"
+                          "  if time.monotonic() >= deadline: raise TimeoutError('fixture cleanup gate')\n"
+                          "  time.sleep(0.05)\n" + build_body)
+        (helper/'clean_builds.py').write_text("import os,sys,time\nfrom pathlib import Path\n"
             "def post_install_build(repo, capture):\n"+build_body+"\n"
             "def post_install_release(repo):\n"+release_body+"\n")
         result=subprocess.run(['/bin/bash','-c','set -euo pipefail\necho shell=$$\n'+source[start:stop]],env=dict(os.environ,
@@ -920,22 +923,24 @@ class CleanupTests(unittest.TestCase):
     def test_hook_release_runs_in_foreground_with_the_installer_as_parent(self):
         """CL-372: the release finishes before the hook returns, with the installer shell as its parent."""
         result,capture,log=self.hook_run(" print('parent=%d'%os.getppid(),flush=True)\n return 0",
-                                         " time.sleep(1.5)\n print('build done',flush=True)\n return 0")
-        self.assertEqual(result.returncode,0,result.stderr)
-        shell=next(l for l in result.stdout.splitlines() if l.startswith('shell='))[6:]
-        text=log.read_text()
-        self.assertIn('parent='+shell,text)  # present at return, not reparented
-        self.assertNotIn('build done',text)  # the leased build cleanup stays in the background
-        self.assertLess(result.stdout.index('Build cleanup started in background'),
-                        result.stdout.index('Post-install release finished'))
-        self.assertFalse((self.build/'.build-lock').exists())
-        deadline=time.monotonic()+6
-        while time.monotonic()<deadline and 'build done' not in log.read_text():time.sleep(0.05)
-        self.assertIn('build done',log.read_text())
+                                         " print('build done',flush=True)\n return 0", hold_build=True)
+        try:
+            self.assertEqual(result.returncode,0,result.stderr)
+            shell=next(l for l in result.stdout.splitlines() if l.startswith('shell='))[6:]
+            text=log.read_text()
+            self.assertIn('parent='+shell,text)
+            self.assertNotIn('build done',text)
+            self.assertLess(result.stdout.index('Build cleanup started in background'),
+                            result.stdout.index('Post-install release finished'))
+            self.assertFalse((self.build/'.build-lock').exists())
+        finally:
+            (capture/'allow-build-cleanup').touch()
+        self.assert_cleanup_report(log, 'build done')
 
     def test_hook_source_keeps_nohup_off_the_release(self):
         source=(ROOT/'script/build_and_run.sh').read_text()
-        body=source[source.index('post_install_cleanup()'):source.index('# Interactive modes')]
+        start=source.index('post_install_cleanup()')
+        body=source[start:source.index('# Interactive modes',start)]
         release=next(l for l in body.splitlines() if "<<'PYRELEASE'" in l)
         self.assertNotIn('nohup',release);self.assertFalse(release.rstrip().endswith('&'))
         self.assertLess(body.index('rmdir "$BUILD_ROOT/.build-lock"'),body.index("<<'PYCLEAN' &"))
@@ -948,6 +953,9 @@ class CleanupTests(unittest.TestCase):
                 result,_,log=self.hook_run(body)
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertIn(expected,result.stderr)
+                self.assertIn('python3 script/clean_scratch.py --release-done --repo "$PWD"', result.stderr)
+                if expected == 'release skipped':
+                    self.assertIn('--session-id "$INSTALLING_SESSION_ID"', result.stderr)
         result,_,log=self.hook_run(" raise RuntimeError('fixture')")
         self.assertIn('RuntimeError: fixture',log.read_text())
 
@@ -1417,5 +1425,17 @@ class ReleaseWorkspaceTests(unittest.TestCase):
             self.assertEqual(clean.release_workspace(copy, {'CHECKLIST_WORKSPACE': str(plain)}), plain.resolve())
             self.assertEqual(clean.release_workspace(copy, {}), checkout.resolve())
             self.assertEqual(clean.release_workspace(plain, {}), plain.resolve())
+
+    def test_archive_uses_the_invoking_checkout_if_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout, archive = Path(tmp) / 'checkout', Path(tmp) / 'archive'
+            (checkout / '.git').mkdir(parents=True)
+            (checkout / 'script').mkdir()
+            (checkout / 'script/clean_scratch.py').touch()
+            archive.mkdir()
+            with patch.object(Path, 'cwd', return_value=checkout.resolve()):
+                self.assertEqual(clean.release_workspace(archive, {}), checkout.resolve())
+            with patch.object(Path, 'cwd', return_value=archive.resolve()):
+                self.assertEqual(clean.release_workspace(archive, {}), archive.resolve())
 
 if __name__ == '__main__': unittest.main()
