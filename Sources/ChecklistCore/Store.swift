@@ -60,6 +60,7 @@ public final class CommandRouter: @unchecked Sendable {
     var managedAttachmentPreparation: ManagedAttachmentPreparation?
     var managedImportRecoveryFailures: [Data:Int] = [:]
     var managedImportMaintenanceAfterRow: Int64 = 0
+    var managedImportStageReferences: ManagedImportStageReferences?
     var storageMaintenanceFallbackFailures = 0
     // Deadlines are also observed outside the writer by the maintenance planner.
     private let maintenanceStateLock = NSLock()
@@ -186,6 +187,7 @@ public final class CommandRouter: @unchecked Sendable {
                     Self.qualificationStartupObserve?("pending_files_end")
                     if fixtureFreshStore?.empty != true { try? self.sweepAbandonedManagedImports(db) }
                     Self.qualificationStartupObserve?("abandoned_imports_end")
+                    self.managedImportStageReferences = try? ManagedImportStageReferences(db)
                     _ = self.performStorageMaintenance(db, permit: permit)
                     Self.qualificationStartupObserve?("storage_maintenance_end")
                     if fixtureFreshStore?.empty == true {
@@ -415,12 +417,18 @@ public final class CommandRouter: @unchecked Sendable {
     public func handle(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
         try handle(method:method,params:params,caller:caller,observeOperationWriterWait:nil)
     }
-    public func handle(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?) throws -> [String: Any] {
+    public func handle(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?,
+                       observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,expectedAuthorizationGeneration: String? = nil) throws -> [String: Any] {
         // CL-362: a transient descriptor shortage must not fail an ordinary attachment.
-        guard method == "attachment_add" else {return try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait)}
-        return try StorageFailureReport.retryingTransient {try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait)}
+        func attempt() throws -> JSON {
+            try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait,
+                              observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+        }
+        guard method == "attachment_add" else {return try attempt()}
+        return try StorageFailureReport.retryingTransient {try attempt()}
     }
-    private func handleAttempt(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?) throws -> [String: Any] {
+    private func handleAttempt(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?,
+                               observeStoragePhase: ((String,TimeInterval) -> Void)?,expectedAuthorizationGeneration: String?) throws -> [String: Any] {
         // Validation, preparation and owner projection also bridge Foundation
         // objects outside the SQL callbacks. Bound their lifetime on this thread.
         try autoreleasepool {
@@ -437,7 +445,8 @@ public final class CommandRouter: @unchecked Sendable {
                 let scheduled = Thread.current.threadDictionary[commandOperations.contextKey] != nil
                 if commandOperations.enabled,!scheduled,
                    try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
-                    return try acceptCommandOperation(method:method,params:params,caller:caller,observeWriterWait:observeOperationWriterWait)
+                    return try acceptCommandOperation(method:method,params:params,caller:caller,observeWriterWait:observeOperationWriterWait,
+                        expectedGeneration:expectedAuthorizationGeneration)
                 }
                 // The scheduled deletion admits its own bounded writer steps.
                 if scheduled,method == "media_round_delete",!legacyReserved {return nil}
@@ -448,7 +457,9 @@ public final class CommandRouter: @unchecked Sendable {
                     case .run:admittedWrite = true
                     }
                 } else if (!Self.readMethods.contains(method) && method != "backup_create") || legacyReserved {
-                    switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{try backupWriteAuthorization(params:params,caller:caller)}) {
+                    switch try backupWrites.admit(method:method,params:params,caller:caller,admission:storageAdmission,authorization:{
+                        try backupWriteAuthorization(params:params,caller:caller,expectedGeneration:expectedAuthorizationGeneration)
+                    }) {
                     case .reply(let result):return result
                     case .run:admittedWrite = true
                     }
@@ -458,7 +469,8 @@ public final class CommandRouter: @unchecked Sendable {
             if let admittedReply {return addingWriteAdmission(admittedReply)}
             // Admission locks never span file work or domain execution.
             defer {if admittedWrite {backupWrites.finishWrite()}}
-            return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+            return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller,
+                observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration))
         }
     }
     func executeBackupQueuedWrite(method: String,params: JSON,caller: Caller) throws -> JSON {
@@ -477,7 +489,12 @@ public final class CommandRouter: @unchecked Sendable {
     public func withImmediateWriteAccess<T>(_ body: () throws -> T) rethrows -> T? {
         try backupWrites.withImmediateAccess(body)
     }
-    private func handleCommand(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
+    private func handleCommand(method: String, params: [String: Any], caller: Caller,
+                               observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,expectedAuthorizationGeneration: String? = nil) throws -> [String: Any] {
+        func storagePhaseStart() -> TimeInterval? { observeStoragePhase.map { _ in ProcessInfo.processInfo.systemUptime } }
+        func finishStoragePhase(_ phase: String, since start: TimeInterval?) {
+            if let start { observeStoragePhase?(phase,ProcessInfo.processInfo.systemUptime-start) }
+        }
         guard ["owner","worker","assistant"].contains(caller.role), !caller.installation.isEmpty else { throw CoreError("FORBIDDEN", "An authenticated connection is required.") }
         guard let encoded = try? JSONSerialization.data(withJSONObject:params), encoded.count <= 2_000_000 else { throw CoreError("INVALID_INPUT", "Command input is too large or invalid.") }
         try validateInput(method,params,caller)
@@ -569,13 +586,14 @@ public final class CommandRouter: @unchecked Sendable {
             }
         }
         defer {if writerRead {backupWrites.finishWrite()}}
-        // A crash-left export reserves its intent before any command's file preparation.
-        // The shared transaction guard checks it again under the object gate.
-        // CL-363: the digest of (method, params) is computed here, at its original place under the
-        // gate, and used again by the transaction guard below. The inputs do not change in between.
+        // A crash-left export reserves its intent before other commands can
+        // prepare files. Ticket capture has no file preparation: its writer
+        // checks the same reservation before creating or replaying a ticket.
         var firstDigest: String?
-        if !Self.readMethods.contains(method),let command = params["command_id"] as? String {
+        if method != "task_create",!Self.readMethods.contains(method),let command = params["command_id"] as? String {
+            let waiting = storagePhaseStart()
             try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) { _ in
+                finishStoragePhase("object_gate_wait_ms",since:waiting)
                 let digest = hash(Data((method + (try jsonString(params))).utf8))
                 firstDigest = digest
                 try requirePendingExportIntent(command:command,digest:digest,caller:caller)
@@ -622,9 +640,16 @@ public final class CommandRouter: @unchecked Sendable {
             self.managedAttachmentPreparation = managedImport
             defer { self.managedAttachmentPreparation = nil }
             var output: JSON = [:]
+            let transactionStarted = storagePhaseStart()
             do { try self.withValidatedDomainTransaction(db) {
+                let bodyStarted = storagePhaseStart()
+                defer {finishStoragePhase("domain_transaction_body_ms",since:bodyStarted)}
                 if !caller.isOwner,let pid = params["project_id"] as? String {
-                    _ = try self.scope(db,["project_id":pid],caller)
+                    if let expectedAuthorizationGeneration {
+                        // A transport that queued after authentication checks
+                        // its current registration in this writer snapshot.
+                        _ = try self.backupWriteAuthorization(db,params:params,caller:caller,expectedGeneration:expectedAuthorizationGeneration)
+                    } else { _ = try self.scope(db,["project_id":pid],caller) }
                     if caller.role == "assistant" {
                         let permission = method == "task_create" ? "create_drafts_on_request" : (["message_send","agent_message_send","attachment_add","attachment_update","agent_resolve"].contains(method) ? "post_notes_on_request" : (["message_ack","assistant_inbox"].contains(method) ? "receive_messages" : "read"))
                         try self.assistantPermission(caller,pid,permission)
@@ -672,7 +697,10 @@ public final class CommandRouter: @unchecked Sendable {
                     try self.executeStoreStatement(db,sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(durable)])
                 }
                 return .commit
-            } } catch {
+            }
+                finishStoragePhase("domain_transaction_ms",since:transactionStarted)
+            } catch {
+                finishStoragePhase("domain_transaction_ms",since:transactionStarted)
                 // The failed read transaction has rolled back. Persist only its
                 // bounded availability observation in a separate transaction.
                 try? self.persistManagedAttachmentReadFailure(db,method:method,params:params,caller:caller,error:error)
@@ -687,8 +715,12 @@ public final class CommandRouter: @unchecked Sendable {
             // command or startup instead of coupling it to this narrow deletion.
             var maintenanceWarning: StorageMaintenanceWarning?
             if method != "epic_delete" {
+                let started = storagePhaseStart()
                 maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
+                finishStoragePhase("post_commit_maintenance_ms",since:started)
+                let pruneStarted = storagePhaseStart()
                 _ = self.pruneRoutineRecordsIfDue(db)
+                finishStoragePhase("routine_prune_ms",since:pruneStarted)
             }
             do {output = try self.addingTicketObjectDeletionReceipt(db,output:output)}
             catch {maintenanceWarning = maintenanceWarning ?? .retryPending}
@@ -703,8 +735,14 @@ public final class CommandRouter: @unchecked Sendable {
             return self.commandManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller,command:params["command_id"] as? String)
         }
         func commit(_ preparedPurge: PreparedManualTicketPurge?) throws -> JSON {
-            try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) {permit in
-                try dbQueue.writeWithoutTransaction {db in try autoreleasepool {try write(db,permit,preparedPurge)}}
+            let waiting = storagePhaseStart()
+            return try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) {permit in
+                finishStoragePhase("object_gate_wait_ms",since:waiting)
+                let writerQueued = storagePhaseStart()
+                return try dbQueue.writeWithoutTransaction {db in
+                    finishStoragePhase("storage_writer_queue_ms",since:writerQueued)
+                    return try autoreleasepool {try write(db,permit,preparedPurge)}
+                }
             }
         }
         let writerOutput = try method == "task_purge" ? withManualTicketPurgePreparation(params,caller,commit:commit) : commit(nil)

@@ -6,6 +6,84 @@ import os
 @testable import ChecklistService
 
 final class CommandOperationServiceTests: XCTestCase {
+    func testDeletionAdmissionWaitingForWriterLeavesStatusResponsive() throws {
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        let router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        defer {try? router.closeStore();try? FileManager.default.removeItem(at:directory)}
+        let owner = Caller(role:"owner",installation:"operation-service-fixture",projectIDs:[])
+        let round = try closedRound(router,owner,name:"Writer admission",workspace:directory)
+        let session = uuid(), installation = "deletion-admission-worker", generation = "current"
+        let credential = "deletion-admission-fixture"
+        let registration = try router.handle(method:"session_register",params:["command_id":uuid(),"project_id":round.project,"project_ids":[round.project],
+            "session_id":session,"installation":installation+"/"+generation,"provider":"codex","role":"worker","workspace":directory.path],caller:owner)
+        let registered = try XCTUnwrap(registration["data"] as? JSON)
+        let coordinator = Coordinator(router:router,enrollmentFile:directory.appendingPathComponent("unused-enrollments.json"),startBackgroundWork:false)
+        coordinator.workHealthFailures = 2
+        coordinator.enrollments[installation] = Enrollment(installation:installation,name:"Admission fixture",provider:"codex",role:"worker",
+            projectIDs:[round.project],sessionID:session,workspace:directory.path,profileID:nil,tokenDigest:ChecklistCore.hash(Data(credential.utf8)),generation:generation)
+        let connection = NSXPCConnection(machServiceName:"org.checklist.synthetic.unconnected")
+        defer {connection.invalidate()}
+        let peer = Peer(coordinator:coordinator,connection:connection)
+        let held = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
+        let holder = DispatchQueue(label:"test.sqlite-writer")
+        holder.async {
+            router.dbQueue.writeWithoutTransaction { _ in
+                held.signal()
+                _ = release.wait(timeout:.now()+10)
+            }
+        }
+        defer {
+            release.signal()
+            holder.sync {}
+            coordinator.queue.sync {}
+            coordinator.mediaRoundDeletionAdmissionQueue.sync {}
+            coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
+            coordinator.queue.sync {}
+            coordinator.storageQueue.sync {}
+            coordinator.queue.sync {coordinator.storageWake?.cancel()}
+        }
+        guard held.wait(timeout:.now()+5) == .success else {return XCTFail("SQLite writer was not acquired")}
+
+        let command = uuid()
+        let deletion = try JSONSerialization.data(withJSONObject:["method":"media_round_delete","installation":installation,
+            "credential":credential,"workspace":directory.path,"params":["project_id":round.project,"round_id":round.id,
+                "expected_revision":round.revision,"reason":"Retire synthetic round","command_id":command]])
+        let status = try JSONSerialization.data(withJSONObject:["method":"service_info","params":[:]])
+        let deletionReply = expectation(description:"Durable deletion admission"), statusReply = expectation(description:"Independent status")
+        let accepted = OSAllocatedUnfairLock<String?>(initialState:nil)
+        peer.execute(deletion) { bytes in
+            let reply = (try? JSONSerialization.jsonObject(with:bytes)) as? JSON
+            XCTAssertEqual(reply?["command_outcome"] as? String,"accepted")
+            XCTAssertEqual(reply?["command_id"] as? String,command)
+            let operation = (reply?["data"] as? JSON)?["operation_id"] as? String
+            accepted.withLock {$0 = operation}
+            deletionReply.fulfill()
+        }
+        peer.execute(status) { bytes in
+            let reply = (try? JSONSerialization.jsonObject(with:bytes)) as? JSON
+            XCTAssertNotNil(reply?["data"])
+            statusReply.fulfill()
+        }
+        let responsive = XCTWaiter.wait(for:[statusReply],timeout:1)
+        XCTAssertNil(accepted.withLock {$0},"Deletion must wait for a durable admission")
+        release.signal()
+        wait(for:[deletionReply],timeout:5)
+        if responsive != .completed {coordinator.queue.sync {}}
+        XCTAssertEqual(responsive,.completed,"Status must reply while deletion admission waits for the writer")
+        coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
+        let operation = try XCTUnwrap(accepted.withLock {$0})
+        let worker = Caller(role:"worker",installation:installation+"/"+generation,projectIDs:[round.project],sessionID:session,workspace:directory.path)
+        let result = try router.handle(method:"operation_get",params:["project_id":round.project,"operation_id":operation],caller:worker)
+        XCTAssertEqual((result["data"] as? JSON)?["state"] as? String,"succeeded")
+        _ = try router.handle(method:"session_update",params:["command_id":uuid(),"project_id":round.project,"session_id":session,
+            "expected_revision":registered["revision"]!,"provider":"claude"],caller:owner)
+        XCTAssertThrowsError(try router.handle(method:"media_round_delete",
+            params:["command_id":uuid(),"project_id":round.project,"round_id":round.id,"expected_revision":round.revision,"reason":"Stale admission"],
+            caller:worker,observeOperationWriterWait:nil,expectedAuthorizationGeneration:router.sessionGeneration(registered))) {
+                XCTAssertEqual(($0 as? CoreError)?.code,"CONNECTION_REVOKED")
+            }
+    }
+
     func testCoordinatorRunsDurableBackupReplyOnItsOperationQueue() throws {
         let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("operation-service-" + UUID().uuidString)
         defer {try? FileManager.default.removeItem(at:directory)}
@@ -179,8 +257,10 @@ final class CommandOperationServiceTests: XCTestCase {
         XCTAssertEqual(allFinished.wait(timeout:.now()+45),.success)
     }
 
-    private func closedRound(_ router: CommandRouter,_ owner: Caller,name: String,cancel: Bool = true) throws -> (project: String,id: String,revision: Int) {
-        let created = try router.handle(method:"project_create",params:["command_id":uuid(),"name":name,"key_prefix":"DEL"],caller:owner)
+    private func closedRound(_ router: CommandRouter,_ owner: Caller,name: String,cancel: Bool = true,workspace: URL? = nil) throws -> (project: String,id: String,revision: Int) {
+        var projectInput: JSON = ["command_id":uuid(),"name":name,"key_prefix":"DEL"]
+        projectInput["root_path"] = workspace?.path
+        let created = try router.handle(method:"project_create",params:projectInput,caller:owner)
         let project = try XCTUnwrap((created["data"] as? JSON)?["id"] as? String)
         func media(_ method: String,_ input: JSON) throws -> JSON {
             var params = input

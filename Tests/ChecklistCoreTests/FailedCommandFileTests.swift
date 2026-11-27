@@ -273,6 +273,41 @@ extension EvidenceAuthorityTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 
+    func testTicketCaptureWriterMatchesEarlyExportIntentFence() throws {
+        let project = try self.project()
+        let epic = try call("epic_create",["project_id":project["id"]!,"name":"Capture intent fence"])
+        let files = try StorageObjectFiles(root:storeRoot)
+        for index in 0..<12 {
+            let command = uuid()
+            let input: JSON = ["project_id":project["id"]!,"epic_id":epic["id"]!,"title":"Intent fixture \(index)","command_id":command]
+            let digest = ChecklistCore.hash(Data(("task_create" + (try jsonString(input))).utf8))
+            if index % 2 == 0 {
+                let principal = index % 4 == 0 ? owner.principal : "unrelated-owner"
+                let journal = "staging/pending-exports/" + uuid() + ".json"
+                let export = ExportPublication(destination:directory.appendingPathComponent("fixture-\(index)"),
+                    principal:principal,command:command,digest:String(repeating:"a",count:64),journal:journal)
+                try export.recordPending(files)
+            }
+            // The original capture path made this check before the writer.
+            let earlyRefusal: String?
+            do {
+                try ArchiveStorageGate.withExclusive(root:storeRoot) { _ in
+                    try router.requirePendingExportIntent(command:command,digest:digest,caller:owner)
+                }
+                earlyRefusal = nil
+            } catch let error as CoreError { earlyRefusal = error.code }
+            if let earlyRefusal {
+                XCTAssertEqual(earlyRefusal,"IDEMPOTENCY_CONFLICT")
+                assertCode(earlyRefusal) { _ = try self.router.handle(method:"task_create",params:input,caller:self.owner) }
+            } else {
+                let created = try router.handle(method:"task_create",params:input,caller:owner)
+                let replayed = try router.handle(method:"task_create",params:input,caller:owner)
+                XCTAssertEqual(try jsonString(created["data"]!),try jsonString(replayed["data"]!))
+                XCTAssertEqual(replayed["replayed"] as? Bool,true)
+            }
+        }
+    }
+
     /// A historical conflicting receipt is an uncertain outcome, not a commit or rollback
     /// of the journal's intent. Startup must preserve that journal and its owned export.
     func testStartupKeepsExportJournalForAConflictingReceipt() throws {

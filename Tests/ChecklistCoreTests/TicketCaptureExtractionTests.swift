@@ -77,6 +77,34 @@ extension CoreTests {
         XCTAssertEqual(try captureSnapshot(), before)
     }
 
+    func testTicketCaptureWriterRechecksAdmittedSession() throws {
+        let workspace = directory.appendingPathComponent("admitted-capture")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let project = try call("project_create",["name":"Admitted capture","key_prefix":"AC","root_path":workspace.path])
+        let pid = try XCTUnwrap(project["id"] as? String)
+        let epic = try call("epic_create",["project_id":pid,"name":"Capture authorization"])
+        let session = uuid(), installation = "capture-admission/current"
+        let registered = try call("session_register",["project_id":pid,"session_id":session,"installation":installation,
+            "provider":"codex","role":"worker","workspace":workspace.path])
+        let admitted = Caller(role:"worker",installation:installation,projectIDs:[pid],sessionID:session,workspace:workspace.path)
+        let generation = router.sessionGeneration(registered)
+        func refusesStaleCapture(_ code: String) throws {
+            let before = try captureSnapshot()
+            assertCode(code) {
+                _ = try self.router.handle(method:"task_create",
+                    params:["command_id":uuid(),"project_id":pid,"epic_id":epic["id"]!,"title":"Old admission"],
+                    caller:admitted,observeOperationWriterWait:nil,expectedAuthorizationGeneration:generation)
+            }
+            XCTAssertEqual(try captureSnapshot(),before)
+        }
+        let changed = try call("session_update",["project_id":pid,"session_id":session,
+            "expected_revision":registered["revision"]!,"provider":"claude"])
+        XCTAssertNotEqual(router.sessionGeneration(changed),generation)
+        try refusesStaleCapture("CONNECTION_REVOKED")
+        _ = try call("session_update",["project_id":pid,"session_id":session,"expected_revision":changed["revision"]!,"state":"revoked"])
+        try refusesStaleCapture("RECIPIENT_CHANGED")
+    }
+
     func testCaptureExtractionCommandReceiptsAreScopedToDistinctWorkerPrincipals() throws {
         let workspace = directory.appendingPathComponent("capture-workspace")
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)

@@ -443,14 +443,15 @@ extension CommandRouter {
             throw CoreError("OPERATION_PENDING","Read the original operation before applying this command.",details:["operation_id":id,"status_method":"operation_get"])
         }
     }
-    func acceptCommandOperation(method: String,params input: JSON,caller: Caller,observeWriterWait: ((TimeInterval) -> Void)? = nil) throws -> JSON {
+    func acceptCommandOperation(method: String,params input: JSON,caller: Caller,observeWriterWait: ((TimeInterval) -> Void)? = nil,
+                                expectedGeneration: String? = nil) throws -> JSON {
         var params = input
         if Self.readMethods.contains(method),params["command_id"] == nil {params["command_id"] = uuid()}
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
         if Self.storageRestoreMethods.contains(method) || Self.storageBackupPruningMethods.subtracting(Self.storageIncompleteBackupMethods).contains(method) {try owner(caller)}
         if Self.storageIncompleteBackupMethods.contains(method) {try requireIncompleteBackupAuthority(params:params,caller:caller)}
-        let generation = try backupWriteAuthorization(params:params,caller:caller)
+        let generation = try backupWriteAuthorization(params:params,caller:caller,expectedGeneration:expectedGeneration)
         let id = Self.commandOperationID(principal:caller.principal,command:command)
         let digest = hash(Data((method + (try jsonString(params))).utf8))
         let lease = try storageAdmission.acquire()
@@ -479,6 +480,9 @@ extension CommandRouter {
             if previous["state"] as? String != "failed" || !bool(previous,"recoverable") {return operationAcknowledgment(previous)}
         }
         func accept(_ db: Database,persist: Bool) throws -> JSON {
+                if let expectedGeneration {
+                    _ = try self.backupWriteAuthorization(db,params:params,caller:caller,expectedGeneration:expectedGeneration)
+                }
                 if var previous = try self.operationRecord(db,id:id) {
                     try self.authorizeOperation(db,previous,params:params,caller:caller)
                     guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}

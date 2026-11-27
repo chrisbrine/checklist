@@ -301,14 +301,17 @@ final class BackupWriteQueue: @unchecked Sendable {
 extension CommandRouter {
     public var writeAdmissionStatus: [String:Any] {backupWrites.status()}
     public func observeWriteAdmission(_ observer: @escaping @Sendable () -> Void) {backupWrites.setObserver(observer)}
-    func backupWriteAuthorization(params: JSON,caller: Caller) throws -> String? {
+    func backupWriteAuthorization(params: JSON,caller: Caller,expectedGeneration: String? = nil) throws -> String? {
         guard !caller.isOwner,params["project_id"] != nil else {return nil}
-        return try readForPreparation {try self.backupWriteAuthorization($0,params:params,caller:caller)}
+        return try readForPreparation {try self.backupWriteAuthorization($0,params:params,caller:caller,expectedGeneration:expectedGeneration)}
     }
-    func backupWriteAuthorization(_ db: Database,params: JSON,caller: Caller) throws -> String? {
+    func backupWriteAuthorization(_ db: Database,params: JSON,caller: Caller,expectedGeneration: String? = nil) throws -> String? {
         guard !caller.isOwner,params["project_id"] != nil else {return nil}
         let project = try scope(db,params,caller)
         let generation = try callerSessionGeneration(db,caller,project:project)
+        if let expectedGeneration,generation != expectedGeneration {
+            throw CoreError("CONNECTION_REVOKED","The session registration changed before the command could be applied.")
+        }
         if let sessionID = caller.sessionID {
             let session = try scoped(db,sessionID,project,type:"session")
             guard session["installation"] as? String == caller.installation,session["role"] as? String == caller.role else {throw CoreError("CONNECTION_REVOKED","The queued command no longer matches this session registration.")}

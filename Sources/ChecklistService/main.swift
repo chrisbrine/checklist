@@ -98,6 +98,10 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
     let workHealthQueue = DispatchQueue(label:"org.checklist.work-health",qos:.utility,autoreleaseFrequency:.workItem)
     let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
+    // These requests can wait for a storage writer before replying. Keep each
+    // admission order while leaving the coordinator free to authenticate reads.
+    let ticketCaptureQueue = DispatchQueue(label:"org.checklist.ticket-capture",qos:.userInitiated)
+    let mediaRoundDeletionAdmissionQueue = DispatchQueue(label:"org.checklist.media-round-deletion-admission",qos:.userInitiated)
     let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.default,attributes:.concurrent,autoreleaseFrequency:.workItem)
     var storageRunning = false
     var storageWakePlanning = false
@@ -312,7 +316,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
               let hash=(info as? [String:Any])?[kSecCodeInfoUnique as String] as? Data else { return false }
         return hash == expectedOwnerHash
     }
-    func caller(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> Caller {
+    func caller(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil,
+                observeSessionGeneration: ((String) -> Void)? = nil) throws -> Caller {
         requireCommandQueue()
         if request["owner_channel"] as? Bool == true {
             guard owner(connection) else { throw ChecklistError("OWNER_CHANNEL_REQUIRED", "Only the signed native Checklist app can author human actions.") }
@@ -339,7 +344,9 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             }
         }
         guard let pid = enrollment.projectIDs.first else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This connection has no registered project.") }
-        try requireCommittedRegistration(enrollment, project: pid, caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []), timing:timing)
+        let generation = try requireCommittedRegistration(enrollment, project: pid,
+            caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []), timing:timing)
+        observeSessionGeneration?(generation)
         return Caller(role: enrollment.role, installation: enrollment.installation + "/" + enrollment.generation, projectIDs: enrollment.projectIDs, sessionID: enrollment.sessionID, workspace: enrollment.assistantRelay == true ? nil:callerWorkspace, assistantGrants:enrollment.assistantGrants ?? [:],executionDomain:enrollment.nativeExecutionDomain)
     }
     func constantEqual(_ a: String, _ b: String) -> Bool {
@@ -347,13 +354,19 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         guard x.count == y.count else { return false }
         return zip(x,y).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
-    enum Routed { case done([String: Any], runHooks: Bool = true); case router(method: String, params: [String: Any], caller: Caller) }
+    enum Routed {
+        case done([String: Any], runHooks: Bool = true)
+        case router(method: String, params: [String: Any], caller: Caller, expectedGeneration: String? = nil)
+    }
     func execute(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil) throws -> [String: Any] {
         let routed = try ServiceCallTiming.measure(timing,"bootstrap_verification_ms") { try route(request, connection: connection, timing:timing) }
         switch routed {
         case .done(let result, _): return result
-        case .router(let method, let params, let caller):
-            return try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
+        case .router(let method, let params, let caller, let expectedGeneration):
+            return try ServiceCallTiming.measure(timing,"execution_ms") {
+                try router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:nil,
+                    expectedAuthorizationGeneration:expectedGeneration)
+            }
         }
     }
     /// Resolves the caller and every coordinator-owned operation on the serial queue.
@@ -363,7 +376,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         let method = request["method"] as? String ?? ""
         if currentConnectionOnly {
             precondition(method == "connection_bootstrap")
-            return try routeNativeBootstrap(request, connection: connection, currentConnectionOnly: true)
+            return try routeNativeBootstrap(request, connection: connection, currentConnectionOnly: true, timing:timing)
         }
         // Bootstrap checks an existing committed connection without the writer.
         // Its registration/repair branches acquire their own immediate admission.
@@ -376,11 +389,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         return try routeAdmitted(request,connection:connection,timing:timing)
     }
     private func routeNativeBootstrap(_ request: [String: Any], connection: NSXPCConnection,
-                                      currentConnectionOnly: Bool = false) throws -> Routed {
+                                      currentConnectionOnly: Bool = false, timing: ServiceCallTiming? = nil) throws -> Routed {
         requireCommandQueue()
         let result = try queue.activity("connection_bootstrap") {
             try bootstrap(request["params"] as? [String: Any] ?? [:], connection: connection,
-                          currentConnectionOnly: currentConnectionOnly)
+                          currentConnectionOnly: currentConnectionOnly,timing:timing)
         }
         var reply = result.reply
         reply["write_admission"] = router.writeAdmissionStatus
@@ -390,14 +403,15 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         requireCommandQueue()
         ServiceCallTiming.measure(timing,"route_lifecycle_ms") { observeNativeConversationLifecycles() }
         if request["method"] as? String == "connection_bootstrap" {
-            return try routeNativeBootstrap(request, connection: connection)
+            return try routeNativeBootstrap(request, connection: connection, timing:timing)
         }
         let method = request["method"] as? String ?? ""
         let params = request["params"] as? [String: Any] ?? [:]
         if method == "project_create", request["owner_channel"] as? Bool != true {
             return .done(try createWorkspaceProject(params,request:request,connection:connection))
         }
-        let caller = try caller(request, connection: connection, timing:timing)
+        var sessionGeneration: String?
+        let caller = try caller(request, connection: connection, timing:timing, observeSessionGeneration:{sessionGeneration = $0})
         if method == "connection_list" {
             guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Connection setup is owner-only.") }
             return .done(["data": ["connections": enrollments.values.sorted { $0.name < $1.name }.map { e -> [String:Any] in
@@ -483,7 +497,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             try saveEnrollments(); credentials.remove(installation)
             return .done(["data":["disconnected":true], "command_id":commandID])
         }
-        return .router(method:method,params:params,caller:caller)
+        let expectedGeneration = method == "task_create" || method == "media_round_delete" ? sessionGeneration : nil
+        return .router(method:method,params:params,caller:caller,expectedGeneration:expectedGeneration)
     }
     func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
     /// A worker can report deferral after the unlock notification was delivered.
@@ -859,34 +874,52 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             } catch { finish(["error":Self.publicError(error)],timing:timing,runHooks:Self.requiresAfterCommand(object?["method"] as? String ?? ""),method:object?["method"] as? String ?? "",reply:reply);return }
             switch routed {
             case .done(let result,let runHooks): finish(result,timing:timing,runHooks:runHooks,method:object?["method"] as? String ?? "",reply:reply)
-            case .router(let method,let params,let caller) where CommandRouter.runsOutsideSerialQueue(method) || coordinator.nativeLifecycle.resumptionInFlight:
-                // CL-71/72: file work and pure reads do not hold the serial queue; the router
-                // serializes writes itself. Retain the original reply until handle returns
-                // its committed receipt, however long preparation takes. A client deadline
-                // never cancels it; a same-ID retry uses the router's stored receipt.
-                // Hooks return to the serial queue after the reply.
+            case .router(let method,let params,let caller,let expectedGeneration):
+                let worker: DispatchQueue
+                switch method {
+                case "task_create": worker = coordinator.ticketCaptureQueue
+                case "media_round_delete": worker = coordinator.mediaRoundDeletionAdmissionQueue
+                default:
+                    guard CommandRouter.runsOutsideSerialQueue(method) || coordinator.nativeLifecycle.resumptionInFlight else {
+                        let result: [String:Any]
+                        do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:timing.map { $0.recordOperationWriterWait }) } } catch { result = ["error":Self.publicError(error)] }
+                        finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),method:method,reply:reply)
+                        return
+                    }
+                    worker = DispatchQueue.global(qos:.userInitiated)
+                }
+                // Retain the reply until the router has its original committed
+                // receipt. A client deadline does not cancel accepted work.
+                // Hooks return to the coordinator after the reply.
                 let router = coordinator.router
                 // Freeze the JSON command before transferring it to a pooled read worker.
                 let paramsBytes: Data
                 do { paramsBytes = try JSONSerialization.data(withJSONObject:params) }
                 catch { finish(["error":Self.publicError(error)],timing:timing,method:method,reply:reply); return }
                 let queued = ProcessInfo.processInfo.systemUptime
-                DispatchQueue.global(qos:.userInitiated).async { [self] in autoreleasepool {
+                worker.async { [self] in autoreleasepool {
                     timing?.queued(since:queued, phase:"worker_queue_wait_ms")
                     let result: [String:Any]
                     do {
                         let params = try JSONSerialization.jsonObject(with:paramsBytes) as? [String:Any] ?? [:]
-                        result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:timing.map { $0.recordOperationWriterWait }) }
-                    } catch { result = ["error":Self.publicError(error)] }
+                        result = try ServiceCallTiming.measure(timing,"execution_ms") {
+                            try router.handle(method:method,params:params,caller:caller,
+                                observeOperationWriterWait:timing.map { $0.recordOperationWriterWait },
+                                observeStoragePhase:timing.map { $0.recordStoragePhase },
+                                expectedAuthorizationGeneration:expectedGeneration)
+                        }
+                    } catch {
+                        var refusal: [String:Any] = ["error":Self.publicError(error)]
+                        if method == "task_create" || method == "media_round_delete" {
+                            refusal["write_admission"] = router.writeAdmissionStatus
+                        }
+                        result = refusal
+                    }
                     reply(Self.responseBytes(result,timing:timing))
                     let succeeded = result["error"] == nil && !["queued","accepted"].contains(result["command_outcome"] as? String ?? "")
                     let runHooks = Self.requiresAfterCommand(method) && result["command_outcome"] as? String != "accepted"
                     coordinator.queue.async { [self] in autoreleasepool {afterCommand(succeeded:succeeded,runHooks:runHooks,timed:timing,method:method)} }
                 }}
-            case .router(let method,let params,let caller):
-                let result: [String:Any]
-                do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:timing.map { $0.recordOperationWriterWait }) } } catch { result = ["error":Self.publicError(error)] }
-                finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),method:method,reply:reply)
             }
             }
         }

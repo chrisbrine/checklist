@@ -43,7 +43,7 @@ extension CommandRouter {
 }
 
 extension CommandRouter {
-    func sessionGeneration(_ session: JSON) -> String { session["authorization_generation"] as? String ?? "unqualified-legacy" }
+    public func sessionGeneration(_ session: [String:Any]) -> String { session["authorization_generation"] as? String ?? "unqualified-legacy" }
     func callerSessionGeneration(_ db: Database,_ caller: Caller,project: String) throws -> String {
         guard let sid = caller.sessionID else { return caller.isOwner ? "human" : "unpaired" }
         let session = try scoped(db,sid,project,type:"session")

@@ -38,7 +38,11 @@ public final class ServiceCallTiming: Sendable {
     }
 
     public func recordOperationWriterWait(_ seconds: TimeInterval) {
-        durations.withLock { $0["operation_writer_wait_ms", default: 0] += seconds * 1000 }
+        recordStoragePhase("operation_writer_wait_ms",seconds)
+    }
+
+    public func recordStoragePhase(_ phase: String, _ seconds: TimeInterval) {
+        durations.withLock { $0[phase, default: 0] += seconds * 1000 }
     }
 
     public static func measure<T>(_ timing: ServiceCallTiming?, _ phase: String, _ body: () throws -> T) rethrows -> T {

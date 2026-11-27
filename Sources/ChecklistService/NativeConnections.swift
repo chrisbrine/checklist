@@ -26,14 +26,19 @@ extension Coordinator {
         }
         return result
     }
-    func bootstrap(_ context:[String:Any], connection:NSXPCConnection, currentConnectionOnly: Bool = false) throws -> BootstrapResult {
-        let native = try verifiedNativeWorkspace(context, connection: connection)
-        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read, currentConnectionOnly: currentConnectionOnly)
+    func bootstrap(_ context:[String:Any], connection:NSXPCConnection, currentConnectionOnly: Bool = false,
+                   timing: ServiceCallTiming? = nil) throws -> BootstrapResult {
+        let native = try ServiceCallTiming.measure(timing,"bootstrap_native_peer_ms") {
+            try verifiedNativeWorkspace(context, connection: connection)
+        }
+        return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read,
+            currentConnectionOnly: currentConnectionOnly, timing:timing)
     }
 
     // Peer/process verification stays at the XPC boundary; this stage retains all grant checks.
     func bootstrapVerifiedWorkspace(_ context: [String: Any], native: VerifiedNativeWorkspace,
-                                    readCredential: (String) throws -> String?, currentConnectionOnly: Bool = false) throws -> BootstrapResult {
+                                    readCredential: (String) throws -> String?, currentConnectionOnly: Bool = false,
+                                    timing: ServiceCallTiming? = nil) throws -> BootstrapResult {
         let (provider, sid, process, executionDomain, workspace) = (native.provider, native.session, native.process, native.executionDomain, native.workspace)
         let plugin = ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)!
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
@@ -43,7 +48,9 @@ extension Coordinator {
         if currentConnectionOnly && relay { throw NativeBootstrapRequiresWrite() }
         guard context["mode"] == nil || relay else { throw ChecklistError("INVALID_CONNECTION_MODE","Use worker or personal-assistant relay access.") }
         if relay && ProviderPluginRegistry.bundled.plugin(provider, requiring: .assistantRelay) == nil { throw ChecklistError("ADAPTER_UNAVAILABLE","The personal-assistant helper currently uses native Codex.") }
-        let resolved=try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
+        let resolved = try ServiceCallTiming.measure(timing,"bootstrap_workspace_resolution_ms") {
+            try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
+        }
         let body=resolved["data"] as? [String:Any] ?? resolved
         var projects=body["projects"] as? [[String:Any]] ?? []
         if relay {
@@ -95,7 +102,9 @@ extension Coordinator {
             observeNativeConversationLifecycle(earlier)
         }
         if var existing=enrollments[installation] {
-            let session = try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
+            let session = try ServiceCallTiming.measure(timing,"bootstrap_canonical_session_ms") {
+                try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
+            }
             if let session {
                 guard session["owner_revoked"] as? Bool != true else {
                     throw ChecklistError("CONNECTION_REVOKED","The owner disconnected this conversation in Checklist. It stays refused until the owner selects Allow again on its ticket.")
@@ -131,14 +140,17 @@ extension Coordinator {
             guard existing.sessionID == boundSessionID,existing.workspace == binding,existing.provider == provider,relay || existing.projectIDs == [pid] else { throw ChecklistError("BINDING_CHANGED","The registered workspace changed. Review this connection in Checklist before reconnecting.") }
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
             // Ordinary MCP/client restarts do not rotate claims, deliveries or grants.
-            guard let credential = try readCredential(installation), SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
+            let savedCredential = try ServiceCallTiming.measure(timing,"bootstrap_credential_read_ms") {try readCredential(installation)}
+            guard let credential = savedCredential, SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
             if let session {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
             }
             // A thread can connect before its rollout exists, and an older enrollment has no value.
             if provider == "codex", !relay, existing.codexAppHostProven != true,
-               provesCodexAppRegistration(session: existing.nativeSessionID ?? existing.sessionID, domain: executionDomain) {
+               ServiceCallTiming.measure(timing,"bootstrap_host_proof_ms", {
+                   provesCodexAppRegistration(session:existing.nativeSessionID ?? existing.sessionID,domain:executionDomain)
+               }) {
                 guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
                 storeCodexAppHostProof(installation: installation, generation: existing.generation)
                 existing.codexAppHostProven = true
@@ -157,7 +169,7 @@ extension Coordinator {
                     return BootstrapResult(reply:connectionResult(existing, project:pid),changed:true)
                 }
             }
-            try requireCommittedRegistration(existing, project: pid, caller: owner)
+            try requireCommittedRegistration(existing, project: pid, caller: owner, timing:timing)
             return BootstrapResult(reply:connectionResult(existing, project:pid),changed:false)
         }
         return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
@@ -273,7 +285,8 @@ extension Coordinator {
         })
     }
 
-    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller, timing: ServiceCallTiming? = nil) throws {
+    @discardableResult
+    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller, timing: ServiceCallTiming? = nil) throws -> String {
         let currentSession = try ServiceCallTiming.measure(timing,"route_current_session_ms") {
             try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller)
         }
@@ -289,6 +302,7 @@ extension Coordinator {
                 throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "Pairing preparation has no matching committed receipt. Reconcile its original command before repair.")
             }
         }
+        return router.sessionGeneration(session)
     }
 
     func bindProviderEndpoint(_ enrollment:inout Enrollment,endpoint:String,process:pid_t) throws {
