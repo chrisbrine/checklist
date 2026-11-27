@@ -74,6 +74,12 @@ extension TicketLifecycleCleanupTests {
     func testOversizedJobObservationDefersActualDoneSelectionAndSchedulesRetry() throws {
         try QualificationSuite.requireEnabled()
         let (project,task,attachment) = try fixture(),tid = task["id"] as! String
+        let sibling = try call("task_create",["project_id":project["id"]!,"title":"Synthetic sibling"])
+        let siblingID = sibling["id"] as! String
+        let source = URL(fileURLWithPath:project["root_path"] as! String).appendingPathComponent("sibling.txt")
+        try Data("sibling evidence".utf8).write(to:source)
+        _ = try call("attachment_add",["project_id":project["id"]!,"task_id":siblingID,"path":source.path,"mode":"managed_copy"])
+        try mark(project,sibling,category:"done")
         var oversized = cleanupObservedJob(task)
         oversized["body"] = String(repeating:"x",count:4 * 1024 * 1024 + 1)
         try saveObservedJobs([oversized])
@@ -81,8 +87,9 @@ extension TicketLifecycleCleanupTests {
         let prepared = try router.readers!.read {try self.router.ticketCleanupSelection($0,project:project)}
         let item = try XCTUnwrap((prepared.selection["items"] as? [JSON])?.first {$0["task_id"] as? String == tid})
         XCTAssertEqual(item["action"] as? String,"keep");XCTAssertEqual(item["reason"] as? String,"CLEANUP_INVENTORY_LIMIT")
-        XCTAssertTrue(strings(prepared.selection,"retry_task_ids").contains(tid))
+        XCTAssertEqual(strings(prepared.selection,"retry_task_ids"),[tid])
         XCTAssertNil(prepared.plans[tid],"An unreadable bounded job history cannot prove that a new byte job is needed")
+        XCTAssertNotNil(prepared.plans[siblingID])
         XCTAssertTrue(FileManager.default.fileExists(atPath:attachment["path"] as! String))
         XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT COUNT(*) FROM records WHERE type='storage_job'")},before)
     }
@@ -247,12 +254,237 @@ extension TicketLifecycleCleanupTests {
         }
     }
 
-    func testJobObservationScopedPayloadOverflowFailsClosedForEverySelectedTicket() throws {
+    func testJobObservationScopedPayloadOverflowOnlyRefusesItsOwner() throws {
         let first = selectedJobTicket(project:uuid()),second = selectedJobTicket(project:first["project_id"] as! String),unrelated = selectedJobTicket(project:first["project_id"] as! String)
-        var oversized = cleanupObservedJob(unrelated);oversized["body"] = String(repeating:"x",count:2048)
+        var oversized = cleanupObservedJob(unrelated,objects:[["body":String(repeating:"é🪁",count:23_000),"task_id":first["id"]!]])
+        oversized["summary"] = ["values":[1,2.5,true,NSNull(),["another_task_id":second["id"]!]] as [Any]]
         try saveObservedJobs([cleanupObservedJob(first),oversized,cleanupObservedJob(second,state:"pending")])
         var limits = TicketCleanupJobObservation.Limits();limits.rowBytes = 1024
         let observation = try jobObservation([first,second],limits:limits)
-        assertJobObservationRefused(observation,first);assertJobObservationRefused(observation,second)
+        XCTAssertFalse(try observedEntry(observation,first).pending)
+        XCTAssertTrue(try observedEntry(observation,second).pending)
+        let includingOwner = try jobObservation([first,second,unrelated],limits:limits)
+        assertJobObservationRefused(includingOwner,unrelated)
+        XCTAssertFalse(try observedEntry(includingOwner,first).pending)
+        XCTAssertTrue(try observedEntry(includingOwner,second).pending)
+    }
+
+    func testJobObservationOversizedOwnerDecodesEscapesAndMatchesExactUTF8() throws {
+        let pid = uuid(), id = uuid()
+        let first = selectedJobTicket("task-caf\u{e9}",project:pid), second = selectedJobTicket("task-cafe\u{301}",project:pid)
+        let prefix = "{\"id\":\"\(id)\",\"project_id\":\"\(pid)\",\"revision\":1.0,\"body\":\""
+        let padding = String(repeating:"x",count:65534 - prefix.utf8.count)
+        let raw = prefix + padding + "\\ud83d\\ude80\",\"task_\\u0069d\":\"task-cafe\\u0301\"}"
+        try write {db in
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'storage_job',1,?)",arguments:[id,pid,raw])
+        }
+        var limits = TicketCleanupJobObservation.Limits();limits.rowBytes = 1024
+        let observation = try jobObservation([first,second],limits:limits)
+        XCTAssertFalse(try observedEntry(observation,first).pending)
+        XCTAssertThrowsError(try observedEntry(observation,second)) { error in
+            XCTAssertEqual((error as? CoreError)?.code,"CLEANUP_INVENTORY_LIMIT")
+            XCTAssertTrue((error as? CoreError)?.message.contains("1024-byte payload bound") == true)
+        }
+    }
+
+    func testJobObservationUnattributablePayloadOverflowDefersOnlyItsProject() throws {
+        let foreign = selectedJobTicket(project:uuid())
+        try saveObservedJobs([cleanupObservedJob(foreign,state:"pending")])
+        var limits = TicketCleanupJobObservation.Limits();limits.rowBytes = 1024
+        let padding = String(repeating:"x",count:2048)
+        for scenario in ["missing", "nonstring", "duplicate", "id", "project", "revision", "badUnicode", "badUTF8", "largeKey", "blob"] {
+            let pid = uuid(), id = uuid()
+            let first = selectedJobTicket(project:pid), second = selectedJobTicket(project:pid)
+            let tid = first["id"] as! String
+            let identity = "\"id\":\"\(scenario == "id" ? uuid() : id)\",\"project_id\":\"\(scenario == "project" ? uuid() : pid)\",\"revision\":\(scenario == "revision" ? 2 : 1)"
+            var job = "{\(identity),\"padding\":\"\(padding)\""
+            switch scenario {
+            case "missing": break
+            case "nonstring": job += ",\"task_id\":[]"
+            case "duplicate": job += ",\"task_id\":\"\(tid)\",\"task_\\u0069d\":\"\(uuid())\""
+            case "badUnicode": job += ",\"task_id\":\"\(tid)\",\"body\":\"\\ud800\""
+            case "largeKey": job += ",\"task_id\":\"\(tid)\",\"\(String(repeating:"k",count:65536))\":null"
+            default: job += ",\"task_id\":\"\(tid)\""
+            }
+            var bytes = Data(job.utf8)
+            if scenario == "badUTF8" {bytes.append(contentsOf:[44,34,255,34,58,48])}
+            bytes.append(125)
+            try write {db in
+                let payload = scenario == "blob" ? "?" : "CAST(? AS TEXT)"
+                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES(?,?,'storage_job',1,\(payload))",arguments:[id,pid,bytes])
+            }
+            let observation = try jobObservation([first,second,foreign],limits:limits)
+            assertJobObservationRefused(observation,first)
+            assertJobObservationRefused(observation,second)
+            XCTAssertTrue(try observedEntry(observation,foreign).pending,scenario)
+        }
+    }
+
+    func testJobObservationMatchesFrozenSmallJobPath() throws {
+        for count in [0,32,128,384] {
+            let project = uuid(), otherProject = uuid()
+            let tasks = [selectedJobTicket("task-caf\u{e9}",project:project),
+                         selectedJobTicket("task-cafe\u{301}",project:project),
+                         selectedJobTicket(project:project),selectedJobTicket(project:otherProject)]
+            let owners = tasks + [selectedJobTicket(project:project),selectedJobTicket(project:uuid()),
+                                  selectedJobTicket(tasks[0]["id"] as! String,project:otherProject)]
+            let states = ["retained","pending","removed"]
+            let objects: [JSON] = (0..<23).map { index in
+                ["stored_path":index.isMultiple(of:5) ? NSNull() : "objects/\(index % 7)",
+                 "sha256":index.isMultiple(of:7) ? index : "sha-\(index % 3)",
+                 "reasons":index.isMultiple(of:3) ? ["a","b"] : ["b","a"],
+                 "state":states[index % states.count]]
+            }
+            var seed: UInt64 = 516
+            func draw(_ limit: Int) -> Int {
+                seed = 6364136223846793005 &* seed &+ 1
+                return Int((seed >> 32) % UInt64(limit))
+            }
+            let jobs = (0..<count).map { _ in
+                cleanupObservedJob(owners[draw(owners.count)],state:draw(6) == 0 ? "pending" : "completed",
+                                   objects:(0..<draw(6)).map {_ in objects[draw(objects.count)]},
+                                   cause:draw(4) == 0 ? "task_purge" : "done_evidence",
+                                   kind:draw(3) == 0 ? "historical_kind" : "ticket_object_delete")
+            }
+            try saveObservedJobs(jobs)
+            let (old,new) = try router.readers!.read { db in
+                (try self.router.legacyTicketCleanupJobObservation(db,tasks:tasks),
+                 try self.router.ticketCleanupJobObservation(db,tasks:tasks))
+            }
+            for task in tasks {
+                let prior = try old.entry(task:task["id"] as! String,project:task["project_id"] as! String)
+                let current = try observedEntry(new,task)
+                XCTAssertEqual(prior.pending,current.pending,"\(count) generated jobs")
+                for object in objects {
+                    XCTAssertEqual(prior.retains(object),current.retains(object),"\(count) generated jobs")
+                }
+            }
+        }
+    }
+}
+
+// Frozen from 57a4f70 for the small-job differential test.
+/// Selected-ticket accounting only, built and consumed in one read snapshot.
+/// Full job payloads are validated once and discarded; no history is truncated
+/// to infer that a ticket has no pending or previously retained objects.
+private struct LegacyTicketCleanupJobObservation {
+    struct Limits {
+        var rowBytes = TicketCleanupInventory.rowByteLimit
+        var ticketJobs = 4096
+        var ticketObjects = 100000
+        var ticketBytes = TicketCleanupInventory.byteLimit
+        var totalObjects = 200000
+        var totalBytes = TicketCleanupBatchInventory.byteLimit
+    }
+    fileprivate struct Signature: Hashable {
+        let path: String?
+        let sha: String?
+        let reasons: [String]
+        init(_ object: JSON) {
+            path = object["stored_path"] as? String
+            sha = object["sha256"] as? String
+            reasons = strings(object,"reasons")
+        }
+        var charge: Int {
+            (path?.utf8.count ?? 0) + (sha?.utf8.count ?? 0) + reasons.reduce(0) {$0 + $1.utf8.count + 32} + 256
+        }
+    }
+    struct Entry {
+        fileprivate let project: Data
+        fileprivate var retained = Set<Signature>()
+        fileprivate var jobs = 0
+        fileprivate var bytes = 0
+        fileprivate(set) var pending = false
+        func retains(_ object: JSON) -> Bool {retained.contains(Signature(object))}
+    }
+    private var entries: [Data:Entry] = [:]
+    private var selectionError: CoreError?
+    private var errors: [Data:CoreError] = [:]
+    private var retainedObjects = 0
+    private var retainedBytes = 0
+
+    func entry(task: String,project: String) throws -> Entry {
+        if let selectionError {throw selectionError}
+        let key = Data(task.utf8)
+        if let error = errors[key] {throw error}
+        guard let entry = entries[key],entry.project == Data(project.utf8) else {
+            throw Self.limit("A same-snapshot, exact-ticket job observation is required.")
+        }
+        return entry
+    }
+    private static func limit(_ message: String) -> CoreError {CoreError("CLEANUP_INVENTORY_LIMIT",message)}
+    fileprivate mutating func fail(_ tasks: Set<Data>) {
+        for task in tasks where errors[task] == nil {
+            errors[task] = Self.limit("Selected cleanup job history exceeds its bound; this ticket is deferred.")
+            if let entry = entries.removeValue(forKey:task) {
+                retainedObjects -= entry.retained.count;retainedBytes -= entry.bytes
+            }
+        }
+    }
+    fileprivate mutating func observe(_ job: JSON,project: Data,limits: Limits) {
+        guard job["cause"] as? String == "done_evidence",let task = job["task_id"] as? String else {return}
+        let key = Data(task.utf8)
+        guard var entry = entries[key],entry.project == project else {return}
+        entry.jobs += 1
+        guard entry.jobs <= limits.ticketJobs else {fail([key]);return}
+        entry.pending = entry.pending || job["state"] as? String == "pending"
+        for object in job["objects"] as? [JSON] ?? [] where object["state"] as? String == "retained" {
+            let signature = Signature(object)
+            guard !entry.retained.contains(signature) else {continue}
+            let charge = signature.charge
+            guard entry.retained.count < limits.ticketObjects,entry.bytes + charge <= limits.ticketBytes,
+                  retainedObjects < limits.totalObjects,retainedBytes + charge <= limits.totalBytes else {
+                // Publish the locally accumulated charges before releasing this
+                // ticket, so aggregate admission remains exact after refusal.
+                entries[key] = entry;fail([key]);return
+            }
+            entry.retained.insert(signature);entry.bytes += charge
+            retainedObjects += 1;retainedBytes += charge
+        }
+        entries[key] = entry
+    }
+
+    fileprivate init(tasks: [JSON],limits: Limits) throws {
+        guard tasks.count <= 32 else {throw CoreError("PURGE_LIMIT","Cleanup selects at most 32 tickets per observation.")}
+        for task in tasks {
+            let stored = StoredRecord(task,family:"task"),tid = Data(try stored.string("id").utf8),pid = Data(try stored.string("project_id").utf8)
+            if let previous = entries[tid] {
+                guard previous.project == pid else {throw Self.limit("A selected ticket has inconsistent job scope.")}
+                continue
+            }
+            let charge = tid.count + pid.count + 192
+            guard charge <= limits.ticketBytes,charge <= limits.rowBytes,retainedBytes + charge <= limits.totalBytes else {
+                selectionError = Self.limit("Selected cleanup job identities exceed their memory bound; this selection is deferred.")
+                entries.removeAll();retainedBytes = 0;break
+            }
+            entries[tid] = Entry(project:pid,bytes:charge);retainedBytes += charge
+        }
+    }
+    fileprivate var scopes: [Data:Set<Data>] {
+        entries.reduce(into:[:]) {$0[$1.value.project,default:[]].insert($1.key)}
+    }
+}
+
+extension CommandRouter {
+    fileprivate func legacyTicketCleanupJobObservation(_ db: Database,tasks: [JSON],limits: LegacyTicketCleanupJobObservation.Limits = .init()) throws -> LegacyTicketCleanupJobObservation {
+        var result = try LegacyTicketCleanupJobObservation(tasks:tasks,limits:limits)
+        let scopes = result.scopes
+        for project in scopes.keys.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
+            // Bound the payload before it crosses GRDB. Oversized rows cannot
+            // safely supply canonical task ownership, so defer this whole scope.
+            let bounded = "CASE WHEN length(CAST(data AS BLOB))<=\(limits.rowBytes) THEN data END"
+            let columns = "id,project_id,type,revision,\(bounded) AS data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes"
+            let cursor = try Row.fetchCursor(db,sql:"SELECT " + columns + ",length(CAST(data AS BLOB)) AS original_size,typeof(data) AS original_type FROM records INDEXED BY records_scope WHERE project_id=CAST(? AS TEXT) AND type='storage_job' ORDER BY rowid",arguments:[project])
+            while let row = try cursor.next() {
+                try autoreleasepool {
+                    guard row["original_type"] as String == "text" else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
+                    guard let size: Int = row["original_size"],size <= limits.rowBytes else {result.fail(scopes[project] ?? []);return}
+                    let envelope = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job")
+                    guard envelope.projectID.map({Data($0.utf8)}) == project else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.identityMismatch))}
+                    result.observe(envelope.object,project:project,limits:limits)
+                }
+            }
+        }
+        return result
     }
 }

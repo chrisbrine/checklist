@@ -50,9 +50,9 @@ struct TicketCleanupJobObservation {
         return entry
     }
     private static func limit(_ message: String) -> CoreError {CoreError("CLEANUP_INVENTORY_LIMIT",message)}
-    fileprivate mutating func fail(_ tasks: Set<Data>) {
+    fileprivate mutating func fail(_ tasks: Set<Data>,message: String = "Selected cleanup job history exceeds its bound; this ticket is deferred.") {
         for task in tasks where errors[task] == nil {
-            errors[task] = Self.limit("Selected cleanup job history exceeds its bound; this ticket is deferred.")
+            errors[task] = Self.limit(message)
             if let entry = entries.removeValue(forKey:task) {
                 retainedObjects -= entry.retained.count;retainedBytes -= entry.bytes
             }
@@ -107,15 +107,28 @@ extension CommandRouter {
         var result = try TicketCleanupJobObservation(tasks:tasks,limits:limits)
         let scopes = result.scopes
         for project in scopes.keys.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
-            // Bound the payload before it crosses GRDB. Oversized rows cannot
-            // safely supply canonical task ownership, so defer this whole scope.
-            let bounded = "CASE WHEN length(CAST(data AS BLOB))<=\(limits.rowBytes) THEN data END"
-            let columns = "id,project_id,type,revision,\(bounded) AS data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes"
-            let cursor = try Row.fetchCursor(db,sql:"SELECT " + columns + ",length(CAST(data AS BLOB)) AS original_size,typeof(data) AS original_type FROM records INDEXED BY records_scope WHERE project_id=CAST(? AS TEXT) AND type='storage_job' ORDER BY rowid",arguments:[project])
+            // octet_length reads the size of a column without loading its payload.
+            let bounded = "CASE WHEN octet_length(data)<=\(limits.rowBytes) THEN data END"
+            let id = "CASE WHEN octet_length(data)<=\(limits.rowBytes) OR octet_length(id)<=\(TicketCleanupJobOwner.fieldLimit) THEN id END"
+            let sql = """
+                SELECT rowid,\(id) AS id,typeof(id) AS id_type,project_id,type,revision,\(bounded) AS data,
+                    CAST(\(id) AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,
+                    CAST(type AS BLOB) AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes,
+                    octet_length(data) AS original_size,typeof(data) AS original_type
+                FROM records INDEXED BY records_scope WHERE project_id=CAST(? AS TEXT) AND type='storage_job' ORDER BY rowid
+                """
+            let cursor = try Row.fetchCursor(db,sql:sql,arguments:[project])
+            let selected = scopes[project] ?? []
             while let row = try cursor.next() {
                 try autoreleasepool {
-                    guard row["original_type"] as String == "text" else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
-                    guard let size: Int = row["original_size"],size <= limits.rowBytes else {result.fail(scopes[project] ?? []);return}
+                    let text = row["original_type"] as String == "text"
+                    guard let size: Int = row["original_size"],size <= limits.rowBytes else {
+                        let task = text ? TicketCleanupJobOwner.task(db,row:row,project:project) : nil
+                        let affected = task.map {selected.intersection([$0])} ?? selected
+                        result.fail(affected,message:"A cleanup job exceeds the \(limits.rowBytes)-byte payload bound; this ticket is deferred.")
+                        return
+                    }
+                    guard text else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
                     let envelope = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job")
                     guard envelope.projectID.map({Data($0.utf8)}) == project else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.identityMismatch))}
                     result.observe(envelope.object,project:project,limits:limits)
