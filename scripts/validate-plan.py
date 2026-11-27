@@ -249,6 +249,16 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_expired']['error']['code'] = 'OPERATION_INTERRUPTED'
     reject('media-round-deletion', bad, 'interruption presented as receipt expiry')
+    owner_expiry = json.loads((ROOT / 'examples/agent-project-commands.json').read_text())['owner_selected_file_expiry']
+    expired_schema = validators['media-round-deletion'].schema['properties']['operation_expired']
+    if not validators['media-round-deletion'].evolve(schema=expired_schema).is_valid(owner_expiry['expired']):
+        errors.append('agent-project-commands: invalid selected-file preview expiry')
+    preview_input = owner_expiry['request']['params']
+    if (owner_expiry['request']['method'] != 'media_intake_preview' or not preview_input.get('sources')
+            or owner_expiry['read']['method'] != 'operation_get'
+            or preview_input['project_id'] != owner_expiry['read']['params']['project_id']
+            or preview_input['command_id'] != owner_expiry['expired']['error']['details']['command_id']):
+        errors.append('agent-project-commands: selected-file expiry must read the original preview operation and command')
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['accepted']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
     reject('media-round-deletion', bad, 'fabricated result for queued operation')

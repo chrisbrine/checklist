@@ -176,50 +176,129 @@ extension CommandRouter {
         return result
     }
 
-    /// One global command-result stream for every aged purge in a selection.
-    /// Match complete UTF-8 string/key tokens, preserving byte-exact identity.
+    /// The operation journal supplies scope and identity. Probe the command
+    /// slots by primary key. A historical failure reference survives retry.
+    private static func ticketPurgeReceiptScopesSQL(changesOnly: Bool = false) -> String {
+        let source = changesOnly
+            ? "ticket_cleanup_changes x CROSS JOIN metadata m ON m.rowid=x.position AND x.kind=3"
+            : "metadata"
+        return """
+            WITH operations AS MATERIALIZED (
+                SELECT json_extract(value,'$.principal') AS principal,
+                       json_extract(value,'$.command_id') AS command,
+                       json_extract(value,'$.error_result_command_id') AS error_command,
+                       json_extract(value,'$.method') AS method,
+                       json_extract(value,'$.digest') AS digest,
+                       CASE
+                           WHEN json_type(value,'$.method') IS NOT 'text' OR json_type(value,'$.project_id') IS NOT 'text' THEN NULL
+                           WHEN json_type(value,'$.purge_uses_store_epoch')='true' THEN NULL
+                           WHEN json_type(value,'$.purge_uses_store_epoch')='false' THEN NULLIF(json_extract(value,'$.project_id'),'')
+                           WHEN json_extract(value,'$.method') IN (SELECT value FROM json_each(?)) THEN NULL
+                           WHEN json_extract(value,'$.method')='media_intake_preview'
+                                AND (json_extract(value,'$.caller.role') IS NULL OR json_extract(value,'$.caller.role')='owner') THEN NULL
+                           ELSE NULLIF(json_extract(value,'$.project_id'),'')
+                       END AS project
+                FROM \(source) WHERE key GLOB 'command-operation:*' AND json_valid(value)
+            ), private_receipts AS (
+                SELECT c.rowid AS position,o.project FROM operations o CROSS JOIN commands c
+                ON c.principal=o.principal AND c.command_id=o.command
+                WHERE c.digest=o.digest AND (o.method='import_preview' OR length(CAST(c.result AS BLOB))>?) AND c.result<>?
+                UNION ALL
+                SELECT c.rowid AS position,o.project FROM operations o CROSS JOIN commands c
+                ON c.principal=o.principal AND c.command_id=o.error_command WHERE c.result<>?
+            ), scopes AS MATERIALIZED (
+                SELECT position,CASE WHEN count(*)=1 THEN max(project) END AS project
+                FROM private_receipts GROUP BY position
+            )
+            """
+    }
+
+    private static func ticketPurgeReceiptScopeArguments() throws -> StatementArguments {
+        [try jsonString(storeWideOperationPurgeMethods.sorted()),TicketCleanupInventory.rowByteLimit,prunedResult,prunedResult]
+    }
+
+    /// The ordinary change fence covers exact references and large payloads.
+    /// A newly published private receipt can need retirement without naming
+    /// a removed record. Its terminal journal metadata changes with it.
+    static func ticketPurgePrivateReceiptChanged(_ db: Database,project: String) throws -> Bool {
+        try Bool.fetchOne(db,sql:ticketPurgeReceiptScopesSQL(changesOnly:true) + "\n" + """
+            SELECT EXISTS(SELECT 1 FROM scopes s
+                JOIN ticket_cleanup_changes x ON x.kind=2 AND x.position=s.position
+                WHERE s.project IS NULL OR CAST(s.project AS BLOB)=?)
+            """,arguments:ticketPurgeReceiptScopeArguments() + [Data(project.utf8)]) == true
+    }
+
+    /// Foundation dictionaries keep distinct UTF-8 keys that Swift's String
+    /// equality would merge. Use the SQL scan when the Swift traversal is too deep.
+    private static func visitTicketPurgeReceiptTokens(_ value: Any,depth: Int = 0,budget: inout Int,visit: (String) -> Void) -> Bool {
+        budget -= 1
+        guard depth <= 64,budget >= 0 else {return false}
+        if let string = value as? String {visit(string)}
+        else if let object = value as? NSDictionary {
+            for (key,member) in object {
+                if let key = key as? String {visit(key)}
+                guard visitTicketPurgeReceiptTokens(member,depth:depth+1,budget:&budget,visit:visit) else {return false}
+            }
+        } else if let array = value as? NSArray {
+            for member in array {
+                guard visitTicketPurgeReceiptTokens(member,depth:depth+1,budget:&budget,visit:visit) else {return false}
+            }
+        }
+        return true
+    }
+
+    /// Manual and automatic purge use the same command-result snapshot.
+    /// Ordinary results need an exact reference. Failure receipts, oversized
+    /// operation results and import previews can also carry private text alone.
     func ticketPurgeExpiringCommands(_ db: Database,tasks: [JSON],plans: [String:TicketPurgePlan]) throws -> TicketCleanupCommandObservation {
         guard tasks.count <= 32 else {throw CoreError("PURGE_LIMIT","Cleanup selects at most 32 tickets per observation.")}
-        var needles: [Data:Set<String>] = [:],targets = Set<String>()
+        var needles: [Data:Set<String>] = [:],projects: [Data:Set<String>] = [:],targets = Set<String>()
         for task in tasks {
-            let tid = try StoredRecord(task,family:"task").string("id")
+            let stored = try StoredRecord(task,family:"task"),tid = try stored.string("id")
             guard let plan = plans[tid] else {continue}
             targets.insert(tid)
+            projects[Data(try stored.string("project_id").utf8),default:[]].insert(tid)
             for key in Set(plan.removed.map(\.key)).union([Data(tid.utf8)]) {needles[key,default:[]].insert(tid)}
         }
         var selected = CleanupHistoryRows()
         guard !targets.isEmpty else {return TicketCleanupCommandObservation()}
         let keys = try jsonString(needles.keys.map {String(decoding:$0,as:UTF8.self)})
-        let cursor = try Row.fetchCursor(db,sql:"""
-            SELECT rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,
-                   CAST(command_id AS BLOB) AS cleanup_command_id,
-                   length(CAST(result AS BLOB)) AS result_bytes,
-                   CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result
-            FROM commands
-            """,arguments:[TicketCleanupInventory.rowByteLimit])
+        let cursor = try Row.fetchCursor(db,sql: Self.ticketPurgeReceiptScopesSQL() + "\n" + """
+            SELECT c.rowid AS cleanup_row,c.principal,c.command_id,CAST(c.principal AS BLOB) AS cleanup_principal,
+                   CAST(c.command_id AS BLOB) AS cleanup_command_id,
+                   length(CAST(c.result AS BLOB)) AS result_bytes,
+                   CASE WHEN length(CAST(c.result AS BLOB))<=? THEN c.result END AS result,
+                   scopes.position IS NOT NULL AS private_receipt,CAST(scopes.project AS BLOB) AS receipt_project
+            FROM commands c LEFT JOIN scopes ON scopes.position=c.rowid
+            WHERE c.result<>?
+            """,arguments: try Self.ticketPurgeReceiptScopeArguments() + [TicketCleanupInventory.rowByteLimit,Self.prunedResult])
         while let row = try cursor.next() {
             guard targets.contains(where:{selected.errors[$0] == nil}) else {break}
             try autoreleasepool {
-                func refuse(_ error: CoreError) throws {
-                    let payloadSQL = "SELECT result AS payload FROM commands WHERE rowid=?"
-                    guard let exact = try Self.ticketCleanupMatchingPayloadKeys(db,payloadSQL:payloadSQL,position:row["cleanup_row"],keys:keys) else {
-                        selected.fail(targets,error);return
-                    }
-                    var matched = Set<String>()
-                    for key in exact {matched.formUnion(needles[key] ?? [])}
-                    selected.fail(matched,error)
-                }
-                guard let data: String = row["result"] else {
-                    try refuse(CoreError("CLEANUP_INVENTORY_LIMIT","A selected command result exceeds the 4 MiB payload bound."));return
-                }
-                var tokens = Set<Data>(),budget = 2000000
-                do {try TicketCleanupInventory.strings(jsonObject(data),{tokens.insert(Data($0.utf8))},budget:&budget)}
-                catch let error as CoreError {
-                    try refuse(CoreError(error.code,error.message,details:["limit":budget < 0 ? "command_row_tokens" : "command_row_depth","maximum":budget < 0 ? 2000000 : 64]));return
-                }
                 var matched = Set<String>()
-                for key in tokens {matched.formUnion(needles[key] ?? [])}
-                selected.add(row,tokens:[],bytes:row["result_bytes"],tasks:matched,commands:true)
+                if row["private_receipt"] as Bool {
+                    if let project: Data = row["receipt_project"] {matched = projects[project] ?? []}
+                    else {matched = targets}
+                }
+                let raw: String? = row["result"]
+                if targets.contains(where:{!matched.contains($0) && selected.errors[$0] == nil}) {
+                    var inspected = false
+                    if let raw,let payload = try? JSONSerialization.jsonObject(with:Data(raw.utf8)) {
+                        var budget = 2000000
+                        inspected = Self.visitTicketPurgeReceiptTokens(payload,budget:&budget) {
+                            matched.formUnion(needles[Data($0.utf8)] ?? [])
+                        }
+                    }
+                    if !inspected {
+                        let payloadSQL = "SELECT result AS payload FROM commands WHERE rowid=?"
+                        if let exact = try Self.ticketCleanupMatchingPayloadKeys(db,payloadSQL:payloadSQL,position:row["cleanup_row"],keys:keys) {
+                            for key in exact {matched.formUnion(needles[key] ?? [])}
+                        } else {matched = targets}
+                    }
+                }
+                // A large result is scrubbed by row identity without retaining
+                // its payload in the purge plan. The per-ticket row bound applies.
+                selected.add(row,tokens:[],bytes:raw == nil ? 0 : row["result_bytes"],tasks:matched,commands:true)
             }
         }
         var result = TicketCleanupCommandObservation(errors:selected.errors)

@@ -18,6 +18,12 @@
     "succeeded": {"data":{"operation_id":"00000000-0000-4000-8000-000000000012","command_id":"00000000-0000-4000-8000-000000000011","method":"backup_create","state":"succeeded","created_at":"2026-10-01T12:00:00Z","started_at":"2026-10-01T12:00:01Z","finished_at":"2026-10-01T12:00:30Z","result":{"command_id":"00000000-0000-4000-8000-000000000011","data":{"path":"<service-selected-backup-destination>","format":"checklist-store-snapshot","manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","operation_id":"00000000-0000-4000-8000-000000000013","restore_supported":true,"status":"complete","writer_lease_seconds":0.2}}}},
     "replay": "Repeat the request with the same command_id and identical parameters to receive the same operation. Preserve its result's own snapshot operation_id separately from the command operation ID."
   },
+  "owner_selected_file_expiry": {
+    "description": "An owner preview reads a managed text file from a different project. Ticket purge there commits before the preview saves, so the intake transaction aborts and operation_get reports expiry for the original command.",
+    "request": {"method":"media_intake_preview","params":{"project_id":"00000000-0000-0000-0000-000000000014","round_id":"00000000-0000-0000-0000-000000000015","command_id":"00000000-0000-0000-0000-000000000016","sources":[{"path":"/synthetic/objects/source.txt"}]}},
+    "read": {"method":"operation_get","params":{"project_id":"00000000-0000-0000-0000-000000000014","operation_id":"00000000-0000-0000-0000-000000000017"}},
+    "expired": {"error":{"code":"COMMAND_RESULT_EXPIRED","message":"This command's stored reply is no longer available. Read the current state before starting a new command.","details":{"command_id":"00000000-0000-0000-0000-000000000016"}}}
+  },
   "remaining_owner_only": {
     "project_edit.root_path": "Defines the filesystem authority boundary; explicit owner decision required.",
     "export_project": "Path-based destination publication and crash reconciliation need descriptor-relative confinement together.",

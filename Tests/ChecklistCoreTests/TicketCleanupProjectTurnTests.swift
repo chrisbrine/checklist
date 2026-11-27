@@ -15,6 +15,37 @@ extension TicketLifecycleCleanupTests {
         try attachmentOperationAcrossAutomaticPurge(sameProject:true)
     }
 
+    func testCL520AutomaticPurgeRechecksPrivateReceiptsPublishedAfterObservation() throws {
+        for sameProject in [false,true] {
+            let (project,closed,_) = try independentFixture(age:20)
+            let destination = sameProject ? project : try otherProjectForPurgeOverlap()
+            let lane = DispatchQueue(label:"late-cleanup-receipt")
+            router.configureCommandOperations(on:lane)
+            var selector: JSON = [:]
+            try router.withTicketCleanupPreparation({db in
+                let pass = try XCTUnwrap(self.router.prepareTicketLifecycleCleanup(db))
+                let reply = try self.callBesideSnapshot("attachment_cleanup_preview",["project_id":destination["id"]!,"task_id":uuid()])
+                selector = ["project_id":destination["id"]!,"operation_id":try XCTUnwrap(reply["operation_id"])]
+                lane.sync {}
+                return pass
+            }) {db,_,prepared in
+                let item = try XCTUnwrap((prepared.selection["items"] as? [JSON])?.first)
+                XCTAssertEqual(item["action"] as? String,sameProject ? "keep" : "purge")
+                if sameProject {XCTAssertEqual(item["fence_reason"] as? String,"fenced by concurrent write to private operation receipt")}
+                try self.router.commitTicketLifecycleCleanup(db,prepared:prepared,at:Date())
+            }
+            XCTAssertEqual(try call("operation_get",selector)["state"] as? String,"failed")
+            XCTAssertEqual(bool(try read(closed),"purged"),!sameProject)
+            if sameProject {
+                let pid = try XCTUnwrap(project["id"] as? String),tid = try XCTUnwrap(closed["id"] as? String)
+                let due = try router.dbQueue.read {db in try XCTUnwrap(self.router.ticketCleanupRetries(db,project:pid)[tid])}
+                try router.runTicketLifecycleCleanup(at:Date(timeIntervalSince1970:due).addingTimeInterval(1))
+                XCTAssertTrue(bool(try read(closed),"purged"))
+                assertOperationReplyExpired(selector)
+            }
+        }
+    }
+
     func testCL520AutomaticPurgeRetiresImportPreviewOfAnotherProjectsExport() throws {
         let (source,closed,_) = try fixture(age:20)
         let destination = try otherProjectForPurgeOverlap()

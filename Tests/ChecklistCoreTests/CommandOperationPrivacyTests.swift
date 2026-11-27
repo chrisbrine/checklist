@@ -5,6 +5,145 @@ import GRDB
 @testable import ChecklistCore
 
 final class CommandOperationPrivacyTests: XCTestCase {
+    private func otherProject(_ f: StorageFixture) throws -> JSON {
+        let workspace = f.base.appendingPathComponent("second-project")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let project = try XCTUnwrap(f.call("project_create",["name":"Second project","key_prefix":"SP","root_path":workspace.path])["data"] as? JSON)
+        _ = try f.call("epic_create",["project_id":project["id"]!,"name":"Second project tickets"])
+        return project
+    }
+
+    private func preparePurge(_ f: StorageFixture,task: JSON) throws -> JSON {
+        let project = try XCTUnwrap(task["project_id"] as? String)
+        let current = try XCTUnwrap(f.call("task_get",["project_id":project,"task_id":task["id"]!])["data"] as? JSON)
+        let trashed = try XCTUnwrap(f.call("task_archive",["project_id":project,"task_id":task["id"]!,
+            "expected_revision":current["revision"]!,"action":"trash"])["data"] as? JSON)
+        var input: JSON = ["project_id":project,"task_id":task["id"]!,"expected_revision":trashed["revision"]!,"command_id":uuid()]
+        let preview = try XCTUnwrap(f.router!.executeBackupQueuedWrite(method:"task_purge_preview",params:input,caller:f.owner)["data"] as? JSON)
+        input["preview_digest"] = preview["digest"]
+        input["command_id"] = uuid()
+        return input
+    }
+
+    private func assertExpired(_ f: StorageFixture,_ selector: JSON,file: StaticString = #filePath,line: UInt = #line) {
+        XCTAssertThrowsError(try f.call("operation_get",selector),file:file,line:line) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"COMMAND_RESULT_EXPIRED",file:file,line:line)
+        }
+    }
+
+    func testCL520OwnerPreviewDoesNotSaveForeignManagedTextAcrossPurge() throws {
+        let media = try MediaRoundTests.Fixture(),f = media.storage,router = media.router
+        let sourceProject = try otherProject(f),task = try f.task(sourceProject)
+        let text = "Private contents of the purged attachment."
+        let source = f.base.appendingPathComponent("purge-source.txt")
+        try Data(text.utf8).write(to:source)
+        let attachment = try XCTUnwrap(f.call("attachment_add",["project_id":sourceProject["id"]!,"task_id":task["id"]!,"path":source.path])["data"] as? JSON)
+        let path = try XCTUnwrap(attachment["path"] as? String)
+        XCTAssertTrue(path.hasPrefix(f.root.path + "/objects/"))
+        let purge = try preparePurge(f,task:task)
+        let round = try media.round(media.type(MediaRoundTests().schema()))
+        let lane = DispatchQueue(label:"owner-selected-file-purge")
+        router.configureCommandOperations(on:lane)
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.mediaIntakePreviewPreparationProbe = {prepared in
+            XCTAssertTrue(prepared.encodedResult.contains(text),"Pause after reading and projecting the managed text")
+            entered.signal()
+            guard release.wait(timeout:.now() + 20) == .success else {throw CoreError("TEST_TIMEOUT","Preview did not resume.")}
+        }
+        defer {
+            release.signal();lane.sync {}
+            router.mediaIntakePreviewPreparationProbe = nil
+        }
+        let command = uuid()
+        let input: JSON = ["project_id":media.project,"round_id":round["id"]!,"sources":[["path":path]]]
+        let accepted = try XCTUnwrap(f.call("media_intake_preview",input,command:command)["data"] as? JSON)
+        let selector: JSON = ["project_id":media.project,"operation_id":try XCTUnwrap(accepted["operation_id"])]
+        XCTAssertEqual(entered.wait(timeout:.now() + 10),.success)
+        XCTAssertEqual((try f.call("operation_get",selector)["data"] as? JSON)?["state"] as? String,"running")
+        let removed = try router.executeBackupQueuedWrite(method:"task_purge",params:purge,caller:f.owner)
+        XCTAssertEqual(((removed["data"] as? JSON)?["task"] as? JSON)?["purged"] as? Bool,true)
+        release.signal();lane.sync {}
+        assertExpired(f,selector)
+        let statusInput: JSON = ["project_id":media.project,"command_id":command]
+        XCTAssertThrowsError(try f.call("command_status",statusInput)) {XCTAssertEqual(($0 as? CoreError)?.code,"COMMAND_RESULT_EXPIRED")}
+        for family in ["media_intake","media_intake_row","media_intake_plan"] {XCTAssertTrue(try media.rows(family).isEmpty,family)}
+        try router.dbQueue.read {db in
+            XCTAssertNil(try String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]))
+            let id = try XCTUnwrap(selector["operation_id"] as? String)
+            let operation = try XCTUnwrap(router.operationRecord(db,id:id))
+            XCTAssertEqual(operation["state"] as? String,"failed")
+            XCTAssertEqual(try String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",
+                arguments:[f.owner.principal,try XCTUnwrap(operation["error_result_command_id"] as? String)]),CommandRouter.prunedResult)
+        }
+        XCTAssertEqual((try f.call("media_intake_preview",input,command:command)["data"] as? JSON)?["operation_id"] as? String,accepted["operation_id"] as? String)
+    }
+
+    func testCL520ManualPurgeKeepsUnrelatedErrorsAndOversizedReplyAtPublication() throws {
+        let media = try MediaRoundTests.Fixture(),f = media.storage,router = media.router
+        let first = try router.dbQueue.read {try router.record($0,media.project,type:"project")}
+        let second = try otherProject(f),other = try XCTUnwrap(second["id"] as? String)
+        let task = try f.task(first),purge = try preparePurge(f,task:task)
+        let sources: [JSON] = try (0..<10).map {index in
+            let source = f.base.appendingPathComponent("large-media-\(index).txt")
+            try Data(("Take \(index): " + String(repeating:"x",count:230_000)).utf8).write(to:source)
+            return ["path":source.path]
+        }
+        func confirmation(project: String) throws -> JSON {
+            let schema = MediaRoundTests().schema()
+            let type = try media.call("media_type_create",["project_id":project,"title":"Large intake","schema":schema])
+            let draft = try media.call("media_type_get",["project_id":project,"type_id":type["id"]!])
+            let adopted = try media.call("media_type_adopt",["project_id":project,"type_id":draft["id"]!,"type_revision_id":draft["draft_revision_id"]!,
+                "expected_revision":draft["revision"]!,"observed_type_token":draft["observed_type_token"]!])
+            let round = try media.call("media_round_create",["project_id":project,"type_id":adopted["id"]!,"title":"Large intake round"])
+            let intake = try media.call("media_intake_preview",["project_id":project,"round_id":round["id"]!,"sources":sources])
+            let plan = try XCTUnwrap(intake["plan"] as? JSON)
+            return ["project_id":project,"intake_id":intake["id"]!,"expected_revision":intake["revision"]!,
+                "plan_id":plan["id"]!,"plan_digest":plan["digest"]!]
+        }
+        let aConfirm = try confirmation(project:media.project),bConfirm = try confirmation(project:other)
+        let lane = DispatchQueue(label:"operation-receipt-projects")
+        router.configureCommandOperations(on:lane)
+        func start(_ method: String,_ params: JSON,command: String = uuid()) throws -> JSON {
+            let accepted = try XCTUnwrap(f.call(method,params,command:command)["data"] as? JSON)
+            return ["project_id":try XCTUnwrap(params["project_id"]),"operation_id":try XCTUnwrap(accepted["operation_id"])]
+        }
+        func status(_ selector: JSON) throws -> JSON {try XCTUnwrap(f.call("operation_get",selector)["data"] as? JSON)}
+        let errorA = try start("attachment_cleanup_preview",["project_id":media.project,"task_id":uuid()])
+        let errorB = try start("attachment_cleanup_preview",["project_id":other,"task_id":uuid()])
+        let successA = try start("media_intake_confirm",aConfirm)
+        lane.sync {}
+        XCTAssertEqual(try status(errorA)["state"] as? String,"failed")
+        let bError = try XCTUnwrap(status(errorB)["error"] as? JSON)
+        XCTAssertEqual(try status(errorB)["state"] as? String,"failed")
+        XCTAssertEqual(try status(successA)["state"] as? String,"succeeded")
+        XCTAssertGreaterThan(try jsonString(status(successA)["result"]!).utf8.count,TicketCleanupInventory.rowByteLimit)
+
+        let command = uuid(),id = CommandRouter.commandOperationID(principal:f.owner.principal,command:command)
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.commandOperations.publicationProbe = {operation in
+            guard operation == id else {return}
+            entered.signal();XCTAssertEqual(release.wait(timeout:.now() + 20),.success)
+        }
+        defer {release.signal();lane.sync {};router.commandOperations.publicationProbe = nil}
+        let successB = try start("media_intake_confirm",bConfirm,command:command)
+        XCTAssertEqual(entered.wait(timeout:.now() + 10),.success)
+        XCTAssertEqual(try status(successB)["state"] as? String,"running")
+        let storedB = try router.dbQueue.read {db in
+            try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,command]))
+        }
+        XCTAssertGreaterThan(storedB.utf8.count,TicketCleanupInventory.rowByteLimit)
+        let removed = try router.executeBackupQueuedWrite(method:"task_purge",params:purge,caller:f.owner)
+        XCTAssertEqual(((removed["data"] as? JSON)?["task"] as? JSON)?["purged"] as? Bool,true)
+        release.signal();lane.sync {}
+        assertExpired(f,errorA);assertExpired(f,successA)
+        XCTAssertEqual(try jsonString(status(errorB)["error"]!),try jsonString(bError))
+        let result = try status(successB)
+        XCTAssertEqual(result["state"] as? String,"succeeded")
+        let reply = try XCTUnwrap(result["result"] as? JSON)
+        XCTAssertEqual(try jsonString(reply["data"]!),storedB)
+        XCTAssertEqual(reply["command_id"] as? String,command)
+    }
+
     func testLargePreviewReceiptExpiresOnPurgeWithoutBlockingOrReplaying() throws {try previewReceiptExpires(bytes:TicketCleanupInventory.rowByteLimit + 1)}
     func testSmallPreviewWithSourceIDsExpiresWhenImportedTicketIsPurged() throws {try previewReceiptExpires(bytes:100)}
     private func previewReceiptExpires(bytes: Int) throws {

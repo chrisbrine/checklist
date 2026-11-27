@@ -37,6 +37,9 @@ struct PreparedMediaCommand {
     var readBytes = 0
 
     func commit(_ db: Database,router: CommandRouter? = nil,caller: Caller? = nil) throws {
+        if try resources.previewPurgeEpoch?.changed(in:db) == true {
+            throw CoreError("MEDIA_CONTEXT_CHANGED","A permanent removal committed during selected-file preview. Select current sources and preview again.")
+        }
         if resources.workerChannel {
             guard let router,let caller else {throw CoreError("FORBIDDEN","Prepared worker media changes require current caller authority.")}
             try router.mediaWorkerWriteAccess(db,method:method,p:params,c:caller,project:project)

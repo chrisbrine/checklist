@@ -115,7 +115,7 @@
     "operation_expired": {
       "type": "object",
       "additionalProperties": false,
-      "description": "MCP tool error structured content returned when the terminal receipt has expired. The command ID stays reserved.",
+      "description": "MCP tool error structured content returned when the terminal receipt is missing or retired. A successful media_round_delete skips retirement for its own epoch advance. Its existing receipt can still retire through ordinary retention or removal of an exact reference. The command ID stays reserved.",
       "properties": {
         "error": {
           "type": "object",

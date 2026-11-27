@@ -18,6 +18,7 @@
       "additionalProperties": false,
       "properties": {
         "input": {
+          "description": "Owner previews of selected local files use the store-wide purge epoch. A ticket purge or media round deletion that commits before the preview saves aborts the intake write.",
           "enum": [
             "selected_files",
             "tsv",

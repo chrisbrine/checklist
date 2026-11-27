@@ -101,6 +101,7 @@ extension CommandRouter {
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
         defer { try? prepared?.observer.close() }
+        if let prepared,resources.previewPurgeEpoch != nil {try mediaIntakePreviewPreparationProbe?(prepared)}
         return try ArchiveStorageGate.withExclusive(root:root) { _ in
             try dbQueue.writeWithoutTransaction { db in
                 var result: JSON = [:]

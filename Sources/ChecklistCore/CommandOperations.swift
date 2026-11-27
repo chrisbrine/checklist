@@ -127,6 +127,7 @@ final class CommandOperations: @unchecked Sendable {
     }
     private var probe: ((String) -> Void)?
     private var backupProbe: ((String) throws -> Void)?
+    private var publishProbe: ((String) -> Void)?
     let contextKey = "ChecklistCommandOperation-" + UUID().uuidString
 
     /// Serialize only matching caller/UUID admissions across the SQLite and
@@ -163,6 +164,11 @@ final class CommandOperations: @unchecked Sendable {
     var executionProbe: ((String) -> Void)? {
         get {lock.withLock {probe}}
         set {lock.withLock {probe = newValue}}
+    }
+    /// Owned-test seam between a semantic write and terminal publication.
+    var publicationProbe: ((String) -> Void)? {
+        get {lock.withLock {publishProbe}}
+        set {lock.withLock {publishProbe = newValue}}
     }
     /// Test seam only: observes real backup boundaries, including after writer
     /// admission opens. The service never installs it.
@@ -332,7 +338,7 @@ extension CommandRouter {
     }
     func operationPayload(_ db: Database,_ operation: JSON,caller: Caller) throws -> JSON {
         var value = operation
-        for key in ["principal","digest","authorization_generation","incarnation","recoverable","outcome_unknown","caller","reply_write_admission","error_result_command_id"] {value.removeValue(forKey:key)}
+        for key in ["principal","digest","authorization_generation","incarnation","recoverable","outcome_unknown","caller","reply_write_admission","error_result_command_id","purge_uses_store_epoch"] {value.removeValue(forKey:key)}
         value["status_method"] = "operation_get"
         // A read operation that started while backup admission was closed has
         // no durable running marker; this process reports its actual state.
@@ -466,6 +472,7 @@ extension CommandRouter {
                     "caller":["role":caller.role,"installation":caller.installation,"session_id":caller.sessionID as Any? ?? NSNull()],
                     "digest":digest,"state":"queued","incarnation":self.incarnation,"created_at":now(),"updated_at":now()]
                 value["project_id"] = params["project_id"];value["authorization_generation"] = generation
+                value["purge_uses_store_epoch"] = Self.operationPurgeProject(method:method,params:params,caller:caller) == nil
                 if let receipt = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
                     guard receipt["digest"] as String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID belongs to another intent.")}
                     guard !Self.isPrunedResult(jsonObject(receipt["result"])) else {throw Self.expiredCommandError(command)}
@@ -498,7 +505,7 @@ extension CommandRouter {
     }
     func operationAcknowledgment(_ operation: JSON) -> JSON {
         var data = operation
-        for key in ["principal","caller","digest","authorization_generation","incarnation","recoverable","outcome_unknown","error","reply_write_admission","error_result_command_id"] {data.removeValue(forKey:key)}
+        for key in ["principal","caller","digest","authorization_generation","incarnation","recoverable","outcome_unknown","error","reply_write_admission","error_result_command_id","purge_uses_store_epoch"] {data.removeValue(forKey:key)}
         data["status_method"] = "operation_get"
         return ["command_id":operation["command_id"]!,"command_outcome":"accepted","data":data]
     }
@@ -528,6 +535,7 @@ extension CommandRouter {
     }
     private func performCommandOperation(_ job: CommandOperations.Job) throws -> Bool {
         guard let outcome = try executeCommandOperation(job) else {return false}
+        commandOperations.publicationProbe?(job.id)
         try finishCommandOperation(job,outcome)
         return true
     }
@@ -542,12 +550,14 @@ extension CommandRouter {
         commandOperations.releaseHeld(job.id)
         return true
     }
-    private static func operationPurgeProject(method: String,params: JSON) -> String? {
-        // Storage operations describe whole stores, even when the project
-        // supplies authorization. Import preview returns the source document,
-        // and import commit errors can describe source files.
-        if method == "backup_create" || storageRestoreMethods.contains(method) || storageBackupPruningMethods.contains(method)
-            || method == "import_preview" || method == "import_commit" {return nil}
+    // The project may authorize a whole-store operation or an import whose
+    // source document and errors can describe another project.
+    static var storeWideOperationPurgeMethods: Set<String> {
+        storageRestoreMethods.union(storageBackupPruningMethods).union(["backup_create","import_preview","import_commit"])
+    }
+
+    private static func operationPurgeProject(method: String,params: JSON,caller: Caller) -> String? {
+        if storeWideOperationPurgeMethods.contains(method) || ownerMediaPreviewUsesLocalSources(method:method,params:params,caller:caller) {return nil}
         return params["project_id"] as? String
     }
 
@@ -558,13 +568,13 @@ extension CommandRouter {
         // handle still returns the operation for every outside same-ID replay.
         commandOperations.beginExecution(job.id)
         defer {commandOperations.endExecution(job.id)}
-        let previous = Thread.current.threadDictionary[commandOperations.contextKey]
-        Thread.current.threadDictionary[commandOperations.contextKey] = job.id
-        defer {if let previous {Thread.current.threadDictionary[commandOperations.contextKey] = previous} else {Thread.current.threadDictionary.removeObject(forKey:commandOperations.contextKey)}}
         var output: JSON?,failure: CoreError?
         let startedAt = now()
-        let purgeProject = Self.operationPurgeProject(method:job.method,params:params)
+        let purgeProject = Self.operationPurgeProject(method:job.method,params:params,caller:job.caller)
         let purgeEpoch = try readForPreparation {try CommandOperationPurgeEpoch($0,project:purgeProject)}
+        let previous = Thread.current.threadDictionary[commandOperations.contextKey]
+        Thread.current.threadDictionary[commandOperations.contextKey] = purgeEpoch
+        defer {if let previous {Thread.current.threadDictionary[commandOperations.contextKey] = previous} else {Thread.current.threadDictionary.removeObject(forKey:commandOperations.contextKey)}}
         do {
             let generation = try backupWriteAuthorization(params:params,caller:job.caller)
             guard generation == job.generation else {throw CoreError("CONNECTION_REVOKED","The operation's session authorization changed before application.")}

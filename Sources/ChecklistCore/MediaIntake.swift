@@ -13,6 +13,7 @@ struct PreparedMediaResources {
     var workerChannel = false
     var nativeOwnerProjection = false
     var preview: [JSON] = []
+    var previewPurgeEpoch: CommandOperationPurgeEpoch?
     var captures: [String:Capture] = [:]
     var errors: [String:String] = [:]
     var originals: [PreparedAttachmentOriginal] = []
@@ -28,6 +29,11 @@ struct PreparedMediaResources {
 extension CommandRouter {
     /// Rows captured by one capture command; an internal chunk, not an intake limit.
     static let mediaCaptureChunk = 200
+    static func ownerMediaPreviewUsesLocalSources(method: String,params: JSON,caller: Caller) -> Bool {
+        guard method == "media_intake_preview",caller.isOwner,let sources = params["sources"] as? [JSON] else {return false}
+        return !sources.isEmpty
+    }
+
     /// Deliberately private to the internal router seam. Even an owner input is a selected
     /// regular file, never a directory traversal, URL fetch or a new filesystem grant.
     func mediaInspectFile(_ path: String,caller: Caller,project: JSON,managed: Bool = false,reserveRead: ((Int) throws -> Void)? = nil) throws -> JSON {
@@ -88,9 +94,12 @@ extension CommandRouter {
         // These methods have no media bytes to prepare. Ordinary canonical preparation
         // below still performs their authority, receipt and context validation.
         guard ["media_intake_preview","media_intake_capture","media_round_publish","media_context_reconcile"].contains(method) else {return resources}
+        // Read the executing operation's epoch on its own thread, before
+        // entering GRDB. Synchronous previews take their baseline below.
+        let operationEpoch = Thread.current.threadDictionary[commandOperations.contextKey] as? CommandOperationPurgeEpoch
         // Authorize and reconcile a committed command BEFORE any source access. Intent
         // conflicts also precede file work, including other methods' pending journals.
-        let snapshot: (String,JSON,JSON?)? = try dbQueue.read { db in
+        let snapshot: (String,JSON,JSON?,CommandOperationPurgeEpoch?)? = try dbQueue.read { db in
             let pid = try self.mediaAccess(db,p,c,write:true)
             let command = try text(p,"command_id",max:100),digest = hash(Data((method + (try jsonString(p))).utf8))
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
@@ -105,11 +114,16 @@ extension CommandRouter {
                 try self.mediaCaptureSelection(db,p:p,intake:selected,caller:c)
                 intake = selected
             }
-            return (pid,try self.record(db,pid,type:"project"),intake)
+            // A selected local file can belong to any project. Capture the
+            // store epoch before reading it, including on the synchronous path.
+            let purgeEpoch = try Self.ownerMediaPreviewUsesLocalSources(method:method,params:p,caller:c)
+                ? operationEpoch ?? CommandOperationPurgeEpoch(db,project:nil) : nil
+            return (pid,try self.record(db,pid,type:"project"),intake,purgeEpoch)
         }
-        guard let (pid,project,intake) = snapshot else { return resources }
+        guard let (pid,project,intake,purgeEpoch) = snapshot else { return resources }
         if method == "media_intake_preview" {
             try prepareMediaPreview(p,caller:c,project:project,resources:&resources)
+            resources.previewPurgeEpoch = purgeEpoch
         }
         if method == "media_intake_capture",let intake {
             // Reserve the enclosing command before staging even the first row. A crash

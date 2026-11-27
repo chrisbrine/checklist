@@ -32,10 +32,18 @@ extension CommandRouter {
     func revalidateTicketCleanupPass(_ db: Database,prepared: TicketCleanupPreparedPass) throws -> TicketCleanupPreparedPass {
         var selection = prepared.selection
         var items = selection["items"] as? [JSON] ?? [],retryIDs = selection["retry_task_ids"] as? [String] ?? []
+        let project = try StoredRecord(prepared.project,family:"project").string("id")
+        let privateReceiptChanged = try items.contains {($0["action"] as? String) == "purge"}
+            && Self.ticketPurgePrivateReceiptChanged(db,project:project)
         for index in items.indices {
             guard items[index]["action"] as? String != "keep",let id = items[index]["task_id"] as? String,
                   let fence = prepared.itemFences[id] else {continue}
-            do {try fence.validate(db)} catch let error as CoreError where error.code == "CLEANUP_CONCURRENT_WRITE" {
+            do {
+                try fence.validate(db)
+                if privateReceiptChanged,items[index]["action"] as? String == "purge" {
+                    throw CoreError("CLEANUP_CONCURRENT_WRITE","A private operation receipt committed during purge preparation.",details:["reason":"fenced by concurrent write to private operation receipt"])
+                }
+            } catch let error as CoreError where error.code == "CLEANUP_CONCURRENT_WRITE" {
                 items[index]["action"] = "keep";items[index]["reason"] = "fenced_by_concurrent_write"
                 items[index]["fence_reason"] = error.details["reason"] ?? error.code
                 retryIDs.append(id)

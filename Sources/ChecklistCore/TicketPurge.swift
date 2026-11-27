@@ -266,81 +266,10 @@ extension CommandRouter {
     }
 
     func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
-        let removedIDs = Set(plan.removed.map(\.key)).union([Data(((try StoredRecord(task, family: "task").string("id"))).utf8)])
-        let keys = try jsonString(removedIDs.map {String(decoding:$0,as:UTF8.self)})
-        let columns = """
-            rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,
-            CAST(command_id AS BLOB) AS cleanup_command_id,length(CAST(result AS BLOB)) AS result_bytes
-            """
-        var selected: [Row] = [],positions = Set<Int64>(),bytes = 0
-        func admit(_ row: Row,bytes charge: Int) throws {
-            let position: Int64 = row["cleanup_row"]
-            guard !positions.contains(position) else {return}
-            guard selected.count < Self.ticketCleanupSelectedHistoryRowLimit else {throw Self.ticketCleanupSelectedHistoryLimit(commands:true)}
-            bytes += charge
-            guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command results exceed the 16 MiB cleanup bound.")}
-            positions.insert(position);selected.append(row.copy())
-        }
-        func admitPrivateReceipt(principal: Data,command: Data) throws {
-            if let row = try Row.fetchOne(db,sql:"SELECT " + columns + " FROM commands WHERE principal=CAST(? AS TEXT) AND command_id=CAST(? AS TEXT) AND result<>?",arguments:[principal,command,Self.prunedResult]) {
-                try admit(row,bytes:min(row["result_bytes"] as Int,TicketCleanupInventory.rowByteLimit))
-            }
-        }
-        // Import previews contain source IDs and operation errors can contain
-        // private text without a ticket ID. Expire their live cached results.
-        // Stream metadata and admit only receipts that still need scrubbing.
-        let operations = try Row.fetchCursor(db,sql:"""
-            SELECT CAST(json_extract(value,'$.principal') AS BLOB) AS principal,
-                   CAST(json_extract(value,'$.command_id') AS BLOB) AS command,
-                   CAST(json_extract(value,'$.error_result_command_id') AS BLOB) AS error_command,
-                   json_extract(value,'$.method') AS method
-            FROM metadata WHERE key GLOB 'command-operation:*'
-              AND CASE WHEN json_valid(value) THEN
-                json_extract(value,'$.method')='import_preview' OR json_type(value,'$.error_result_command_id')='text'
-              ELSE 0 END
-            """)
-        while let row = try operations.next() {
-            try autoreleasepool {
-                guard let principal = row["principal"] as Data?,let command = row["command"] as Data? else {throw StoreRecovery.required("command_operation_invalid")}
-                if row["method"] as String? == "import_preview" {try admitPrivateReceipt(principal:principal,command:command)}
-                if let error = row["error_command"] as Data? {try admitPrivateReceipt(principal:principal,command:error)}
-            }
-        }
-        let receipts = try Row.fetchCursor(db,sql:"SELECT " + columns + """
-            , CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result
-            FROM commands WHERE result<>?
-            """,arguments:[TicketCleanupInventory.rowByteLimit,Self.prunedResult])
-        func containsRemoved(_ value: Any) -> Bool {
-            if let s = value as? String {return removedIDs.contains(Data(s.utf8))}
-            if let a = value as? [Any] {return a.contains {containsRemoved($0)}}
-            if let d = value as? JSON {return d.contains {removedIDs.contains(Data($0.key.utf8)) || containsRemoved($0.value)}}
-            return false
-        }
-        while let row = try receipts.next() {
-            try autoreleasepool {
-                let position: Int64 = row["cleanup_row"]
-                guard !positions.contains(position) else {return}
-                if let result: String = row["result"] {
-                    if containsRemoved(jsonObject(result)) {try admit(row,bytes:row["result_bytes"])}
-                    return
-                }
-                // Larger operation receipts can be expired by identity without
-                // ever copying their private payload across the SQL boundary.
-                let operation = try Bool.fetchOne(db,sql:"""
-                    SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'command-operation:*'
-                      AND CASE WHEN json_valid(value) THEN
-                        CAST(json_extract(value,'$.principal') AS BLOB)=? AND
-                        (CAST(json_extract(value,'$.command_id') AS BLOB)=? OR
-                         CAST(json_extract(value,'$.error_result_command_id') AS BLOB)=?) AND
-                        json_type(value,'$.method')='text'
-                      ELSE 0 END)
-                    """,arguments:[row["cleanup_principal"] as Data,row["cleanup_command_id"] as Data,row["cleanup_command_id"] as Data]) == true
-                if operation {try admit(row,bytes:0);return}
-                let matches = try Self.ticketCleanupMatchingPayloadKeys(db,payloadSQL:"SELECT result AS payload FROM commands WHERE rowid=?",position:position,keys:keys)
-                guard matches?.isEmpty == true else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected command result exceeds the 4 MiB payload bound.")}
-            }
-        }
-        return selected.sorted {($0["cleanup_row"] as Int64) < ($1["cleanup_row"] as Int64)}
+        let tid = try StoredRecord(task,family:"task").string("id")
+        let observation = try ticketPurgeExpiringCommands(db,tasks:[task],plans:[tid:plan])
+        if let error = observation.errors[tid] {throw error}
+        return observation.commands[tid] ?? []
     }
 
     func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil) throws -> JSON {

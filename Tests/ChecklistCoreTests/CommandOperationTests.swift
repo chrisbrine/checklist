@@ -23,7 +23,7 @@ final class CommandOperationTests: XCTestCase {
     }
     private func data(_ reply: JSON) throws -> JSON {try XCTUnwrap(reply["data"] as? JSON)}
     private func assertPublicMetadata(_ value: JSON,file: StaticString = #filePath,line: UInt = #line) {
-        for key in ["digest","principal","caller","authorization_generation","incarnation","recoverable","reply_write_admission"] {
+        for key in ["digest","principal","caller","authorization_generation","incarnation","recoverable","reply_write_admission","purge_uses_store_epoch"] {
             XCTAssertNil(value[key],"Operation metadata exposed internal \(key)",file:file,line:line)
         }
     }

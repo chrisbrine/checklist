@@ -49,6 +49,8 @@ public final class CommandRouter: @unchecked Sendable {
     var ticketCleanupTrashRoot: URL? // Owned fixture seam; nil uses the same-volume production Trash.
     /// Owned-test seam after the read-only deletion plan, before writer acquisition.
     var mediaRoundDeletionPreparationProbe: (@Sendable () throws -> Void)?
+    /// Owned-test seam after a selected-file intake preview has read its sources.
+    var mediaIntakePreviewPreparationProbe: (@Sendable (PreparedMediaCommand) throws -> Void)?
     /// Writer-confined, command-local preparation ownership. Import housekeeping
     /// waits until these snapshots finish; ordinary domain writes remain fenced.
     var mediaRoundDeletionPreparations: [Data:Set<String>] = [:]
