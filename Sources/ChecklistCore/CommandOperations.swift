@@ -56,7 +56,11 @@ final class CommandOperations: @unchecked Sendable {
     private var queue: DispatchQueue?
     private var mediaRoundDeletionQueue: DispatchQueue?
     private var jobs: [String:Job] = [:]
-    private var mediaRoundDeletions: [Data:[Job]] = [:]
+    // Each large preparation can use four CPU-intensive snapshot readers.
+    // Leave excess project heads queued without dispatching blocked workers.
+    private static let mediaRoundDeletionLimit = 2
+    private var mediaRoundDeletions: [Job] = []
+    private var scheduledMediaRoundDeletions = 0
     private var scheduled = Set<String>()
     private var recoveryRequired = Set<String>()
     private var executing = Set<String>()
@@ -192,8 +196,8 @@ final class CommandOperations: @unchecked Sendable {
     }
     func add(_ job: Job,router: CommandRouter) {
         lock.withLock {
-            if let project = job.mediaRoundDeletionProject {
-                mediaRoundDeletions[project,default:[]].append(job)
+            if job.mediaRoundDeletionProject != nil {
+                mediaRoundDeletions.append(job)
             } else {
                 jobs[job.id] = job
             }
@@ -205,10 +209,14 @@ final class CommandOperations: @unchecked Sendable {
     func resume(router: CommandRouter) {
         lock.withLock {
             guard let queue else {return}
-            // Dispatch only the head of each project. Backup capture can defer
-            // a writer step without letting the next deletion overtake the head.
-            for deletions in mediaRoundDeletions.values {
-                guard let job = deletions.first,scheduled.insert(job.id).inserted else {continue}
+            // Admit the oldest eligible project heads. A scheduled or deferred
+            // head still prevents later deletions in its project from passing it.
+            var projects = Set<Data>()
+            for job in mediaRoundDeletions {
+                guard scheduledMediaRoundDeletions < Self.mediaRoundDeletionLimit else {break}
+                guard let project = job.mediaRoundDeletionProject,projects.insert(project).inserted,
+                      scheduled.insert(job.id).inserted else {continue}
+                scheduledMediaRoundDeletions += 1
                 schedule(job,on:mediaRoundDeletionQueue ?? queue,router:router)
             }
             for job in jobs.values where scheduled.insert(job.id).inserted {schedule(job,on:queue,router:router)}
@@ -219,13 +227,11 @@ final class CommandOperations: @unchecked Sendable {
             let finished = router.runCommandOperation(job)
             let callback = lock.withLock { () -> (@Sendable (String,Bool) -> Void)? in
                 scheduled.remove(job.id)
-                if finished {
-                    if let project = job.mediaRoundDeletionProject {
-                        mediaRoundDeletions[project]?.removeFirst()
-                        if mediaRoundDeletions[project]?.isEmpty == true {mediaRoundDeletions.removeValue(forKey:project)}
-                    } else if jobs[job.id]?.attempt == job.attempt {
-                        jobs.removeValue(forKey:job.id)
-                    }
+                if job.mediaRoundDeletionProject != nil {
+                    scheduledMediaRoundDeletions -= 1
+                    if finished {mediaRoundDeletions.removeAll {$0.attempt == job.attempt}}
+                } else if finished,jobs[job.id]?.attempt == job.attempt {
+                    jobs.removeValue(forKey:job.id)
                 }
                 return completion
             }

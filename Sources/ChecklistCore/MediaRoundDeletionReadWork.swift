@@ -36,6 +36,7 @@ enum MediaRoundDeletionReadWork {
     // Larger deletions can share the CPU without multiplying four extra read
     // connections for every accepted operation. Others keep the serial scan.
     private static let splitSlots = DispatchSemaphore(value:2)
+    private static let referenceQueue = DispatchQueue(label:"org.checklist.media-deletion-references",qos:.default,attributes:.concurrent,autoreleaseFrequency:.workItem)
 
     private final class Results: @unchecked Sendable {
         private let lock = NSLock()
@@ -61,16 +62,25 @@ enum MediaRoundDeletionReadWork {
         defer {splitSlots.signal()}
         var configuration = source.configuration
         configuration.maximumReaderCount = partitions + 1
+        configuration.qos = .default
         guard let snapshot = try? DatabaseSnapshotPool(source,configuration:configuration) else {return nil}
         defer {try? snapshot.close()}
         let results = Results()
-        DispatchQueue.concurrentPerform(iterations:partitions + 1) {index in
+        @Sendable func observe(_ index: Int) {
             // Failure before running the closure means the same snapshot could
             // not open. Keep the primary observer's exact snapshot for fallback.
             if let result = try? snapshot.read({db in Result {try read(db,index)}}) {
                 results.save(result,index:index)
             }
         }
+        // Fan out reference scans below ordinary request priority. History uses
+        // the caller's deletion worker so it can proceed while the scans run.
+        let referenceScans = DispatchGroup()
+        for index in 0..<partitions {
+            referenceQueue.async(group:referenceScans,qos:.default,flags:.enforceQoS) {observe(index)}
+        }
+        observe(partitions)
+        referenceScans.wait()
         return try results.get()
     }
 }

@@ -709,7 +709,7 @@
           "const": "media_round_delete"
         },
         "state": {
-          "description": "Queued deletions in the same project wait for earlier deletions, including a head deferred by backup write admission. Deletions in different projects can run concurrently.",
+          "description": "Queued deletions wait for earlier deletions in their project, including a head deferred by backup write admission. At most two project heads run concurrently. The oldest eligible project head starts when capacity opens.",
           "enum": [
             "queued",
             "running",
@@ -731,7 +731,7 @@
         "started_at": {
           "type": "string",
           "format": "date-time",
-          "description": "Execution start after queue wait. Subtract created_at to estimate the wait at timestamp precision."
+          "description": "First execution start after queue wait for project order, service capacity and backup admission. Subtract created_at to estimate the initial wait at timestamp precision."
         },
         "finished_at": {
           "type": "string",

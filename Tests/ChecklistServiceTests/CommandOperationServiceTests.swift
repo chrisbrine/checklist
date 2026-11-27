@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import GRDB
 import os
 @testable import ChecklistCore
 @testable import ChecklistService
@@ -97,7 +98,88 @@ final class CommandOperationServiceTests: XCTestCase {
         XCTAssertEqual(executions.withLock {$0},try [queryA,queryB].map {try XCTUnwrap($0["operation_id"] as? String)})
     }
 
-    private func closedRound(_ router: CommandRouter,_ owner: Caller,name: String) throws -> (project: String,id: String,revision: Int) {
+    func testLargeMediaDeletionsLeaveCapacityForOrdinaryRequests() throws {
+        let directory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("media-deletion-load-" + UUID().uuidString)
+        let router = try CommandRouter(root:directory.appendingPathComponent("store"))
+        defer {try? router.closeStore();try? FileManager.default.removeItem(at:directory)}
+        let owner = Caller(role:"owner",installation:"operation-service-load",projectIDs:[])
+        let rounds = try ["Project A","Project B","Project C"].map {try closedRound(router,owner,name:$0)}
+        let ordinary = try closedRound(router,owner,name:"Ordinary requests",cancel:false)
+        try router.dbQueue.write {db in
+            try db.execute(sql:"""
+                WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<24576),
+                messages(id) AS (SELECT printf('00000000-0000-0000-0000-%012d',n+300000) FROM fixture)
+                INSERT INTO records(id,project_id,type,revision,data)
+                SELECT id,?,'message',1,json_object('id',id,'project_id',?,'revision',1,'body',?) FROM messages
+                """,arguments:[ordinary.project,ordinary.project,String(repeating:"p",count:768)])
+        }
+        let coordinator = Coordinator(router:router,enrollmentFile:directory.appendingPathComponent("unused-enrollments.json"),startBackgroundWork:false)
+        let connection = NSXPCConnection(machServiceName:"org.checklist.synthetic.unconnected")
+        defer {connection.invalidate()}
+        let prepared = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0),allFinished = DispatchSemaphore(value:0)
+        let completion = UUID()
+        router.mediaRoundDeletionPreparationProbe = {
+            prepared.signal()
+            guard release.wait(timeout:.now()+30) == .success else {throw CoreError("TEST_TIMEOUT","Deletion preparation was not released.")}
+        }
+        defer {
+            for _ in rounds {release.signal()}
+            coordinator.queue.sync {_ = coordinator.waiters.removeValue(forKey:completion)}
+            coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
+            coordinator.mediaRoundDeletionQueue.sync(flags:.barrier) {}
+            router.mediaRoundDeletionPreparationProbe = nil
+        }
+        func accept(_ index: Int) throws -> JSON {
+            let round = rounds[index]
+            let reply = try router.handle(method:"media_round_delete",params:["project_id":round.project,"round_id":round.id,
+                "expected_revision":round.revision,"reason":"Retire this synthetic media pass","command_id":uuid()],caller:owner)
+            XCTAssertEqual(reply["command_outcome"] as? String,"accepted")
+            return ["project_id":round.project,"operation_id":try XCTUnwrap((reply["data"] as? JSON)?["operation_id"])]
+        }
+        func state(_ query: JSON) throws -> String {
+            let reply = try router.handle(method:"operation_get",params:query,caller:owner)
+            return try XCTUnwrap((reply["data"] as? JSON)?["state"] as? String)
+        }
+        let first = try accept(0),second = try accept(1)
+        var times: [String:TimeInterval] = [:]
+        func request(_ method: String,_ call: () throws -> JSON) throws -> JSON {
+            let start = ProcessInfo.processInfo.systemUptime
+            let result = try call()
+            let seconds = ProcessInfo.processInfo.systemUptime-start
+            times[method] = max(times[method] ?? 0,seconds)
+            XCTAssertLessThan(seconds,1,"\(method) while two deletion snapshots are active")
+            return try XCTUnwrap(result["data"] as? JSON)
+        }
+        var revision = ordinary.revision
+        for index in 0..<4 {
+            if index != 0 {Thread.sleep(forTimeInterval:0.25)}
+            _ = try request("service_info") {try coordinator.queue.sync {try coordinator.execute(["method":"service_info"],connection:connection)}}
+            _ = try request("project_settings_get") {try router.handle(method:"project_settings_get",params:["project_id":ordinary.project],caller:owner)}
+            let linked = try request("media_round_link_task") {
+                try router.handle(method:"media_round_link_task",params:["project_id":ordinary.project,"round_id":ordinary.id,
+                    "expected_revision":revision,"task_id":NSNull(),"command_id":uuid()],caller:owner)
+            }
+            revision = try XCTUnwrap(linked["revision"] as? Int)
+        }
+        print("CL-518 largest request seconds during concurrent large-store deletion preparation: \(times)")
+        for _ in 0..<2 {
+            guard prepared.wait(timeout:.now()+40) == .success else {return XCTFail("Both projects must prepare concurrently")}
+        }
+        XCTAssertEqual(try state(first),"running")
+        XCTAssertEqual(try state(second),"running")
+        let third = try accept(2)
+        XCTAssertEqual(prepared.wait(timeout:.now()+0.5),.timedOut,"No third preparation while both slots are occupied")
+        XCTAssertEqual(try state(third),"queued")
+        coordinator.queue.sync {
+            coordinator.waiters[completion] = {
+                if [first,second,third].allSatisfy({(try? state($0)) == "succeeded"}) {allFinished.signal()}
+            }
+        }
+        for _ in rounds {release.signal()}
+        XCTAssertEqual(allFinished.wait(timeout:.now()+45),.success)
+    }
+
+    private func closedRound(_ router: CommandRouter,_ owner: Caller,name: String,cancel: Bool = true) throws -> (project: String,id: String,revision: Int) {
         let created = try router.handle(method:"project_create",params:["command_id":uuid(),"name":name,"key_prefix":"DEL"],caller:owner)
         let project = try XCTUnwrap((created["data"] as? JSON)?["id"] as? String)
         func media(_ method: String,_ input: JSON) throws -> JSON {
@@ -114,6 +196,7 @@ final class CommandOperationServiceTests: XCTestCase {
             "expected_revision":draft["revision"]!,"observed_type_token":draft["observed_type_token"]!])
         let round = try media("media_round_create",["type_id":typeID,"title":"Synthetic round"])
         let id = try XCTUnwrap(round["id"] as? String)
+        if !cancel {return (project,id,try XCTUnwrap(round["revision"] as? Int))}
         let canceled = try media("media_round_cancel",["round_id":id,"expected_revision":round["revision"]!,"reason":"Synthetic cancellation"])
         return (project,id,try XCTUnwrap(canceled["revision"] as? Int))
     }
