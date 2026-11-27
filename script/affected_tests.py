@@ -14,15 +14,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 QUALIFICATION_TESTS = (
+    'ChecklistCoreTests.CleanupStoreScaleTests/testDeletionAndTicketCleanupAboveFormerStoreRowLimit',
     'ChecklistCoreTests.HumanAnswerNoticeTests/testHookPickupTimeOnALargeDeliveryTable',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL403InventoryRefusedNewestWindowRunsTheOlderQueueWithoutRetry',
     # CL-363 continuation: unchanged attachment/history scale boundaries.
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL397AgentReadsALargeFileInRangesAndTheBytesMatch',
-    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL392LimitRefusalDoublesToOneHourAndADoneWakeStartsAgain',
-    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL392OutcomeRowsOfOtherTicketsDoNotCountAgainstTheHistoryLimit',
-    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394HistoryRowLimitIsVisibleAndRepeatedRefusalAddsNoHistory',
-    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394HistoryTokenLimitIsVisible',
-    'ChecklistCoreTests.TicketLifecycleCleanupTests/testCL394CommandRowLimitIsVisible',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321SharedHistoryBoundsRefuseOnlyOversizedTicket',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testP321ExactHistoryAdmissionDoesNotStarveTicketWithLargeForeignProtectedHistory',
     'ChecklistCoreTests.TicketLifecycleCleanupTests/testOversizedJobObservationDefersActualDoneSelectionAndSchedulesRetry',

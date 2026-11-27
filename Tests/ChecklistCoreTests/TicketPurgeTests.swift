@@ -109,6 +109,29 @@ extension TicketRetirementTests {
         code("COMMAND_RESULT_EXPIRED") {_ = try self.router.handle(method:"message_send",params:noteParams,caller:self.owner)}
     }
 
+    func testPurgeReaderSnapshotRepreparesAfterAnInterveningWrite() throws {
+        let (project,task) = try fixture()
+        let trashed = try trash(project,task)
+        let preview = try call("task_purge_preview",params(project,trashed))
+        var input = params(project,trashed)
+        input["command_id"] = uuid()
+        input["preview_digest"] = preview["digest"]
+        var preparations = 0
+        try router.withManualTicketPurgePreparation(input,owner) {prepared in
+            let prepared = try XCTUnwrap(prepared)
+            preparations += 1
+            if preparations == 1 {
+                try router.dbQueue.write {db in
+                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('cl516-purge-race-fixture','unchanged preview')")
+                }
+            }
+            try prepared.validate()
+            XCTAssertEqual(prepared.plan.digest,preview["digest"] as? String)
+        }
+        XCTAssertEqual(preparations,2)
+        XCTAssertFalse(try read(project,trashed)["purged"] as? Bool ?? false)
+    }
+
     func testPurgeRollbackRestoresNotesEventsAndCachedReceipts() throws {
         let (p,t) = try fixture(),tid = t["id"] as! String
         _ = try note(p,t,["body":"Must survive rollback"])

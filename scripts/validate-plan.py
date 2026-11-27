@@ -316,6 +316,16 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_failure']['data']['error']['details']['preparation_timings']['unknown_phase'] = 0
     reject('media-round-deletion', bad, 'unknown refusal preparation phase')
+    for field in ('code', 'message'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_work_limit']['data']['error'].pop(field)
+        reject('media-round-deletion', bad, 'work refusal missing ' + field)
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_work_limit']['data']['error']['code'] = 'PURGE_LIMIT'
+    reject('media-round-deletion', bad, 'wrong code for current media work refusal')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_work_limit']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
+    reject('media-round-deletion', bad, 'work refusal claiming deletion')
     for field, value in (('format', 2), ('state', 'active'), ('owner_kind', 'task'),
                          ('attachment_owner_id', '00000000-0000-0000-0000-000000000908')):
         bad = copy.deepcopy(examples['media-round-deletion'])
@@ -361,6 +371,11 @@ def check() -> dict:
     other_error['operation_failure']['data']['error'] = {'code': 'MEDIA_ROUND_NOT_CLOSED', 'message': 'The synthetic round is open.'}
     if not validators['media-round-deletion'].is_valid(other_error):
         errors.append('media-round-deletion: another refusal incorrectly requires context diagnostics')
+    limit_replay = copy.deepcopy(examples['media-round-deletion'])
+    limit_replay['accepted']['data'] = limit_replay['operation_work_limit']['data']
+    limit_replay['accepted']['command_id'] = limit_replay['accepted']['data']['command_id']
+    if not validators['media-round-deletion'].is_valid(limit_replay):
+        errors.append('media-round-deletion: replay of a work refusal was rejected')
     legacy_failure = copy.deepcopy(examples['media-round-deletion'])
     legacy_failure['accepted']['data'] = legacy_failure.pop('operation_failure')['data']
     legacy_failure['accepted']['data']['error']['details'] = {}

@@ -71,7 +71,6 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testCL392LimitRefusalDoublesToOneHourAndADoneWakeStartsAgain() throws {
-        try QualificationSuite.requireEnabled()
         var count = 0
         for expected in [60.0,120,240,480,960,1920,3600,3600] {
             let time = Date(timeIntervalSince1970:1000)
@@ -81,7 +80,7 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(TicketCleanupRetry(refusedAfter:nil,at:Date(timeIntervalSince1970:0)).deadline,60,accuracy:0.001)
 
         let (project,task,_) = try fixture(),pid = project["id"] as! String,tid = task["id"] as! String
-        try addEvents(pid,count:100001,kind:"history_fixture",entity:pid,data:"{}")
+        try addEvents(pid,count:CommandRouter.ticketCleanupSelectedHistoryRowLimit + 1,kind:"history_fixture",entity:tid,data:"{}")
         var time = Date().addingTimeInterval(1)
         try router.runTicketLifecycleCleanup(at:time)
         let firstRetry = try XCTUnwrap(try retry(pid,tid))
@@ -150,14 +149,13 @@ extension TicketLifecycleCleanupTests {
     }
 
     func testCL392OutcomeRowsOfOtherTicketsDoNotCountAgainstTheHistoryLimit() throws {
-        try QualificationSuite.requireEnabled()
         let (project,task,_) = try fixture(),pid = project["id"] as! String
         let foreign = "{\"origin\":\"automatic_cleanup\",\"receipt_id\":\"\(uuid())\",\"removed_bytes\":1,\"state\":\"removed\",\"task_id\":\"\(uuid())\"}"
-        try addEvents(pid,count:100001,kind:"ticket_evidence_cleanup_outcome",entity:pid,data:foreign)
+        try addEvents(pid,count:CommandRouter.ticketCleanupSelectedHistoryRowLimit + 1,kind:"ticket_evidence_cleanup_outcome",entity:pid,data:foreign)
         let items = try XCTUnwrap(try selection(project)["items"] as? [JSON])
         let item = try XCTUnwrap(items.first {$0["task_id"] as? String == task["id"] as? String})
         XCTAssertEqual(item["action"] as? String,"done_evidence",item["reason"] as? String ?? "")
-        // The manual plan reads the same rows through its own scan.
+        // The selected history bound also applies to the manual purge plan.
         XCTAssertNoThrow(try router.readers!.read {try self.router.ticketPurgePlan($0,task:self.read(task))})
     }
 

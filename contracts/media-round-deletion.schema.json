@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://checklist.local/contracts/media-round-deletion.schema.json",
-  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450)",
+  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450, CL-516)",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -117,6 +117,37 @@
       "properties": {
         "data": {
           "$ref": "#/$defs/failedOperation"
+        },
+        "write_admission": {
+          "$ref": "#/$defs/writeAdmission"
+        }
+      },
+      "required": [
+        "data"
+      ]
+    },
+    "operation_work_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional failed-operation example for a bound on work retained for the selected round. The message identifies the exceeded work bound.",
+      "properties": {
+        "data": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/failedOperation"
+            },
+            {
+              "properties": {
+                "error": {
+                  "properties": {
+                    "code": {
+                      "const": "CLEANUP_INVENTORY_LIMIT"
+                    }
+                  }
+                }
+              }
+            }
+          ]
         },
         "write_admission": {
           "$ref": "#/$defs/writeAdmission"

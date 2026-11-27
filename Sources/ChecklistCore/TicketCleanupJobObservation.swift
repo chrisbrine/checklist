@@ -6,7 +6,6 @@ import GRDB
 /// to infer that a ticket has no pending or previously retained objects.
 struct TicketCleanupJobObservation {
     struct Limits {
-        var rowCount = 100000
         var rowBytes = TicketCleanupInventory.rowByteLimit
         var ticketJobs = 4096
         var ticketObjects = 100000
@@ -105,7 +104,7 @@ struct TicketCleanupJobObservation {
 
 extension CommandRouter {
     func ticketCleanupJobObservation(_ db: Database,tasks: [JSON],limits: TicketCleanupJobObservation.Limits = .init()) throws -> TicketCleanupJobObservation {
-        var result = try TicketCleanupJobObservation(tasks:tasks,limits:limits),count = 0
+        var result = try TicketCleanupJobObservation(tasks:tasks,limits:limits)
         let scopes = result.scopes
         for project in scopes.keys.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
             // Bound the payload before it crosses GRDB. Oversized rows cannot
@@ -114,8 +113,6 @@ extension CommandRouter {
             let columns = "id,project_id,type,revision,\(bounded) AS data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(\(bounded) AS BLOB) AS _envelope_data_bytes"
             let cursor = try Row.fetchCursor(db,sql:"SELECT " + columns + ",length(CAST(data AS BLOB)) AS original_size,typeof(data) AS original_type FROM records INDEXED BY records_scope WHERE project_id=CAST(? AS TEXT) AND type='storage_job' ORDER BY rowid",arguments:[project])
             while let row = try cursor.next() {
-                count += 1
-                guard count <= limits.rowCount else {result.fail(Set(scopes.values.flatMap {$0}));return result}
                 try autoreleasepool {
                     guard row["original_type"] as String == "text" else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
                     guard let size: Int = row["original_size"],size <= limits.rowBytes else {result.fail(scopes[project] ?? []);return}

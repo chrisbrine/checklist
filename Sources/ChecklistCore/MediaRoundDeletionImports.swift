@@ -11,7 +11,7 @@ extension CommandRouter {
         let files = try StorageObjectFiles(root:root)
         var result: [JSON] = []
         func append(_ value: JSON) throws {
-            guard result.count < 100000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media import inventory exceeds its safe bound; files retained.")}
+            guard result.count < 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The round's imports produce more than 100,000 file descriptors; files retained.")}
             result.append(value)
         }
         func incomplete() -> CoreError {
@@ -89,7 +89,7 @@ extension CommandRouter {
                 guard let name = object["representation"] as? String else {return nil};return (name,object)
             })
             let names = try managedDirectoryEntries(files,relative:directory)
-            guard names.count <= 100000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media import staging inventory exceeds its safe bound; files retained.")}
+            guard names.count <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","An import owned by the round has more than 100,000 staging entries; files retained.")}
             for name in names.sorted() {
                 if let object = byName[name] {
                     try staging(directory + "/" + name,jobID:jobID,attachmentID:attachmentID,representation:"staging_" + name,expected:object)

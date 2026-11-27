@@ -64,7 +64,7 @@ extension TicketLifecycleCleanupTests {
             var plans: [String:TicketPurgePlan] = [:]
             for task in tasks {plans[task["id"] as! String] = try self.router.ticketPurgePlan(db,task:task,inventory:batch.inventories[task["id"] as! String],referenceGraph:graphs[task["id"] as! String])}
             var scans = 0
-            db.trace {if case .statement(let statement) = $0,statement.sql.contains("FROM commands LIMIT 100001") {scans += 1}}
+            db.trace {if case .statement(let statement) = $0,statement.sql.contains("FROM commands") && statement.sql.contains(" AS cleanup_row") {scans += 1}}
             let actual = try self.router.ticketPurgeExpiringCommands(db,tasks:tasks,plans:plans)
             db.trace(nil)
             XCTAssertEqual(scans,1);XCTAssertTrue(actual.errors.isEmpty)

@@ -33,7 +33,7 @@ private struct CleanupOwnershipGraph {
         let direct = row.type == "relation" && (row.value["source_task_id"] as? String).map {tasks.contains($0)} == true
         let eligible = !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == CommandRouter.ticketObjectDeletionKind)
         let task = row.value["task_id"] as? String
-        let local = row.value["task_id"] == nil || task.map {tasks.contains($0)} == true
+        let local = task == nil || task.map {tasks.contains($0)} == true
         let parents = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"].compactMap {row.value[$0] as? String}
         guard direct || eligible && local && (task != nil || !parents.isEmpty) else {return}
         let charge = row.id.utf8.count + row.type.utf8.count + (row.project?.utf8.count ?? 0) + (task?.utf8.count ?? 0) + 256 + parents.reduce(0) {$0 + $1.utf8.count + 128}

@@ -65,10 +65,16 @@ extension CommandRouter {
         }
     }
 
-    func sourceBuildCacheDeletionObjects(_ db: Database,owned: [(String,JSON)]) throws -> [JSON] {
-        let executions = owned.filter {$0.0 == "source_execution"},owners = try sourceBuildCacheOwners(db)
+    func sourceBuildCacheDeletionObjects(_ db: Database,owned: [(String,JSON)],allowEnumeration: Bool,maximumObjects: Int) throws -> [JSON] {
+        let executions = owned.filter {$0.0 == "source_execution"}
+        guard !executions.isEmpty else {return []}
+        let owners = try sourceBuildCacheOwners(db)
         let files = try StorageObjectFiles(root:root),budget = StorageSnapshotBudget(deadlineUptime:ProcessInfo.processInfo.systemUptime + 60,canceled:{false})
         var result: [JSON] = [],visited = Set<String>()
+        func append(_ object: JSON) throws {
+            guard result.count < maximumObjects else {throw Self.ticketObjectDeletionObjectLimitError}
+            result.append(object)
+        }
         for (_,execution) in executions {
             guard let entry = try sourceBuildCachePath(db,execution:execution),visited.insert(entry).inserted else {continue}
             let all = owners[entry] ?? []
@@ -76,11 +82,11 @@ extension CommandRouter {
             let ids = Array(Set(local.flatMap {[$0["id"] as? String,$0["source_capture_id"] as? String].compactMap {$0}})).sorted()
             let exclusive = all.allSatisfy {$0["task_id"] as? String == execution["task_id"] as? String && $0["project_id"] as? String == execution["project_id"] as? String}
             if !exclusive {
-                result.append(["stored_path":entry,"relative_path":entry,"name":URL(fileURLWithPath:entry).lastPathComponent,"owner_ids":ids,"representation":"source_build_cache","kind":"directory","state":"retained","reasons":["shared_source_build_cache"],"size":0,"size_unknown":true]);continue
+                try append(["stored_path":entry,"relative_path":entry,"name":URL(fileURLWithPath:entry).lastPathComponent,"owner_ids":ids,"representation":"source_build_cache","kind":"directory","state":"retained","reasons":["shared_source_build_cache"],"size":0,"size_unknown":true]);continue
             }
             let start = result.count
-            guard db.configuration.readonly else {
-                result.append(["stored_path":entry,"relative_path":entry,"owner_ids":ids,"representation":"source_build_cache","kind":"directory","state":"retained","reasons":["cache_requires_read_lane"],"size":0,"size_unknown":true]);continue
+            guard allowEnumeration,db.configuration.readonly else {
+                try append(["stored_path":entry,"relative_path":entry,"owner_ids":ids,"representation":"source_build_cache","kind":"directory","state":"retained","reasons":["cache_requires_read_lane"],"size":0,"size_unknown":true]);continue
             }
             var directories = [entry],count = 0,unsupported = false
             while let directory = directories.popLast() {
@@ -102,7 +108,7 @@ extension CommandRouter {
                         item["kind"] = "symlink";item["link_target"] = target
                         item["sha256"] = hash(Data(target.utf8));item["size"] = target.utf8.count
                     } else {unsupported = true;item["state"] = "retained";item["reasons"] = ["unsupported_cache_entry"]}
-                    result.append(item)
+                    try append(item)
                 }
             }
             if unsupported {

@@ -247,15 +247,12 @@ extension TicketLifecycleCleanupTests {
         }
     }
 
-    func testJobObservationScopedRowCountAndByteOverflowFailClosedForEverySelectedTicket() throws {
-        for bytesLimit in [false,true] {
-            let first = selectedJobTicket(project:uuid()),second = selectedJobTicket(project:first["project_id"] as! String),unrelated = selectedJobTicket(project:first["project_id"] as! String)
-            var oversized = cleanupObservedJob(unrelated);oversized["body"] = String(repeating:"x",count:2048)
-            try saveObservedJobs([cleanupObservedJob(first),oversized,cleanupObservedJob(second,state:"pending")])
-            var limits = TicketCleanupJobObservation.Limits()
-            if bytesLimit {limits.rowBytes = 1024} else {limits.rowCount = 1}
-            let observation = try jobObservation([first,second],limits:limits)
-            assertJobObservationRefused(observation,first);assertJobObservationRefused(observation,second)
-        }
+    func testJobObservationScopedPayloadOverflowFailsClosedForEverySelectedTicket() throws {
+        let first = selectedJobTicket(project:uuid()),second = selectedJobTicket(project:first["project_id"] as! String),unrelated = selectedJobTicket(project:first["project_id"] as! String)
+        var oversized = cleanupObservedJob(unrelated);oversized["body"] = String(repeating:"x",count:2048)
+        try saveObservedJobs([cleanupObservedJob(first),oversized,cleanupObservedJob(second,state:"pending")])
+        var limits = TicketCleanupJobObservation.Limits();limits.rowBytes = 1024
+        let observation = try jobObservation([first,second],limits:limits)
+        assertJobObservationRefused(observation,first);assertJobObservationRefused(observation,second)
     }
 }

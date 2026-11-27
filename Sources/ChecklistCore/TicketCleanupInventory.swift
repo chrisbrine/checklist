@@ -119,10 +119,7 @@ extension CommandRouter {
                 ) END ELSE 0 END AS large_match FROM records ORDER BY rowid
             """
         let cursor = try Row.fetchCursor(db,sql:sql,arguments:[paths,tokens,digests,tokens,digests])
-        var count = 0
         while let raw = try cursor.next() {
-            count += 1
-            guard count <= 100000 else {throw CoreError("PURGE_LIMIT","Cleanup inventory exceeds its record bound; bytes retained.")}
             try autoreleasepool {
                 let size: Int = raw["original_size"]
                 guard raw["original_type"] as String == "text",raw["valid_json"] as Bool else {throw GRDBRecordEnvelopeAdapter.failure(EnvelopeFailure(.sqlData))}
@@ -186,8 +183,9 @@ extension CommandRouter {
         }
     }
 
-    func ticketCleanupInventory(_ db: Database,task: JSON) throws -> TicketCleanupInventory {
+    func ticketCleanupInventory(_ db: Database,task: JSON,objectsForReferences: (([PurgeRow]) throws -> [JSON])? = nil) throws -> TicketCleanupInventory {
         let tid = (try StoredRecord(task, family: "task").string("id")), pid = (try StoredRecord(task, family: "task").string("project_id"))
+        let taskKey = Data(tid.utf8)
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
         let parents = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"]
         var result = TicketCleanupInventory(),owned = Set<Data>()
@@ -195,13 +193,15 @@ extension CommandRouter {
         // children even when a child precedes its parent in physical order.
         for depth in 0..<65 {
             let before = owned.count
-            try streamTicketCleanupRows(db) {row,size in
+            try streamTicketCleanupRows(db,fullPayloads:objectsForReferences != nil) {row,size in
                 guard row.project == pid else {return}
-                let direct = row.type == "relation" && row.value["source_task_id"] as? String == tid
+                let direct = row.type == "relation" && (row.value["source_task_id"] as? String).map {Data($0.utf8) == taskKey} == true
                 let eligible = !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind)
-                let local = row.value["task_id"] == nil || row.value["task_id"] as? String == tid
-                let child = local && parents.contains {field in (row.value[field] as? String).map {owned.contains(Data($0.utf8))} ?? false}
-                if direct || eligible && (row.value["task_id"] as? String == tid || child) {
+                let owner = (row.value["task_id"] as? String).map {Data($0.utf8)}
+                // Non-string legacy values name no other ticket. Resolve
+                // their parent ownership before collecting foreign references.
+                let child = (owner == nil || owner == taskKey) && parents.contains {field in (row.value[field] as? String).map {owned.contains(Data($0.utf8))} ?? false}
+                if direct || eligible && (owner == taskKey || child) {
                     owned.insert(row.key);try result.add(row,bytes:size) {try self.record(db,row.id,type:row.type)}
                 }
             }
@@ -232,7 +232,12 @@ extension CommandRouter {
             try TicketCleanupInventory.strings(row.value,{s in if s.utf8.count == 64 {digests.insert(Data(s.utf8))}},budget:&budget)
         }
         result.holdDigests = digests
-        try streamTicketCleanupRows(db,needles:result.needles,holdDigests:digests,prefixes:result.prefixes,fullPayloads:true) {row,size in
+        if let objectsForReferences {
+            // Some preview or sidecar digests come from verified file
+            // descriptors rather than the canonical owner payload.
+            result.objects(try objectsForReferences(result.rows),root:root)
+        }
+        try streamTicketCleanupRows(db,needles:result.needles,holdDigests:result.holdDigests,prefixes:result.prefixes,fullPayloads:true) {row,size in
             // Deletion receipts are accounting, never reference authority. The
             // stream still validates their complete canonical payload first.
             guard !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) else {return}
@@ -241,7 +246,6 @@ extension CommandRouter {
                 try result.add(row,bytes:size,observation:observation)
             }
         }
-        result.holdDigests = digests
         return result
     }
     func ticketCleanupInventory(_ db: Database,receipt: JSON) throws -> TicketCleanupInventory {

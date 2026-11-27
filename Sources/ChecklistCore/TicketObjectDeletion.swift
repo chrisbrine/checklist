@@ -303,12 +303,22 @@ extension CommandRouter {
         return [path] + closure.filter {$0 != path}.sorted()
     }
 
+    static var ticketObjectDeletionObjectLimitError: CoreError {
+        CoreError("PURGE_LIMIT","The ticket's managed object inventory exceeds the 100,000-object cleanup bound.",
+                  details:["limit":"selected_objects","maximum":TicketCleanupDeletionCohort.objectLimit])
+    }
+
     /// Capture candidate descriptors once before a selected batch observes backup indexes.
-    func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)]) throws -> [JSON] {
+    func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)],allowSourceCacheEnumeration: Bool = true) throws -> [JSON] {
         let files = try StorageObjectFiles(root:root)
+        let objectLimit = TicketCleanupDeletionCohort.objectLimit
         var objects: [String:JSON] = [:]
+        func checkNewObject(_ key: String) throws {
+            guard objects[key] != nil || objects.count < objectLimit else {
+                throw Self.ticketObjectDeletionObjectLimitError
+            }
+        }
         func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil,trash: Bool = false) throws {
-            guard objects.count < 100000 else { throw CoreError("PURGE_LIMIT","The managed object inventory exceeds the safe purge limit.") }
             var item: JSON = ["owner_ids":[owner],"representation":representation,"kind":link == nil ? "file" : "symlink","executable":executable,"state":"pending","size":max(0,size ?? 0)]
             if trash {item["disposal"] = "trash"}
             if let path {item["stored_path"] = path;item["name"] = URL(fileURLWithPath:path).lastPathComponent}
@@ -332,6 +342,7 @@ extension CommandRouter {
             }
             if !reasons.isEmpty {item["state"] = "retained";item["reasons"] = reasons}
             let key = item["relative_path"] as? String ?? "unavailable:" + owner + ":" + representation
+            try checkNewObject(key)
             if var prior = objects[key] {
                 prior["owner_ids"] = Array(Set((prior["owner_ids"] as? [String] ?? []) + [owner])).sorted()
                 if trash {prior["disposal"] = "trash"}
@@ -370,14 +381,17 @@ extension CommandRouter {
             } else if type == "source_capture" {try capture(value,owner:id)}
             else if type == "manifest",let evidence = value["evidence"] as? JSON,let source = evidence["source_capture"] as? JSON {try capture(source,owner:id)}
         }
-        for item in try sourceBuildCacheDeletionObjects(db,owned:owned) {
-            if let path = item["relative_path"] as? String {objects[path] = item}
+        for item in try sourceBuildCacheDeletionObjects(db,owned:owned,allowEnumeration:allowSourceCacheEnumeration,maximumObjects:objectLimit - objects.count) {
+            if let path = item["relative_path"] as? String {
+                try checkNewObject(path)
+                objects[path] = item
+            }
         }
         return Array(objects.values)
     }
 
-    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,preserveTicketMedia: Bool = false) throws -> TicketObjectDeletionPlan {
-        let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned)
+    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,preserveTicketMedia: Bool = false,allowSourceCacheEnumeration: Bool = true) throws -> TicketObjectDeletionPlan {
+        let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned,allowSourceCacheEnumeration:allowSourceCacheEnumeration)
         let backup: StorageBackupRetentionIndex?
         if let backupObservation {backup = backupObservation.index}
         else {backup = observeTicketCleanupBackupRetentionIndex(db,objects:objects)}

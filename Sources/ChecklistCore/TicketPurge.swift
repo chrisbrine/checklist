@@ -20,7 +20,6 @@ struct TicketPurgeReferenceGraph {
     let relevant: Set<Data>
     let removed: [PurgeRow]
     let shared: [PurgeRow]
-    let remainingTokenBudget: Int
 }
 
 struct TicketPurgePlan {
@@ -34,6 +33,19 @@ struct TicketPurgePlan {
     let impact: JSON
     let digest: String
 }
+
+struct PreparedManualTicketPurge {
+    let plan: TicketPurgePlan
+    let expiredCommands: [Row]
+    let reader: DatabaseQueue
+    let version: Int64
+
+    func validate() throws {
+        guard try CommandRouter.ticketPurgeReadVersion(reader) == version else {throw TicketPurgeSnapshotChanged()}
+    }
+}
+
+struct TicketPurgeSnapshotChanged: Error {}
 
 extension CommandRouter {
     func requirePurgeSafe(_ db: Database, task: JSON, automatic: Bool = false) throws {
@@ -110,52 +122,33 @@ extension CommandRouter {
         }
         let removed = all.filter {owned.contains($0.key) && !protected.contains($0.key)}
         let shared = all.filter {protected.contains($0.key)}
-        return TicketPurgeReferenceGraph(taskID:taskKey,projectID:Data(pid.utf8),owned:owned,groups:groups,groupValues:groupValues,references:references,relevant:relevant,removed:removed,shared:shared,remainingTokenBudget:2000000-edgeBudget)
+        return TicketPurgeReferenceGraph(taskID:taskKey,projectID:Data(pid.utf8),owned:owned,groups:groups,groupValues:groupValues,references:references,relevant:relevant,removed:removed,shared:shared)
     }
 
     /// One bounded reference inventory per command, never a full-table scan per row.
     /// Unknown references conservatively retain a shared record; they never grant unlink authority.
-    func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil,doneEvidence: Bool = false,historyObservation: TicketCleanupEventObservation? = nil,backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,referenceGraph: TicketPurgeReferenceGraph? = nil) throws -> TicketPurgePlan {
+    func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil,doneEvidence: Bool = false,historyObservation: TicketCleanupEventObservation? = nil,backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,referenceGraph: TicketPurgeReferenceGraph? = nil,allowSourceCacheEnumeration: Bool = true) throws -> TicketPurgePlan {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id")), taskKey = Data(tid.utf8)
-        let rows = try inventory == nil ? Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records ORDER BY rowid LIMIT 100001") : []
-        if inventory == nil {StorageMemoryGuardSeam.observe?("whole_store_records","TicketPurge.records",rows.count)}
-        guard rows.count <= 100000 else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.")}
-        let all = try inventory?.rows ?? rows.map {row -> PurgeRow in let e = try GRDBRecordEnvelopeAdapter.decode(row);return PurgeRow(id:e.id,type:e.type,project:e.projectID,value:e.object)}
+        var objects = candidateObjects,scannedOwnership: Set<Data>? = nil
+        let inventory = try inventory ?? ticketCleanupInventory(db,task:task,objectsForReferences:{rows in
+            let owned = self.ticketPurgeOwnedKeys(all:rows,pid:pid,tid:tid)
+            scannedOwnership = owned
+            if let objects {return objects}
+            let candidates = try self.ticketObjectDeletionObjects(db,owned:rows.filter {owned.contains($0.key)}.map {($0.type,$0.value)},allowSourceCacheEnumeration:allowSourceCacheEnumeration)
+            objects = candidates
+            return candidates
+        })
+        let all = inventory.rows
         func equals(_ value: Any?, _ id: String) -> Bool {(value as? String).map {Data($0.utf8) == Data(id.utf8)} ?? false}
-        let preparedGraph = try referenceGraph ?? ticketPurgeReferenceGraph(task:task,all:all,cachedTokens:inventory?.tokens ?? [:])
+        let preparedGraph = try referenceGraph ?? ticketPurgeReferenceGraph(task:task,inventory:inventory)
         guard preparedGraph.taskID == taskKey,preparedGraph.projectID == Data(pid.utf8) else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A same-ticket cleanup graph is required.")}
+        if let scannedOwnership,scannedOwnership != preparedGraph.owned {
+            throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected ticket ownership could not be established within the cleanup payload bounds. No content was removed.")
+        }
         let owned = preparedGraph.owned,groups = preparedGraph.groups,groupValues = preparedGraph.groupValues,references = preparedGraph.references,relevant = preparedGraph.relevant,removed = preparedGraph.removed,shared = preparedGraph.shared
-        var edgeBudget = 2000000-preparedGraph.remainingTokenBudget
-        func tokens(_ value: Any, depth: Int = 0) throws -> Set<Data> {
-            guard depth <= 64,edgeBudget < 2000000 else {throw CoreError("PURGE_LIMIT","The reference inventory exceeds the safe purge limit. No content was removed.")}
-            edgeBudget += 1
-            if let s = value as? String {return [Data(s.utf8)]}
-            if let a = value as? [Any] {return try a.reduce(into:Set<Data>()) {$0.formUnion(try tokens($1,depth:depth+1))}}
-            if let d = value as? JSON {return try d.reduce(into:Set<Data>()) {result,entry in result.insert(Data(entry.key.utf8));result.formUnion(try tokens(entry.value,depth:depth+1))}}
-            return []
-        }
         let removedKeys = Set(removed.map(\.key))
-        let events: [Row]
-        if let historyObservation {
-            events = try historyObservation.events(task:tid,matching:removedKeys.union([taskKey]),tokenBudget:2000000-edgeBudget)
-        } else {
-            let historyKeys = try jsonString(removedKeys.union([taskKey]).map {String(decoding:$0,as:UTF8.self)})
-            let eventRows = try Row.fetchCursor(db,sql:"SELECT seq,id,entity_id,data FROM events WHERE project_id=? AND " + Self.ticketCleanupHistoryRowSQL + " ORDER BY seq LIMIT 100001",arguments:[pid,historyKeys,historyKeys,historyKeys])
-            var selectedEvents: [Row] = [],eventCount = 0,historyBytes = 0
-            while let row = try eventRows.next() {
-                eventCount += 1
-                guard eventCount <= 100000 else {throw CoreError("PURGE_LIMIT","The ticket history exceeds the safe purge limit.")}
-                guard (row["data"] as String).utf8.count <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A history row exceeds the memory bound.")}
-                let entity = (row["entity_id"] as String?).map {Data($0.utf8)}
-                let matched = try autoreleasepool {try entity == taskKey || entity.map({removedKeys.contains($0)}) == true || !tokens(jsonObject(row["data"])).isDisjoint(with:removedKeys.union([taskKey]))}
-                if matched {
-                    historyBytes += (row["data"] as String).utf8.count
-                    guard historyBytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected ticket history exceeds the memory bound.")}
-                    selectedEvents.append(row.copy())
-                }
-            }
-            events = selectedEvents
-        }
+        let observation = try historyObservation ?? ticketCleanupEventObservation(db,tasks:[task],inventories:[tid:inventory],referenceGraphs:[tid:preparedGraph])
+        let events = try observation.events(task:tid,matching:removedKeys.union([taskKey]))
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         let managed = all.filter {owned.contains($0.key) && $0.type == "attachment" && $0.value["mode"] as? String == "managed"}
         let backups = try backupObservation?.summaries ?? Row.fetchAll(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) AS value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
@@ -172,7 +165,7 @@ extension CommandRouter {
         let byteProtected = try doneEvidence ? ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != tid},owners:byteOwners,tokens:references) : Set<Data>()
         let excluded = doneEvidence ? byteOwners.subtracting(byteProtected) : removedKeys
         let remaining = all.filter {!excluded.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
-        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:inventory.map {_ in references},historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:candidateObjects,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:doneEvidence)
+        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:references,historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:objects,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:doneEvidence,allowSourceCacheEnumeration:allowSourceCacheEnumeration)
         let impact: JSON = [
             "task_id": tid, "project_id": pid, "expected_revision": (try StoredRecord(task, family: "task").requiredValue("revision")), "record_counts": counts,
             "removed_record_count": removed.count, "shared_record_count": shared.count, "history_events": events.count, "preserved_relation_count": relationCount,
@@ -206,10 +199,66 @@ extension CommandRouter {
         return value
     }
 
+    private func ticketPurgeReader() throws -> DatabaseQueue {
+        var configuration = Configuration()
+        configuration.readonly = true
+        configuration.prepareDatabase {db in
+            try SchemaMigrations.installStorageCollation(db)
+            Self.installTicketSearchFunctions(db)
+            try db.execute(sql:"PRAGMA busy_timeout=5000")
+        }
+        do {return try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)}
+        catch {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Permanent ticket removal needs a separate read lane. Retry the purge.")}
+    }
+
+    static func ticketPurgeReadVersion(_ reader: DatabaseQueue) throws -> Int64 {
+        try reader.unsafeRead {db in
+            guard let version = try Int64.fetchOne(db,sql:"PRAGMA data_version") else {throw TicketPurgeSnapshotChanged()}
+            return version
+        }
+    }
+
+    func withManualTicketPurgePreparation<T>(_ p: JSON,_ c: Caller,commit: (PreparedManualTicketPurge?) throws -> T) throws -> T {
+        let reader = try ticketPurgeReader()
+        defer {try? reader.close()}
+        for attempt in 0..<2 {
+            do {
+                let version = try Self.ticketPurgeReadVersion(reader)
+                let prepared = try reader.read {db in
+                    try autoreleasepool {try self.prepareManualTicketPurge(db,p,c,reader:reader,version:version)}
+                }
+                // Avoid taking the writer for a snapshot already known stale.
+                try prepared?.validate()
+                return try commit(prepared)
+            } catch is TicketPurgeSnapshotChanged where attempt == 0 {continue}
+            catch is TicketPurgeSnapshotChanged {break}
+        }
+        throw CoreError("PURGE_PREVIEW_STALE","The store changed during purge preparation. Read a new permanent-removal preview before retrying.")
+    }
+
+    private func prepareManualTicketPurge(_ db: Database,_ p: JSON,_ c: Caller,reader: DatabaseQueue,version: Int64) throws -> PreparedManualTicketPurge? {
+        try owner(c)
+        let command = try text(p,"command_id",max:100)
+        // The existing writer transaction owns idempotency and rechecks the
+        // receipt. A known command does not need another full observation.
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM commands WHERE principal=? AND command_id=?)",arguments:[c.principal,command]) == true {return nil}
+        let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid)
+        guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")}
+        try revision(p,task);try requirePurgeSafe(db,task:task)
+        let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        guard try text(p,"preview_digest") == plan.digest else {throw Self.ticketPurgeStalePreview}
+        let commands = try ticketPurgeExpiringCommands(db,task:task,plan:plan)
+        return .init(plan:plan,expiredCommands:commands,reader:reader,version:version)
+    }
+
+    private static var ticketPurgeStalePreview: CoreError {
+        CoreError("PURGE_PREVIEW_STALE","This ticket or its references changed. Read a new permanent-removal preview before confirming.")
+    }
+
     func taskPurgePreview(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try owner(c);let pid = try scope(db,p,c),task = try self.task(db,p,pid)
         try revision(p,task);try requirePurgeSafe(db,task:task)
-        let plan = try ticketPurgePlan(db,task:task)
+        let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
         return ["preview_id":plan.digest,"digest":plan.digest,"impact":plan.impact,"can_purge":true,"blockers":[],
             "removes":"Permanently removes this ticket's private content and exclusively owned notes, work, requests, reviews and file records. Earlier history rows keep their place with their content cleared. Earlier cached command results are expired.",
             "preserves":"A minimal Purged ticket reference, incoming relations, shared records and other tickets remain. Exclusively owned managed originals, previews and captured-source bytes are queued for verified deletion after commit. Shared and reader-held bytes remain; live-only bytes wait for a completed backup. External originals and workspace files are never deleted. This is not secure erasure.",
@@ -218,11 +267,28 @@ extension CommandRouter {
 
     func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
         let removedIDs = Set(plan.removed.map(\.key)).union([Data(((try StoredRecord(task, family: "task").string("id"))).utf8)])
-        struct CommandIdentity: Hashable {let principal: Data;let command: Data}
-        // Import previews contain source IDs, before commit assigns internal
-        // ticket UUIDs. They cannot be matched reliably by the removed-ID graph.
-        // Expire these newly durable snapshots conservatively on any purge.
-        var privateOperationReceipts = Set<CommandIdentity>()
+        let keys = try jsonString(removedIDs.map {String(decoding:$0,as:UTF8.self)})
+        let columns = """
+            rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,
+            CAST(command_id AS BLOB) AS cleanup_command_id,length(CAST(result AS BLOB)) AS result_bytes
+            """
+        var selected: [Row] = [],positions = Set<Int64>(),bytes = 0
+        func admit(_ row: Row,bytes charge: Int) throws {
+            let position: Int64 = row["cleanup_row"]
+            guard !positions.contains(position) else {return}
+            guard selected.count < Self.ticketCleanupSelectedHistoryRowLimit else {throw Self.ticketCleanupSelectedHistoryLimit(commands:true)}
+            bytes += charge
+            guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command results exceed the 16 MiB cleanup bound.")}
+            positions.insert(position);selected.append(row.copy())
+        }
+        func admitPrivateReceipt(principal: Data,command: Data) throws {
+            if let row = try Row.fetchOne(db,sql:"SELECT " + columns + " FROM commands WHERE principal=CAST(? AS TEXT) AND command_id=CAST(? AS TEXT) AND result<>?",arguments:[principal,command,Self.prunedResult]) {
+                try admit(row,bytes:min(row["result_bytes"] as Int,TicketCleanupInventory.rowByteLimit))
+            }
+        }
+        // Import previews contain source IDs and operation errors can contain
+        // private text without a ticket ID. Expire their live cached results.
+        // Stream metadata and admit only receipts that still need scrubbing.
         let operations = try Row.fetchCursor(db,sql:"""
             SELECT CAST(json_extract(value,'$.principal') AS BLOB) AS principal,
                    CAST(json_extract(value,'$.command_id') AS BLOB) AS command,
@@ -232,44 +298,34 @@ extension CommandRouter {
               AND CASE WHEN json_valid(value) THEN
                 json_extract(value,'$.method')='import_preview' OR json_type(value,'$.error_result_command_id')='text'
               ELSE 0 END
-            LIMIT 100001
             """)
-        var operationCount = 0
         while let row = try operations.next() {
-            operationCount += 1
-            guard operationCount <= 100000 else {throw CoreError("PURGE_LIMIT","The operation history exceeds the safe purge limit.")}
-            guard let principal = row["principal"] as Data?,let command = row["command"] as Data? else {throw StoreRecovery.required("command_operation_invalid")}
-            if row["method"] as String == "import_preview" {privateOperationReceipts.insert(.init(principal:principal,command:command))}
-            // Private error text need not contain a removed record ID. Retire
-            // every operation error snapshot conservatively on any purge.
-            if let error = row["error_command"] as Data? {privateOperationReceipts.insert(.init(principal:principal,command:error))}
+            try autoreleasepool {
+                guard let principal = row["principal"] as Data?,let command = row["command"] as Data? else {throw StoreRecovery.required("command_operation_invalid")}
+                if row["method"] as String? == "import_preview" {try admitPrivateReceipt(principal:principal,command:command)}
+                if let error = row["error_command"] as Data? {try admitPrivateReceipt(principal:principal,command:error)}
+            }
         }
-        let receipts = try Row.fetchCursor(db,sql:"""
-            SELECT rowid AS cleanup_row,principal,command_id,CAST(principal AS BLOB) AS cleanup_principal,
-                   CAST(command_id AS BLOB) AS cleanup_command_id,
-                   length(CAST(result AS BLOB)) AS result_bytes,
-                   CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result
-            FROM commands LIMIT 100001
-            """,arguments:[TicketCleanupInventory.rowByteLimit])
+        let receipts = try Row.fetchCursor(db,sql:"SELECT " + columns + """
+            , CASE WHEN length(CAST(result AS BLOB))<=? THEN result END AS result
+            FROM commands WHERE result<>?
+            """,arguments:[TicketCleanupInventory.rowByteLimit,Self.prunedResult])
         func containsRemoved(_ value: Any) -> Bool {
             if let s = value as? String {return removedIDs.contains(Data(s.utf8))}
             if let a = value as? [Any] {return a.contains {containsRemoved($0)}}
             if let d = value as? JSON {return d.contains {removedIDs.contains(Data($0.key.utf8)) || containsRemoved($0.value)}}
             return false
         }
-        var selected: [Row] = [],count = 0,bytes = 0
         while let row = try receipts.next() {
-            count += 1
-            guard count <= 100000 else {throw CoreError("PURGE_LIMIT","The command history exceeds the safe purge limit.")}
-            if privateOperationReceipts.contains(.init(principal:row["cleanup_principal"] as Data,command:row["cleanup_command_id"] as Data)) {
-                bytes += min(row["result_bytes"] as Int,TicketCleanupInventory.rowByteLimit)
-                guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command history exceeds the memory bound.")}
-                selected.append(row.copy());continue
-            }
-            if row["result"] as String? == nil {
-                // Operation replies/errors can be larger than an ordinary
-                // domain receipt. Expire their snapshots conservatively without
-                // bringing the large private payload across the SQL boundary.
+            try autoreleasepool {
+                let position: Int64 = row["cleanup_row"]
+                guard !positions.contains(position) else {return}
+                if let result: String = row["result"] {
+                    if containsRemoved(jsonObject(result)) {try admit(row,bytes:row["result_bytes"])}
+                    return
+                }
+                // Larger operation receipts can be expired by identity without
+                // ever copying their private payload across the SQL boundary.
                 let operation = try Bool.fetchOne(db,sql:"""
                     SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'command-operation:*'
                       AND CASE WHEN json_valid(value) THEN
@@ -279,23 +335,19 @@ extension CommandRouter {
                         json_type(value,'$.method')='text'
                       ELSE 0 END)
                     """,arguments:[row["cleanup_principal"] as Data,row["cleanup_command_id"] as Data,row["cleanup_command_id"] as Data]) == true
-                guard operation else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A command history row exceeds the memory bound.")}
-                selected.append(row.copy());continue
-            }
-            if autoreleasepool(invoking:{containsRemoved(jsonObject(row["result"]))}) {
-                bytes += (row["result"] as String).utf8.count
-                guard bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected command history exceeds the memory bound.")}
-                selected.append(row.copy())
+                if operation {try admit(row,bytes:0);return}
+                let matches = try Self.ticketCleanupMatchingPayloadKeys(db,payloadSQL:"SELECT result AS payload FROM commands WHERE rowid=?",position:position,keys:keys)
+                guard matches?.isEmpty == true else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected command result exceeds the 4 MiB payload bound.")}
             }
         }
-        return selected
+        return selected.sorted {($0["cleanup_row"] as Int64) < ($1["cleanup_row"] as Int64)}
     }
 
     func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil) throws -> JSON {
         try owner(c);let pid = try scope(db,p,c,write:!automatic),task = try self.task(db,p,pid)
         try revision(p,task);try requirePurgeSafe(db,task:task,automatic:automatic)
-        let plan = try prepared ?? ticketPurgePlan(db,task:task)
-        guard try text(p,"preview_digest") == plan.digest else {throw CoreError("PURGE_PREVIEW_STALE","This ticket or its references changed. Read a new permanent-removal preview before confirming.")}
+        let plan = try prepared ?? ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        guard try text(p,"preview_digest") == plan.digest else {throw Self.ticketPurgeStalePreview}
         let tid = (try StoredRecord(task, family: "task").string("id"))
         // Expiring receipts keeps idempotency ownership/digests but prevents a
         // retry of an earlier create/note/read-modify command returning purged text.

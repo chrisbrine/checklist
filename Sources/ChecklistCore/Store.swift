@@ -532,6 +532,10 @@ public final class CommandRouter: @unchecked Sendable {
             defer {if writerRead {backupWrites.finishWrite()}}
             return try executeProjectImport(method:method,params:params,caller:caller)
         }
+        if method == "task_purge_preview" {
+            guard let readers else {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","A purge preview needs a separate read lane. Retry the preview.")}
+            return commandManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller),caller:caller,command:params["command_id"] as? String)
+        }
         // CL-72: a pure read runs on a read-only connection, without the object gate or the
         // writer. A read that turns out to write (for example a first cleanup preview) runs
         // again on the writer path below.
@@ -587,8 +591,7 @@ public final class CommandRouter: @unchecked Sendable {
         }
         // CL-410 F6: with a reader pool, the recipient scans run after the writer and the object gate are free.
         var noticesAfterWriter = false
-        let writerOutput: JSON = try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
-        return try dbQueue.writeWithoutTransaction { db in try autoreleasepool {
+        let write: (Database,ArchiveStoragePermit,PreparedManualTicketPurge?) throws -> JSON = {db,permit,preparedPurge in
             // Decode/encode temporaries belong to this command, including its
             // post-commit maintenance and notices. Drain on the writer's thread;
             // a pool on the calling service queue cannot guarantee that lifetime.
@@ -635,7 +638,16 @@ public final class CommandRouter: @unchecked Sendable {
                 if Self.triageStatusMethods.contains(method),let pid = params["project_id"] as? String {
                     membershipBefore = try self.currentTriageMemberships(db,project:pid)
                 }
-                var data = try self.dispatch(db,method:method,p:params,c:caller)
+                var data: JSON
+                if method == "task_purge" {
+                    // Same connection for both version reads. Check after the
+                    // writer transaction has obtained its snapshot, before
+                    // writing anything. An external WAL writer that races the
+                    // check also prevents SQLite from upgrading that snapshot.
+                    guard let preparedPurge else {throw TicketPurgeSnapshotChanged()}
+                    try preparedPurge.validate()
+                    data = try self.taskPurge(db,params,caller,prepared:preparedPurge.plan,expiredCommands:preparedPurge.expiredCommands)
+                } else {data = try self.dispatch(db,method:method,p:params,c:caller)}
                 if Self.triageStatusMethods.contains(method),let pid = params["project_id"] as? String { data["triage_effect"] = try self.triageCommandEffect(db,before:membershipBefore,project:pid,method:method) }
                 output = ["data":data,"event_cursor":try self.cursor(db,caller:caller,scope:try self.authorizationScope(db,caller))]
                 if writes {
@@ -674,8 +686,13 @@ public final class CommandRouter: @unchecked Sendable {
                 } else { noticesAfterWriter = true }
             }
             return self.commandManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller,command:params["command_id"] as? String)
-        }}
-    }
+        }
+        func commit(_ preparedPurge: PreparedManualTicketPurge?) throws -> JSON {
+            try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) {permit in
+                try dbQueue.writeWithoutTransaction {db in try autoreleasepool {try write(db,permit,preparedPurge)}}
+            }
+        }
+        let writerOutput = try method == "task_purge" ? withManualTicketPurgePreparation(params,caller,commit:commit) : commit(nil)
         guard noticesAfterWriter,let readers else { return writerOutput }
         return autoreleasepool { addingRecipientNotices(readers,output:writerOutput,params:params,caller:caller) }
     }

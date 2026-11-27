@@ -186,7 +186,7 @@ extension CommandRouter {
             let size = try jsonString(value).utf8.count
             selectedBytes += size
             guard size <= TicketCleanupInventory.rowByteLimit,selectedBytes <= TicketCleanupInventory.byteLimit,selected.count < 100_000 else {
-                throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected media graph exceeds its safe bound; nothing was removed.")
+                throw CoreError("CLEANUP_INVENTORY_LIMIT","The round's owned records exceed 100,000 rows, 4 MiB per row or 16 MiB total; nothing was removed.")
             }
             guard EnvelopeStorageIdentity.equal(value["project_id"] as? String,project) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A round-owned record has foreign scope.")}
             selected[Data(id.utf8)] = .init(id:id,type:type,project:project,value:value)
@@ -344,6 +344,16 @@ extension CommandRouter {
         }
         let cleanupFinished = ProcessInfo.processInfo.systemUptime
         var events: [String] = [],commands: [(String,String)] = []
+        var identityBytes = 0
+        func admitHistory(bytes: Int) throws {
+            guard events.count + commands.count < 4096 else {
+                throw CoreError("CLEANUP_INVENTORY_LIMIT","The round matches more than 4,096 events and command results; nothing was removed.")
+            }
+            guard bytes <= TicketCleanupInventory.byteLimit - identityBytes else {
+                throw CoreError("CLEANUP_INVENTORY_LIMIT","The round's matched event and command identities exceed 16 MiB; nothing was removed.")
+            }
+            identityBytes += bytes
+        }
         let historyTokens = try jsonString(keys.map {String(decoding:$0,as:UTF8.self)})
         // History needs exact text atoms and dictionary keys, not a Foundation
         // object graph for every unrelated receipt. SQLite streams the complete
@@ -352,16 +362,18 @@ extension CommandRouter {
             "EXISTS(SELECT 1 FROM json_tree(CASE WHEN json_valid(\(payload)) THEN CASE WHEN json_type(\(payload))='object' THEN \(payload) ELSE '{}' END ELSE '{}' END) j WHERE (j.type='text' AND CAST(j.atom AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))) OR (typeof(j.key)='text' AND CAST(j.key AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
         }
         let history = try Row.fetchCursor(db,sql:"SELECT id,entity_id,CASE WHEN kind GLOB 'media_*' THEN " + historyMatch("data") + " ELSE 0 END AS media_reference FROM events WHERE project_id=CAST(? AS TEXT)",arguments:[historyTokens,historyTokens,Data(project.utf8)])
-        var historyCount = 0
         while let row = try history.next() {
-            historyCount += 1;guard historyCount <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The deletion history exceeds its safe bound.")}
-            if owned.contains(Data((row["entity_id"] as String? ?? "").utf8)) || row["media_reference"] as Bool {events.append(row["id"])}
+            guard owned.contains(Data((row["entity_id"] as String? ?? "").utf8)) || row["media_reference"] as Bool else {continue}
+            let id: String = row["id"]
+            try admitHistory(bytes:id.utf8.count)
+            events.append(id)
         }
         let receipts = try Row.fetchCursor(db,sql:"SELECT principal,command_id," + historyMatch("result") + " AS media_reference FROM commands",arguments:[historyTokens,historyTokens])
-        var receiptCount = 0
         while let row = try receipts.next() {
-            receiptCount += 1;guard receiptCount <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The deletion command history exceeds its safe bound.")}
-            if row["media_reference"] as Bool {commands.append((row["principal"],row["command_id"]))}
+            guard row["media_reference"] as Bool else {continue}
+            let principal: String = row["principal"],id: String = row["command_id"]
+            try admitHistory(bytes:principal.utf8.count + id.utf8.count)
+            commands.append((principal,id))
         }
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         observedIDs.formUnion(owned)

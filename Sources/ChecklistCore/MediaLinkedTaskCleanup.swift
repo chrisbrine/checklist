@@ -202,7 +202,7 @@ extension CommandRouter {
         var result: [JSON] = [],count = 0
         while let raw = try rows.next() {
             count += 1
-            guard count <= 100000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff exceeds its bounded history inventory; originals retained.")}
+            guard count <= 100_000 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The round's structural history exceeds 100,000 owned records; originals retained.")}
             try autoreleasepool {
                 var value = try GRDBRecordEnvelopeAdapter.decode(raw).object;value["record_type"] = raw["type"] as String
                 if let visit {try visit(value)} else {result.append(value)}

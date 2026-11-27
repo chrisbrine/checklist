@@ -106,6 +106,28 @@ final class PurgeByteDeletionTests: XCTestCase {
             XCTAssertTrue(((done["objects"] as! [JSON])[0]["reasons"] as! [String]).contains(reason))
         }
     }
+    func testPurgePreviewAndCommitPreserveDigestOnlyHoldOnPreviewBytes() throws {
+        let (project,task,attachment,_) = try fixture()
+        let path = "objects/" + uuid() + ".preview.png",bytes = Data("preview lease bytes".utf8)
+        let files = try StorageObjectFiles(root:router.root)
+        try files.writeNew(path,bytes:bytes)
+        try write {db in
+            var current = try self.router.record(db,attachment["id"] as! String,type:"attachment")
+            current["preview_path"] = path
+            try self.router.save(db,self.router.revised(current),type:"attachment")
+            try self.router.save(db,["id":uuid(),"project_id":project["id"]!,"revision":1,"kind":"reader","state":"active","sha256":ChecklistCore.hash(bytes)],type:"storage_hold")
+        }
+        let trashed = try trash(project,task),view = try preview(project,trashed)
+        let objects = try XCTUnwrap((view["impact"] as? JSON)?["byte_deletion_objects"] as? [JSON])
+        let planned = try XCTUnwrap(objects.first {$0["relative_path"] as? String == path})
+        XCTAssertTrue(strings(planned,"reasons").contains("reader_lease"))
+        let outcome = try finish(purge(project,trashed))
+        let receipt = try XCTUnwrap((outcome["objects"] as? [JSON])?.first {$0["relative_path"] as? String == path})
+        XCTAssertEqual(receipt["state"] as? String,"retained")
+        XCTAssertTrue(strings(receipt,"reasons").contains("reader_lease"))
+        XCTAssertTrue(try files.regularOrLinkExists(path))
+    }
+
     func testRetainedBackupCopyAllowsOriginalRemovalAndLeavesBackupUnchanged() throws {
         let (p,t,a,_) = try fixture(),backup = directory.appendingPathComponent("backup")
         _ = try call("backup_create",["path":backup.path])
