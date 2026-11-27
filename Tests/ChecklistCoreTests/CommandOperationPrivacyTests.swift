@@ -146,6 +146,14 @@ final class CommandOperationPrivacyTests: XCTestCase {
             XCTAssertFalse(try jsonString(metadata).contains("Private failure snapshot"))
             XCTAssertNotNil(metadata["error_result_command_id"])
         }
+        // Older uncertain failures can still be marked recoverable when a later
+        // maintenance pass expires their receipt.
+        try f.router!.dbQueue.write {db in
+            var value = try XCTUnwrap(f.router!.operationRecord(db,id:id))
+            value["recoverable"] = true
+            value["outcome_unknown"] = true
+            try f.router!.saveOperation(db,value)
+        }
         let current = try f.call("task_get",["project_id":pid,"task_id":tid])["data"] as! JSON
         let trashed = try f.call("task_archive",["project_id":pid,"task_id":tid,"expected_revision":current["revision"]!,"action":"trash"])["data"] as! JSON
         let purgeInput: JSON = ["project_id":pid,"task_id":tid,"expected_revision":trashed["revision"]!]
@@ -156,6 +164,9 @@ final class CommandOperationPrivacyTests: XCTestCase {
         var commit = purgeInput;commit["command_id"] = uuid();commit["preview_digest"] = preview["digest"]!
         _ = try f.router!.executeBackupQueuedWrite(method:"task_purge",params:commit,caller:f.owner)
         XCTAssertThrowsError(try f.call("operation_get",["project_id":pid,"operation_id":id])) {XCTAssertEqual(($0 as? CoreError)?.code,"COMMAND_RESULT_EXPIRED")}
+        XCTAssertThrowsError(try f.call("triage_transition",input,command:command)) {XCTAssertEqual(($0 as? CoreError)?.code,"COMMAND_RESULT_EXPIRED")}
+        lane.sync {}
+        XCTAssertEqual(try f.router!.dbQueue.read {try f.router!.operationRecord($0,id:id)?["state"] as? String},"failed")
     }
 
     func testInterruptedRetryRetainsHistoricalErrorReferenceThroughSuccess() throws {

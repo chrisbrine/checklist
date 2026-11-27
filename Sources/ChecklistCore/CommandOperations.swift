@@ -3,6 +3,34 @@ import Dispatch
 import Darwin
 import GRDB
 
+/// Ticket purge and round deletion advance both keys in their removal
+/// transaction. A legacy store can have only the store-wide key.
+struct CommandOperationPurgeEpoch {
+    private static let storeKey = "command-operation-purge-epoch"
+
+    private let key: String
+    private let value: String?
+
+    private static func projectKey(_ project: String) -> String {storeKey + ":" + project}
+
+    init(_ db: Database,project: String?) throws {
+        key = project.map(Self.projectKey) ?? Self.storeKey
+        value = try Self.read(db,key:key)
+    }
+
+    private static func read(_ db: Database,key: String) throws -> String? {
+        try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=CAST(? AS TEXT)",arguments:[Data(key.utf8)])
+    }
+
+    func changed(in db: Database) throws -> Bool {try Self.read(db,key:key) != value}
+
+    static func advance(_ db: Database,project: String) throws {
+        let epoch = uuid()
+        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?),(CAST(? AS TEXT),?)",
+                       arguments:[storeKey,epoch,Data(projectKey(project).utf8),epoch])
+    }
+}
+
 /// Scheduling state is process-local. Acceptance lives in durable journals;
 /// terminal state is canonical in SQLite. Successful replies live exclusively
 /// in the ordinary command journal, with byte-free attachment read descriptors.
@@ -32,7 +60,7 @@ final class CommandOperations: @unchecked Sendable {
     struct Outcome {
         let output: JSON?
         let failure: CoreError?
-        let purgeEpoch: String?
+        let purgeEpoch: CommandOperationPurgeEpoch
         let startedAt: String
     }
     private var held: [String:(attempt: UUID,outcome: Outcome)] = [:]
@@ -393,6 +421,9 @@ extension CommandRouter {
                     try self.authorizeOperation(db,previous,params:params,caller:caller)
                     guard previous["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This command ID was already accepted with different input.")}
                     if !["backup_create","media_round_delete"].contains(previous["method"] as? String ?? ""),previous["state"] as? String == "failed",bool(previous,"recoverable") {
+                        // Recovery can reconcile an uncertain outcome only while
+                        // its current failure receipt is still readable.
+                        _ = try self.operationPayload(db,previous,caller:caller)
                         previous["state"] = "queued";previous["updated_at"] = now();previous.removeValue(forKey:"error");previous.removeValue(forKey:"finished_at")
                         previous["recoverable"] = false
                         if persist {try self.saveOperation(db,previous)};schedule = true
@@ -480,6 +511,15 @@ extension CommandRouter {
         commandOperations.releaseHeld(job.id)
         return true
     }
+    private static func operationPurgeProject(method: String,params: JSON) -> String? {
+        // Storage operations describe whole stores, even when the project
+        // supplies authorization. Import preview returns the source document,
+        // and import commit errors can describe source files.
+        if method == "backup_create" || storageRestoreMethods.contains(method) || storageBackupPruningMethods.contains(method)
+            || method == "import_preview" || method == "import_commit" {return nil}
+        return params["project_id"] as? String
+    }
+
     private func executeCommandOperation(_ job: CommandOperations.Job) throws -> CommandOperations.Outcome? {
         let params = try JSONSerialization.jsonObject(with:job.params) as! JSON
         // GRDB executes callbacks on its own writer/reader threads. The
@@ -492,7 +532,8 @@ extension CommandRouter {
         defer {if let previous {Thread.current.threadDictionary[commandOperations.contextKey] = previous} else {Thread.current.threadDictionary.removeObject(forKey:commandOperations.contextKey)}}
         var output: JSON?,failure: CoreError?
         let startedAt = now()
-        let purgeEpoch = try readForPreparation {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='command-operation-purge-epoch'")}
+        let purgeProject = Self.operationPurgeProject(method:job.method,params:params)
+        let purgeEpoch = try readForPreparation {try CommandOperationPurgeEpoch($0,project:purgeProject)}
         do {
             let generation = try backupWriteAuthorization(params:params,caller:job.caller)
             guard generation == job.generation else {throw CoreError("CONNECTION_REVOKED","The operation's session authorization changed before application.")}
@@ -551,13 +592,11 @@ extension CommandRouter {
                     if let existing {
                         guard existing["digest"] as String == value["digest"] as? String else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation receipt no longer matches its accepted intent.")}
                     }
-                    let currentPurgeEpoch = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='command-operation-purge-epoch'")
                     // Never resurrect a reply scrubbed by a concurrent purge.
-                    // Read-only operations have no semantic journal yet: retire
-                    // their private snapshot if any purge crossed execution.
-                    // Purge/deletion advance this epoch themselves; their durable
-                    // semantic receipts still expose any concurrent scrubbing.
-                    let expired = existing.map {Self.isPrunedResult(jsonObject($0["result"]))} == true || (!["task_purge","media_round_delete"].contains(job.method) && currentPurgeEpoch != purgeEpoch)
+                    // Purge/deletion advance their own epoch. Their content-free
+                    // success receipts can still be scrubbed by receipt identity.
+                    let pruned = existing.map {Self.isPrunedResult(jsonObject($0["result"]))} == true
+                    let expired = try pruned || (!["task_purge","media_round_delete"].contains(job.method) && purgeEpoch.changed(in:db))
                     if expired {durable = jsonObject(Self.prunedResult)}
                     let media = Self.mediaOwnerMethods.contains(job.method) || Self.mediaWorkerMethods.contains(job.method)
                     if !media || existing == nil {
@@ -571,6 +610,9 @@ extension CommandRouter {
                 } else if committedBackup != nil {
                     // The complete backup receipt precedes retention/advisory
                     // work. A later failure cannot replace that proven outcome.
+                    if try purgeEpoch.changed(in:db) {
+                        try db.execute(sql:"UPDATE commands SET result=? WHERE principal=? AND command_id=?",arguments:[Self.prunedResult,job.caller.principal,command])
+                    }
                     value["state"] = "succeeded";value.removeValue(forKey:"outcome_unknown");value.removeValue(forKey:"error")
                 } else if let failure {
                     let uncertain = bool(value,"outcome_unknown") || failure.code == "OUTCOME_UNKNOWN" || failure.details["command_outcome"] as? String == "unknown"
@@ -583,12 +625,12 @@ extension CommandRouter {
                     let errorDigest = hash(Data(("operation-error:" + (value["digest"] as! String)).utf8))
                     let old = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[job.caller.principal,errorCommand])
                     if let old {guard old["digest"] as String == errorDigest else {throw CoreError("IDEMPOTENCY_CONFLICT","The operation error receipt belongs to another command.")}}
-                    let crossedPurge = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='command-operation-purge-epoch'") != purgeEpoch
+                    let crossedPurge = try purgeEpoch.changed(in:db)
                     let expired = crossedPurge || old.map {Self.isPrunedResult(jsonObject($0["result"]))} == true
                     let receipt: JSON = expired ? jsonObject(Self.prunedResult) : ["command_id":value["command_id"]!,"error":error]
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?) ON CONFLICT(principal,command_id) DO UPDATE SET result=excluded.result",arguments:[job.caller.principal,errorCommand,errorDigest,try jsonString(receipt)])
                     value["state"] = "failed";value["error_result_command_id"] = errorCommand;value.removeValue(forKey:"error")
-                    value["recoverable"] = uncertain && !["backup_create","media_round_delete"].contains(job.method);value["outcome_unknown"] = uncertain
+                    value["recoverable"] = uncertain && !expired && !["backup_create","media_round_delete"].contains(job.method);value["outcome_unknown"] = uncertain
                 }
                 if value["started_at"] == nil {value["started_at"] = outcome.startedAt}
                 value["finished_at"] = now();value["updated_at"] = now();try self.saveOperation(db,value)

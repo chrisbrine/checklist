@@ -75,6 +75,21 @@ final class MediaRoundDeletionTests: XCTestCase {
         try assertRefusal(f,"NOT_FOUND") {try self.deletion(f,round)}
     }
 
+    func testCL520RoundDeletionAdvancesItsProjectAndStoreEpochs() throws {
+        let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
+        let (store,project,other) = try f.router.dbQueue.read {db in
+            (try CommandOperationPurgeEpoch(db,project:nil),
+             try CommandOperationPurgeEpoch(db,project:f.project),
+             try CommandOperationPurgeEpoch(db,project:uuid()))
+        }
+        _ = try worker(f,"media_round_delete",input(f,round))
+        try f.router.dbQueue.read {db in
+            XCTAssertTrue(try store.changed(in:db))
+            XCTAssertTrue(try project.changed(in:db))
+            XCTAssertFalse(try other.changed(in:db))
+        }
+    }
+
     func testMatchedHistoryWorkLimitRefusesBeforeRemovingRoundRecords() throws {
         let f = try Fixture(),round = try cancel(f,f.round(f.type(checks.schema())))
         let roundID = try XCTUnwrap(round["id"] as? String)

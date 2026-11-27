@@ -66,6 +66,7 @@
     "operation_get": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Read the original operation in its project. A retired terminal receipt returns the operation_expired tool error.",
       "properties": {
         "method": {
           "const": "operation_get"
@@ -98,6 +99,7 @@
     "operation_result": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Successful deletion summaries skip in-flight purge retirement. The stored receipt still follows ordinary retention and purge scrubbing.",
       "properties": {
         "data": {
           "$ref": "#/$defs/completedOperation"
@@ -109,6 +111,37 @@
       "required": [
         "data"
       ]
+    },
+    "operation_expired": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "MCP tool error structured content returned when the terminal receipt has expired. The command ID stays reserved.",
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "COMMAND_RESULT_EXPIRED"
+            },
+            "message": {
+              "$ref": "#/$defs/text"
+            },
+            "details": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "command_id": {
+                  "$ref": "#/$defs/uuid"
+                }
+              },
+              "required": ["command_id"]
+            }
+          },
+          "required": ["code", "message", "details"]
+        }
+      },
+      "required": ["error"]
     },
     "operation_failure": {
       "type": "object",

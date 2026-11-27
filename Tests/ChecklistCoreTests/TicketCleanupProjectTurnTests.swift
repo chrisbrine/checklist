@@ -1,4 +1,5 @@
 import ChecklistTestSupport
+import Dispatch
 import XCTest
 import GRDB
 @testable import ChecklistCore
@@ -6,6 +7,128 @@ import GRDB
 /// CL-392: one project must not hold every cleanup turn, a limit refusal must
 /// not repeat every minute, and cleanup's own outcome rows must not stop cleanup.
 extension TicketLifecycleCleanupTests {
+    func testCL520AutomaticPurgePreservesAnotherProjectsAttachmentReplyOnLegacyStore() throws {
+        try attachmentOperationAcrossAutomaticPurge(sameProject:false)
+    }
+
+    func testCL520AutomaticPurgeRetiresSameProjectAttachmentReply() throws {
+        try attachmentOperationAcrossAutomaticPurge(sameProject:true)
+    }
+
+    func testCL520AutomaticPurgeRetiresImportPreviewOfAnotherProjectsExport() throws {
+        let (source,closed,_) = try fixture(age:20)
+        let destination = try otherProjectForPurgeOverlap()
+        let export = directory.appendingPathComponent("source-export")
+        _ = try call("export_project",["project_id":source["id"]!,"path":export.path])
+        let input: JSON = ["project_id":destination["id"]!,"path":export.path,"source_format":"checklist-project/1",
+                           "source_namespace":"synthetic-export","command_id":uuid()]
+        let preview = try call("import_preview",input)
+        XCTAssertTrue(try jsonString(preview).contains(try XCTUnwrap(closed["title"] as? String)))
+        let selector = try operationAcrossAutomaticPurge("import_preview",input:input,purging:closed)
+        assertOperationReplyExpired(selector)
+        let replay = try router.handle(method:"import_preview",params:input,caller:owner)
+        XCTAssertEqual((replay["data"] as? JSON)?["operation_id"] as? String,selector["operation_id"] as? String)
+        XCTAssertEqual((replay["data"] as? JSON)?["state"] as? String,"succeeded")
+    }
+
+    private func otherProjectForPurgeOverlap() throws -> JSON {
+        let workspace = directory.appendingPathComponent("other-project")
+        try FileManager.default.createDirectory(at:workspace,withIntermediateDirectories:true)
+        let project = try call("project_create",["name":"Other project","key_prefix":"OP","root_path":workspace.path])
+        _ = try call("epic_create",["project_id":project["id"]!,"name":"Other project tickets"])
+        _ = try configure(project,settings:["done_evidence_enabled":false,"closed_purge_enabled":false,"closed_days":15])
+        return project
+    }
+
+    private func operationAcrossAutomaticPurge(_ method: String,input: JSON,purging closed: JSON) throws -> JSON {
+        let command = try XCTUnwrap(input["command_id"] as? String)
+        let id = CommandRouter.commandOperationID(principal:owner.principal,command:command)
+        let lane = DispatchQueue(label:"operation-across-automatic-purge")
+        let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        router.configureCommandOperations(on:lane)
+        router.commandOperations.executionProbe = {running in
+            guard running == id else {return}
+            entered.signal()
+            _ = release.wait(timeout:.now() + 20)
+        }
+        defer {
+            release.signal()
+            lane.sync {}
+            router.commandOperations.executionProbe = nil
+        }
+        let accepted = try router.handle(method:method,params:input,caller:owner)
+        XCTAssertEqual(accepted["command_outcome"] as? String,"accepted")
+        XCTAssertEqual((accepted["data"] as? JSON)?["operation_id"] as? String,id)
+        XCTAssertEqual(entered.wait(timeout:.now() + 10),.success)
+        let selector: JSON = ["project_id":try XCTUnwrap(input["project_id"] as? String),"operation_id":id]
+        XCTAssertEqual(try call("operation_get",selector)["state"] as? String,"running")
+        try router.runTicketLifecycleCleanup()
+        let purged = try read(closed)
+        XCTAssertTrue(bool(purged,"purged"))
+        XCTAssertEqual(purged["purged_by"] as? String,"system:ticket_cleanup")
+        XCTAssertEqual(try call("operation_get",selector)["state"] as? String,"running")
+        release.signal()
+        lane.sync {}
+        return selector
+    }
+
+    private func assertOperationReplyExpired(_ selector: JSON,file: StaticString = #filePath,line: UInt = #line) {
+        XCTAssertThrowsError(try call("operation_get",selector),file:file,line:line) {error in
+            XCTAssertEqual((error as? CoreError)?.code,"COMMAND_RESULT_EXPIRED",file:file,line:line)
+        }
+    }
+
+    private func attachmentOperationAcrossAutomaticPurge(sameProject: Bool) throws {
+        let (purgeProject,closed,_) = try fixture(age:20)
+        let activeProject = sameProject ? purgeProject : try otherProjectForPurgeOverlap()
+        let project = try XCTUnwrap(activeProject["id"] as? String)
+        let open = try call("task_create",["project_id":project,"title":"Open attachment work"])
+        let task = try XCTUnwrap(open["id"] as? String)
+        let source = URL(fileURLWithPath:try XCTUnwrap(activeProject["root_path"] as? String))
+            .appendingPathComponent("concurrent-attachment.txt")
+        let bytes = Data("The original attachment operation committed.".utf8)
+        try bytes.write(to:source)
+        if !sameProject {
+            // Reopen a store with just the legacy epoch, before any scoped key
+            // has been written for either project.
+            try router.dbQueue.write {db in
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('command-operation-purge-epoch',?)",arguments:[uuid()])
+            }
+            let root = router.root
+            try router.closeStore()
+            router = try TestStore.router(root:root)
+        }
+        let command = uuid()
+        let input: JSON = ["project_id":project,"task_id":task,"path":source.path,"command_id":command]
+        let selector = try operationAcrossAutomaticPurge("attachment_add",input:input,purging:closed)
+        func attachments() throws -> [JSON] {
+            try router.dbQueue.read {db in
+                try self.router.records(db,type:"attachment",project:project).filter {$0["task_id"] as? String == task}
+            }
+        }
+        let committed = try XCTUnwrap(try attachments().first)
+        if sameProject {
+            assertOperationReplyExpired(selector)
+            let receipt = try router.dbQueue.read {db in
+                try String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[self.owner.principal,command])
+            }
+            XCTAssertEqual(receipt,CommandRouter.prunedResult)
+        } else {
+            let status = try call("operation_get",selector)
+            XCTAssertEqual(status["state"] as? String,"succeeded")
+            let result = try XCTUnwrap(status["result"] as? JSON)
+            XCTAssertEqual(result["command_id"] as? String,command)
+            let attachment = try XCTUnwrap(result["data"] as? JSON)
+            XCTAssertEqual(attachment["id"] as? String,committed["id"] as? String)
+            XCTAssertEqual(attachment["sha256"] as? String,ChecklistCore.hash(bytes))
+        }
+        let replay = try router.handle(method:"attachment_add",params:input,caller:owner)
+        XCTAssertEqual((replay["data"] as? JSON)?["operation_id"] as? String,selector["operation_id"] as? String)
+        XCTAssertEqual((replay["data"] as? JSON)?["state"] as? String,"succeeded")
+        XCTAssertEqual(try attachments().count,1)
+        if sameProject {assertOperationReplyExpired(selector)}
+    }
+
     private func setDue(_ pid: String,at time: Double = 0) throws {
         try router.dbQueue.write {try $0.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + pid,String(time)])}
     }

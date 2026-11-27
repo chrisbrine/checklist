@@ -186,6 +186,6 @@ extension CommandRouter {
     static func isPrunedResult(_ result: JSON) -> Bool { result["pruned"] as? Bool == true && result["data"] == nil }
 
     static func expiredCommandError(_ command: String) -> CoreError {
-        CoreError("COMMAND_RESULT_EXPIRED", "This command ID already ran more than 30 days ago. Its stored result is no longer kept; read the current state instead of retrying.", details: ["command_id": command])
+        CoreError("COMMAND_RESULT_EXPIRED", "This command's stored reply is no longer available. Read the current state before starting a new command.", details: ["command_id": command])
     }
 }

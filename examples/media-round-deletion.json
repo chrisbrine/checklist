@@ -218,6 +218,15 @@
       "revision": 0
     }
   },
+  "operation_expired": {
+    "error": {
+      "code": "COMMAND_RESULT_EXPIRED",
+      "message": "This command's stored reply is no longer available. Read the current state before starting a new command.",
+      "details": {
+        "command_id": "00000000-0000-4000-8000-000000000903"
+      }
+    }
+  },
   "operation_failure": {
     "data": {
       "operation_id": "00000000-0000-4000-8000-000000000911",

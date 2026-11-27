@@ -122,6 +122,14 @@ Purge replaces the ticket with an immutable **Purged ticket** reference retainin
 
 After the ticket records are permanently removed, Checklist cleans up managed originals, previews and captured-source files that belonged only to that ticket, including captured file lists and links. Before deleting each file, it checks again for reasons to keep it: shared references, Keep original, files in use by readers or media, backup protection, workspace overlap or uncertainty about ownership. A captured symbolic link that is kept also keeps every link in its target chain and the final file. Cleanup runs after the purge commits and may finish later; its receipt reports files removed, kept, pending or already missing, with reasons. Reported file sizes do not measure reclaimed disk space or promise secure erasure. External originals and workspace files are never deleted. Known backup counts and recorded times come from existing metadata; unrecorded backups/exports may also contain the ticket. **Checklist does not change existing backups or exports; delete those copies yourself if needed.** Automatic CL-193 project ticket-cleanup rules also remove eligible Done-ticket evidence and purge closed Done/Canceled tickets after the configured age (default 15 days), with the same ownership and retention checks; see [automatic ticket cleanup](archive-cleanup.md#done-evidence-and-aged-closed-tickets-cl-193). No backup indexing, secure erasure or conversation-redaction system is added.
 
+### Expired long-command replies (CL-520)
+
+`operation_get` reads `COMMAND_RESULT_EXPIRED` when a terminal result or error receipt is missing or retired. Ordinary retention can retire a receipt after 30 days. A ticket purge or media round deletion can scrub an existing receipt. Ticket purge also conservatively scrubs large operation snapshots, import previews and stored failure details.
+
+From execution start to the terminal receipt write, a ticket purge (including automatic cleanup) or media round deletion in the same project retires an in-flight project reply. Operations without a project, whole-store backup, restore and backup retention, import preview and import commit use the store-wide check. Successful ticket purge and round deletion summaries skip the overlap check because those operations advance the epoch themselves. Their existing receipts can still be scrubbed.
+
+Expiry leaves the original command ID reserved and can follow a committed action. Read the current ticket, attachment or other affected record before starting a new command. See the [long-command contract](mcp-contract.md#long-command-operations-cl-353).
+
 ## Diagnose a busy service queue (CL-462)
 
 The service records each completed command-queue callback that takes more than

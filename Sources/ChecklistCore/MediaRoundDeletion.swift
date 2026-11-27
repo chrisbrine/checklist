@@ -152,7 +152,7 @@ extension CommandRouter {
                     for (principal,id) in plan.commands {
                         try db.execute(sql:"UPDATE commands SET result=? WHERE principal=? AND command_id=?",arguments:[Self.prunedResult,principal,id])
                     }
-                    try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('command-operation-purge-epoch',?)",arguments:[uuid()])
+                    try CommandOperationPurgeEpoch.advance(db,project:project)
                     try self.event(db,caller:c,project:project,entity:plan.round,kind:"media_round_deleted",data:plan.audit)
                     result = try self.mediaRoundDeletionView(receipt)
                     try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[c.principal,command,digest,try jsonString(result)])

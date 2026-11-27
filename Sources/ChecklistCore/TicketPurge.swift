@@ -357,7 +357,7 @@ extension CommandRouter {
         }
         // Retire in-flight operation snapshots before they can publish private
         // replies captured on the other side of this permanent-removal commit.
-        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('command-operation-purge-epoch',?)",arguments:[uuid()])
+        try CommandOperationPurgeEpoch.advance(db,project:pid)
         let expired = receipts.count
         let deletion = try enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"task_purge",plan:plan.byteDeletion)
         for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(pid.utf8),Data(row.type.utf8)])}

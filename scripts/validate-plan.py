@@ -244,6 +244,12 @@ def check() -> dict:
     bad['operation_result']['data']['state'] = 'running'
     reject('media-round-deletion', bad, 'completion claim for running operation')
     bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_expired']['error']['details'].pop('command_id')
+    reject('media-round-deletion', bad, 'expired receipt without original command ID')
+    bad = copy.deepcopy(examples['media-round-deletion'])
+    bad['operation_expired']['error']['code'] = 'OPERATION_INTERRUPTED'
+    reject('media-round-deletion', bad, 'interruption presented as receipt expiry')
+    bad = copy.deepcopy(examples['media-round-deletion'])
     bad['accepted']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
     reject('media-round-deletion', bad, 'fabricated result for queued operation')
     for section in ('accepted', 'operation_result'):
