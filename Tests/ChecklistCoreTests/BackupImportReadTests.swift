@@ -178,7 +178,7 @@ final class BackupImportReadTests: XCTestCase {
             ("media_type_list",[:]),("media_type_get",["type_id":type["id"]!]),("media_round_get",["round_id":round["id"]!]),
             ("media_decision_list",["round_id":round["id"]!]),("media_intake_get",["intake_id":ownIntake["id"]!]),
             ("media_rework_preview",["round_id":round["id"]!,"epic_id":epic,"items":[["item_id":ids[0]]]]),
-            ("media_round_deletion_get",["round_id":deletedDraft["id"]!])]
+            ("media_round_deletion_get",["round_id":deletedDraft["id"]!]),("media_round_list",[:])]
         XCTAssertEqual(Set(workerRoutes.map { $0.0 }),CommandRouter.mediaWorkerReads)
         let assistant = Caller(role:"assistant",installation:"synthetic-assistant",projectIDs:[f.project])
         let before = try f.allState()
@@ -214,6 +214,10 @@ final class BackupImportReadTests: XCTestCase {
                 case "media_round_get":XCTAssertEqual((data["items"] as? [JSON])?.count,2)
                 case "media_decision_list":XCTAssertEqual((data["rows"] as? [JSON])?.count,2)
                 case "media_round_deletion_get":XCTAssertEqual(data["round_id"] as? String,deletedDraft["id"] as? String)
+                case "media_round_list":
+                    // CL-517: the list answers from the pooled reader during the backup's writer lease.
+                    let listed = (data["rounds"] as? [JSON] ?? []).compactMap {$0["id"] as? String}
+                    XCTAssertTrue(listed.contains(round["id"] as! String));XCTAssertFalse(listed.contains(deletedDraft["id"] as! String))
                 case "media_rework_preview":
                     XCTAssertEqual((data["items"] as? [JSON])?.count,1)
                     XCTAssertFalse((data["preview_digest"] as? String ?? "").isEmpty)

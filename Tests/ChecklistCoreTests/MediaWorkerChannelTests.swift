@@ -316,6 +316,158 @@ final class MediaWorkerChannelTests: XCTestCase {
         checks.checkError("RECIPIENT_CHANGED") {try decisions(f,created,limit:1,cursor:fresh["next_cursor"] as? String)}
     }
 
+    // CL-517: agents list the project's rounds without the owner's round page.
+    func list(_ f: Fixture,_ input: JSON = [:],as caller: Caller? = nil) throws -> JSON {
+        try worker(f,"media_round_list",input,as:caller)
+    }
+    func ids(_ page: JSON) -> [String] { (page["rounds"] as? [JSON] ?? []).compactMap {$0["id"] as? String} }
+    /// The stored (created_at, id) order of this project's existing rounds.
+    func storedOrder(_ f: Fixture) throws -> [String] {
+        try f.rows("media_round").map {($0["created_at"] as? String ?? "",$0["id"] as! String)}
+            .sorted {$0.0 == $1.0 ? Array($0.1.utf8).lexicographicallyPrecedes(Array($1.1.utf8)) : Array($0.0.utf8).lexicographicallyPrecedes(Array($1.0.utf8))}.map {$0.1}
+    }
+    func setStored(_ f: Fixture,_ id: Any?,_ path: String,_ value: String) throws {
+        // Fixture-only state that no public command makes in one step (a closed round, a tied creation time).
+        try f.router.dbQueue.write {try $0.execute(sql:"UPDATE records SET data=json_set(data,?,?) WHERE id=? AND type='media_round'",arguments:[path,value,id as! String])}
+    }
+    func cancel(_ f: Fixture,_ round: JSON) throws -> JSON {
+        let current = try f.record(round["id"] as! String,"media_round")
+        return try worker(f,"media_round_cancel",["round_id":round["id"]!,"expected_revision":current["revision"]!,"reason":"Synthetic list fixture"])
+    }
+
+    func testRoundListFiltersStateAndTaskAndOmitsDeletedRounds() throws {
+        let f = try Fixture(),type = try f.type(checks.schema())
+        let task = try f.router.handle(method:"task_create",params:fixtureTaskInput(f.router,method:"task_create",input:["command_id":uuid(),"project_id":f.project,"title":"Round list ticket"]),caller:f.owner)["data"] as! JSON
+        let linked = try worker(f,"media_round_create",["type_id":type["id"]!,"title":"Linked draft","task_id":task["id"]!])
+        let opened = try round(f,type);_ = try f.item(opened);_ = try f.publish(opened)
+        let canceled = try round(f,type);_ = try cancel(f,canceled)
+        let archived = try round(f,type),archiveCancel = try cancel(f,archived)
+        _ = try worker(f,"media_round_archive",["round_id":archived["id"]!,"expected_revision":archiveCancel["revision"]!])
+        let closed = try round(f,type);try setStored(f,closed["id"],"$.state","closed")
+        let deleted = try round(f,type),deleteCancel = try cancel(f,deleted)
+        _ = try f.call("media_round_delete",["round_id":deleted["id"]!,"expected_revision":deleteCancel["revision"]!,"reason":"Synthetic list fixture"])
+        checks.checkError("NOT_FOUND") {try f.record(deleted["id"] as! String,"media_round")}
+
+        let all = try list(f),order = try storedOrder(f)
+        XCTAssertEqual(ids(all),order);XCTAssertEqual(order.count,5)
+        XCTAssertFalse(ids(all).contains(deleted["id"] as! String),"A deleted round has no record and does not show")
+        XCTAssertTrue(all["next_cursor"] is NSNull)
+        for row in all["rounds"] as! [JSON] {
+            XCTAssertEqual(Set(row.keys),["id","title","state","revision","type_id","task","created_at"])
+            XCTAssertEqual(row["type_id"] as? String,type["id"] as? String)
+            XCTAssertNotNil(row["revision"] as? Int);XCTAssertNotNil(row["created_at"] as? String)
+            if row["id"] as? String == linked["id"] as? String {
+                XCTAssertEqual(row["task"] as? [String:String],["id":task["id"] as! String,"key":task["key"] as! String])
+                XCTAssertEqual(row["title"] as? String,"Linked draft")
+            } else {XCTAssertTrue(row["task"] is NSNull)}
+        }
+        let expected: [String:String] = ["draft":linked["id"] as! String,"open":opened["id"] as! String,"closed":closed["id"] as! String,
+            "canceled":canceled["id"] as! String,"archived":archived["id"] as! String]
+        for (state,id) in expected {
+            let page = try list(f,["state":[state]])
+            XCTAssertEqual(ids(page),[id],state);XCTAssertEqual((page["rounds"] as! [JSON]).first?["state"] as? String,state)
+        }
+        XCTAssertEqual(Set(ids(try list(f,["state":["canceled","archived","closed"]]))),[canceled["id"] as! String,archived["id"] as! String,closed["id"] as! String])
+        XCTAssertEqual(ids(try list(f,["task_id":task["id"]!])),[linked["id"] as! String])
+        XCTAssertEqual(ids(try list(f,["task_id":task["key"]!])),[linked["id"] as! String],"A ticket key selects the same rounds")
+        XCTAssertEqual(ids(try list(f,["task_id":task["id"]!,"state":["open"]])),[])
+        for bad: JSON in [["state":["deleted"]],["state":[String]()],["state":"open"],["limit":0],["limit":101],["include_deleted":true]] {
+            checks.checkError("INVALID_INPUT") {try self.list(f,bad)}
+        }
+        // Another project's ticket is NOT_FOUND here, by ID and by key.
+        let foreignWorkspace = f.base.appendingPathComponent("foreign-list-workspace")
+        try FileManager.default.createDirectory(at:foreignWorkspace,withIntermediateDirectories:true)
+        let foreign = try f.router.handle(method:"project_create",params:["command_id":uuid(),"name":"Foreign list fixture","key_prefix":"FL","root_path":foreignWorkspace.path],caller:f.owner)["data"] as! JSON
+        let foreignTask = try f.router.handle(method:"task_create",params:fixtureTaskInput(f.router,method:"task_create",input:["command_id":uuid(),"project_id":foreign["id"]!,"title":"Foreign ticket"]),caller:f.owner)["data"] as! JSON
+        checks.checkError("NOT_FOUND") {try self.list(f,["task_id":foreignTask["id"]!])}
+        checks.checkError("NOT_FOUND") {try self.list(f,["task_id":foreignTask["key"]!])}
+    }
+
+    func testRoundListPagesInCreatedOrderAndBindsCursorToScopeAndFilter() throws {
+        let f = try Fixture(),type = try f.type(checks.schema())
+        let rounds = try (0..<5).map {_ in try round(f,type)}
+        // Two rounds with one creation time page in id order.
+        try setStored(f,rounds[4]["id"],"$.created_at",try f.record(rounds[1]["id"] as! String,"media_round")["created_at"] as! String)
+        var seen: [String] = [],cursor: String?,pages = 0
+        repeat {
+            var p: JSON = ["limit":2];p["cursor"] = cursor
+            let page = try list(f,p);pages += 1
+            XCTAssertLessThanOrEqual(ids(page).count,2);seen += ids(page)
+            cursor = page["next_cursor"] as? String
+            XCTAssertTrue(cursor != nil || page["next_cursor"] is NSNull)
+        } while cursor != nil && pages < 10
+        XCTAssertEqual(pages,3);XCTAssertEqual(seen,try storedOrder(f));XCTAssertEqual(Set(seen).count,5)
+        XCTAssertEqual(ids(try list(f,["limit":5])),seen);XCTAssertTrue(try list(f,["limit":5])["next_cursor"] is NSNull)
+        let first = try list(f,["limit":2]),token = try XCTUnwrap(first["next_cursor"] as? String)
+        XCTAssertEqual(ids(try list(f,["limit":2,"cursor":token])),Array(seen[2..<4]))
+        // The cursor binds to the caller, the project and the exact filter.
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":3,"cursor":token])}
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":2,"state":["draft"],"cursor":token])}
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":2,"cursor":token],as:try self.secondWorker(f))}
+        let offset = token.index(token.startIndex,offsetBy:token.count / 2)
+        var tampered = token;tampered.replaceSubrange(offset...offset,with:token[offset] == "A" ? "B" : "A")
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":2,"cursor":tampered])}
+        let decisionCursor = try XCTUnwrap(decisions(f,rounds[0],limit:1)["next_cursor"] as? String)
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":2,"cursor":decisionCursor])}
+        let foreignWorkspace = f.base.appendingPathComponent("foreign-cursor-workspace")
+        try FileManager.default.createDirectory(at:foreignWorkspace,withIntermediateDirectories:true)
+        let foreign = try f.router.handle(method:"project_create",params:["command_id":uuid(),"name":"Foreign cursor fixture","key_prefix":"FC","root_path":foreignWorkspace.path],caller:f.owner)["data"] as! JSON
+        checks.checkError("FORBIDDEN") {try self.list(f,["project_id":foreign["id"]!,"limit":2,"cursor":token])}
+        try f.router.dbQueue.write {db in
+            var session = try f.router.record(db,f.worker.sessionID!,type:"session")
+            session["authorization_generation"] = uuid();try f.router.save(db,f.router.revised(session),type:"session")
+        }
+        checks.checkError("CURSOR_RESET") {try self.list(f,["limit":2,"cursor":token])}
+        // A round deleted between pages does not break the key cursor: the next page starts after the old key.
+        let fresh = try list(f,["limit":2]),next = try XCTUnwrap(fresh["next_cursor"] as? String)
+        let gone = rounds.first {$0["id"] as? String == seen[1]}!,gone2 = try cancel(f,gone)
+        _ = try f.call("media_round_delete",["round_id":gone["id"]!,"expected_revision":gone2["revision"]!,"reason":"Synthetic list fixture"])
+        XCTAssertEqual(ids(try list(f,["limit":2,"cursor":next])),Array(seen[2..<4]))
+    }
+
+    func testRoundListIsWorkerOnlyReadAndUsesTheScopeIndex() throws {
+        let f = try Fixture(),type = try f.type(checks.schema());_ = try round(f,type)
+        let assistant = Caller(role:"assistant",installation:"synthetic-assistant",projectIDs:[f.project],assistantGrants:[f.project:["read":true]])
+        // The owner keeps media_round_page; this name stays outside the owner's slice and catalog.
+        for (caller,code) in [(f.owner,"UNSUPPORTED_METHOD"),(assistant,"FORBIDDEN")] {
+            XCTAssertThrowsError(try f.router.handle(method:"media_round_list",params:["project_id":f.project],caller:caller)) {
+                XCTAssertEqual(($0 as? CoreError)?.code,code,caller.role)
+            }
+            XCTAssertFalse(f.router.toolCatalog(caller).contains {$0["name"] as? String == "media_round_list"},caller.role)
+        }
+        let tool = try XCTUnwrap(f.router.toolCatalog(f.worker).first {$0["name"] as? String == "media_round_list"})
+        XCTAssertEqual((tool["annotations"] as? JSON)?["readOnlyHint"] as? Bool,true)
+        XCTAssertTrue((tool["description"] as? String ?? "").contains("media_round_deletion_get"))
+        let schema = try XCTUnwrap(tool["inputSchema"] as? JSON)
+        XCTAssertEqual(Set((schema["properties"] as? JSON ?? [:]).keys),["project_id","state","task_id","limit","cursor"])
+        XCTAssertEqual(schema["required"] as? [String],["project_id"])
+        // The write role rules do not change: no command_id, no setting gate, no new write method.
+        XCTAssertFalse(MediaWorkerContract.settingMethods.contains("media_round_list"))
+        let before = try f.allState();_ = try list(f,["state":["draft"]]);XCTAssertEqual(try f.allState(),before)
+        // The query plan selects the project's rounds through an index, never a full table scan.
+        let plan = try f.router.dbQueue.read {db in
+            try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + CommandRouter.mediaRoundListSQL(states:2,task:true,after:true),
+                arguments:[Data(f.project.utf8),Data("draft".utf8),Data("open".utf8),Data("task".utf8),Data("t".utf8),Data("t".utf8),Data("id".utf8),51]).map {$0["detail"] as String}
+        }
+        print("CL517 media_round_list query plan: " + plan.joined(separator:" | "))
+        XCTAssertTrue(plan.contains {$0.contains("records_scope")},plan.joined(separator:" | "))
+        XCTAssertFalse(plan.contains {$0.hasPrefix("SCAN records") && !$0.contains("INDEX")},plan.joined(separator:" | "))
+    }
+
+    func testRoundListWithoutReaderPoolRefusesAtOnceAndNeverUsesTheWriter() throws {
+        CommandRouter.disableReaderPoolForTesting = true
+        defer {CommandRouter.disableReaderPoolForTesting = false}
+        let f = try Fixture(),type = try f.type(checks.schema()),created = try round(f,type)
+        XCTAssertNil(f.router.readers)
+        let before = try f.allState(),started = Date()
+        XCTAssertThrowsError(try list(f)) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_READ_LANE_UNAVAILABLE")}
+        XCTAssertLessThan(Date().timeIntervalSince(started),1)
+        XCTAssertEqual(try f.allState(),before)
+        // The other worker reads keep their existing writer-admitted fallback.
+        XCTAssertNoThrow(try get(f,created))
+        XCTAssertThrowsError(try list(f,["state":["draft"]])) {XCTAssertEqual(($0 as? CoreError)?.code,"MEDIA_READ_LANE_UNAVAILABLE")}
+    }
+
     func testWorkerRoundReadOmitsOwnerIdentityAndPrivateContextBodies() throws {
         let f = try Fixture(),type = try f.type(checks.schema()),created = try f.round(type)
         _ = try f.call("media_context_approve",["kind":"direction","round_id":created["id"]!,"body":"PRIVATE_OWNER_CONTEXT_BODY"])

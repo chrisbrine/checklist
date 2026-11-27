@@ -106,6 +106,8 @@ public final class CommandRouter: @unchecked Sendable {
     var exportPublications: [ExportPublication] = []
     /// Internal phase observer for explicit owned-copy memory qualification.
     nonisolated(unsafe) static var qualificationStartupObserve: ((String) -> Void)?
+    /// Tests only: open the router without its read-only pool, as when the pool cannot open.
+    nonisolated(unsafe) static var disableReaderPoolForTesting = false
     public convenience init(root: URL, serviceLease: StorageServiceLease? = nil, cliCommand: String = "/Applications/Checklist.app/Contents/MacOS/checklist", providerPlugins: ProviderPluginRegistry = .bundled, automaticBackupRetentionTrashRoot: URL? = nil) throws {
         try self.init(root:root,serviceLease:serviceLease,cliCommand:cliCommand,providerPlugins:providerPlugins,
                       automaticBackupRetentionTrashRoot:automaticBackupRetentionTrashRoot,fixtureTrackEpicReferences:true)
@@ -153,7 +155,7 @@ public final class CommandRouter: @unchecked Sendable {
             try SchemaMigrations.installStorageCollation(db); Self.installTicketSearchFunctions(db)
             try db.execute(sql:"PRAGMA busy_timeout=5000")
         }
-        self.readers = try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
+        self.readers = Self.disableReaderPoolForTesting ? nil : try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
         // Authority reconciliation must commit even when unrelated maintenance is broken.
         do {
             try commandOperations.restoreAdmissions(root:root,incarnation:incarnation) {try self.validateOperationRecord($0,id:$1)}
@@ -474,7 +476,12 @@ public final class CommandRouter: @unchecked Sendable {
         // Worker media uses the same prepared capture boundary, with a separate
         // allowlist and projections. An overlapping name never grants owner authority.
         if caller.role == "worker", Self.mediaWorkerMethods.contains(method) {
-            // Worker reads use the pool; without it, admit the writer atomically with capture.
+            // CL-517: the round list is a reader-only query. Without the pool it refuses at once;
+            // it never waits for, or runs behind, writer admission.
+            if method == "media_round_list", readers == nil {
+                throw CoreError("MEDIA_READ_LANE_UNAVAILABLE","The round list needs a separate read lane. Retry the list.")
+            }
+            // Other worker reads use the pool; without it, admit the writer atomically with capture.
             let writerRead = Self.mediaWorkerReads.contains(method) && readers == nil
             if writerRead {
                 switch backupWrites.admitWriterDependentRead() {

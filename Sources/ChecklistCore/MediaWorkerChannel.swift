@@ -30,6 +30,8 @@ extension CommandRouter {
                 let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_review_type' AND json_extract(data,'$.enabled')=1 ORDER BY id COLLATE BINARY LIMIT 9",arguments:[Data(project.utf8)])
                 guard rows.count <= 8 else {throw CoreError("CAPACITY_EXCEEDED","The project exceeds its enabled media type bound.")}
                 return ["types":try rows.map {try self.mediaWorkerType(db,GRDBRecordEnvelopeAdapter.decode($0,expectedType:"media_review_type").object,project:project)}]
+            case "media_round_list":
+                return try self.mediaWorkerRoundList(db,p:p,c:c,project:project)
             case "media_type_get":
                 return try self.mediaWorkerType(db,self.scoped(db,text(p,"type_id"),project,type:"media_review_type"),project:project)
             case "media_rework_preview":
@@ -200,6 +202,84 @@ extension CommandRouter {
         let cursor = try cursor(db,caller:c,scope:scope,sequence:selected.last.map {$0["media_position"] as Int} ?? after)
         return ["round_id":roundID,"rows":rows.map(mediaWorkerDecision),"has_more":records.count > limit,
             "cursor":cursor,"next_cursor":cursor]
+    }
+
+    /// CL-517: the SQL of one `media_round_list` page. `records_scope` selects the project's
+    /// rounds; the filters and the (created_at, id) key run in SQL, so no read loads every round.
+    static func mediaRoundListSQL(states: Int,task: Bool,after: Bool) -> String {
+        let created = "COALESCE(json_extract(data,'$.created_at'),'')"
+        var sql = "SELECT " + canonicalRecordColumns + "," + created + " AS media_created_at" +
+            " FROM records WHERE project_id=CAST(? AS TEXT) AND type='media_round'"
+        if states > 0 {
+            sql += " AND json_extract(data,'$.state') IN (" + Array(repeating:"CAST(? AS TEXT)",count:states).joined(separator:",") + ")"
+        }
+        if task {sql += " AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY"}
+        if after {
+            sql += " AND (" + created + ">CAST(? AS TEXT) COLLATE BINARY OR (" + created +
+                "=CAST(? AS TEXT) COLLATE BINARY AND id>CAST(? AS TEXT) COLLATE BINARY))"
+        }
+        return sql + " ORDER BY media_created_at COLLATE BINARY,id COLLATE BINARY LIMIT ?"
+    }
+
+    /// CL-517: a bounded page of this project's rounds for agents. A deleted round has no
+    /// record, so it never shows; its receipt stays with `media_round_deletion_get`.
+    /// The sealed cursor keeps the last (created_at, id) and binds to the caller scope,
+    /// the project and the exact filter, like the other media query cursors.
+    func mediaWorkerRoundList(_ db: Database,p: JSON,c: Caller,project: String) throws -> JSON {
+        let limit = try MediaConfigurationValue.integer(p["limit"] ?? 50,min:1,max:100,"limit")
+        var states: [String] = []
+        if let raw = p["state"] {
+            guard let values = raw as? [String],!values.isEmpty,Set(values).isSubset(of:MediaWorkerContract.roundListStates) else {
+                throw CoreError("INVALID_INPUT","state lists one or more of draft, open, closed, canceled and archived.")
+            }
+            states = MediaWorkerContract.roundListStates.filter(values.contains)
+        }
+        var taskID: String?
+        if p["task_id"] != nil {
+            // A ticket ID or display key of this project; another project's ticket is NOT_FOUND.
+            let value = try text(p,"task_id")
+            let task: JSON
+            do {task = try scoped(db,value,project,type:"task")}
+            catch let error as CoreError where error.code == "NOT_FOUND" {task = try self.task(db,["key":value],project)}
+            taskID = try StoredRecord(task,family:"task").string("id")
+        }
+        let binding = try mediaQueryBinding(db,p,c,project:project,method:"media_round_list")
+        var after: (created: String,id: String)?
+        if let token = p["cursor"] {
+            guard let token = token as? String else {throw CoreError("CURSOR_RESET","Refresh this media round list.")}
+            let window = try MediaQueryCursor.open(token,binding:binding,key:cursorKey)
+            guard let created = window["after_created_at"] as? String,let id = window["after_id"] as? String else {
+                throw CoreError("CURSOR_RESET","Refresh this media round list.")
+            }
+            after = (created,id)
+        }
+        var arguments: StatementArguments = [Data(project.utf8)]
+        arguments += StatementArguments(states.map {Data($0.utf8)})
+        if let taskID {arguments += [Data(taskID.utf8)]}
+        if let after {arguments += [Data(after.created.utf8),Data(after.created.utf8),Data(after.id.utf8)]}
+        arguments += [limit + 1]
+        let rows = try Row.fetchAll(db,sql:Self.mediaRoundListSQL(states:states.count,task:taskID != nil,after:after != nil),arguments:arguments)
+        let selected = Array(rows.prefix(limit))
+        var lastKey: (created: String,id: String)?
+        let rounds = try selected.map { row -> JSON in
+            let round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object
+            let id = try StoredRecord(round,family:"media_round").string("id")
+            lastKey = (row["media_created_at"] as String,id)
+            var task: Any = NSNull()
+            if let linked = round["task_id"] as? String {
+                // A live key only; a ticket that is no longer readable keeps its ID with a null key.
+                task = ["id":linked,"key":(try? self.scoped(db,linked,project,type:"task"))?["key"] ?? NSNull()] as JSON
+            }
+            return ["id":id,"title":round["title"] ?? NSNull(),"state":round["state"] ?? NSNull(),
+                    "revision":round["revision"] ?? NSNull(),"type_id":round["type_id"] ?? NSNull(),"task":task,
+                    "created_at":round["created_at"] ?? NSNull()]
+        }
+        var next: Any = NSNull()
+        if rows.count > limit,let lastKey {
+            next = try MediaQueryCursor.seal(["created":Date().timeIntervalSince1970,"after_created_at":lastKey.created,
+                "after_id":lastKey.id],binding:binding,key:cursorKey)
+        }
+        return ["rounds":rounds,"next_cursor":next]
     }
 
     /// Bounded owner display of actual worker suggestions, separate from decisions.

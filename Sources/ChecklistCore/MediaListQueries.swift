@@ -6,7 +6,8 @@ import GRDB
 
 /// Internal canonical projections. Cursors retain only a bounded ordered reference index,
 /// never candidates/originals, a database snapshot, a runtime worker or a second store.
-private enum MediaQueryCursor {
+/// CL-517: `media_round_list` reuses this sealed window and its query binding.
+enum MediaQueryCursor {
     static let prefix = "ml1."
     static let maximumBytes = 1_400_000
     /// Larger reference indexes are not sealed; the cursor keeps their digest instead.
@@ -30,7 +31,7 @@ private enum MediaQueryCursor {
 }
 
 extension CommandRouter {
-    private func mediaQueryBinding(_ db: Database,_ p: JSON,_ c: Caller,project: String,method: String) throws -> Data {
+    func mediaQueryBinding(_ db: Database,_ p: JSON,_ c: Caller,project: String,method: String) throws -> Data {
         var query = p;query.removeValue(forKey:"cursor");query.removeValue(forKey:"command_id")
         let identity: JSON = ["method":method,"query":query,"scope":try authorizationScope(db,c),
             "workspace":c.workspace ?? "","generation":try callerSessionGeneration(db,c,project:project)]

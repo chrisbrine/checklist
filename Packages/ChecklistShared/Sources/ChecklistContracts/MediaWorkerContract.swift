@@ -6,9 +6,13 @@ public enum MediaWorkerContract {
     public static let readMethods: Set<String> = [
         "media_type_list", "media_type_get", "media_round_get", "media_intake_get", "media_decision_list",
         "media_round_deletion_get",
+        // CL-517: agents find the rounds to close, archive or delete without the owner's round page.
+        "media_round_list",
         // CL-420: the read-only rework preview supplies the exact preview_digest for media_rework_create.
         "media_rework_preview",
     ]
+    /// CL-517: the round states that `media_round_list` filters on, in display order.
+    public static let roundListStates = ["draft", "open", "closed", "canceled", "archived"]
     public static let methods: Set<String> = readMethods.union([
         "media_intake_preview", "media_intake_revise",
         "media_intake_confirm", "media_intake_capture", "media_suggest", "media_follow_up_record",
@@ -121,6 +125,12 @@ public enum MediaWorkerContract {
             required += ["round_id", "expected_revision", "observed_context_token", "manifest_id", "manifest_digest", "epic_id", "preview_digest", "items"]
         case "media_round_deletion_get":
             properties["round_id"] = text(4_000); required += ["round_id"]
+        case "media_round_list":
+            properties["state"] = ["type": "array", "minItems": 1, "maxItems": 5,
+                "items": ["type": "string", "enum": roundListStates]]
+            properties["task_id"] = text(4_000)
+            properties["limit"] = ["type": "integer", "minimum": 1, "maximum": 100, "default": 50]
+            properties["cursor"] = text(4_096)
         case "media_round_get", "media_decision_list":
             properties["round_id"] = text(4_000)
             properties["cursor"] = text(method == "media_round_get" ? 1_400_000 : 512)

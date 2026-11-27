@@ -7,7 +7,7 @@ final class MediaWorkerContractTests: XCTestCase {
     private let fixtureDigest = String(repeating: "a", count: 64)
 
     func testClosedWorkerCatalogAndReadClassification() throws {
-        XCTAssertEqual(MediaWorkerContract.methods.count, 13 + MediaWorkerContract.settingMethods.count, "CL-446 adds the content-free deletion read")
+        XCTAssertEqual(MediaWorkerContract.methods.count, 14 + MediaWorkerContract.settingMethods.count, "CL-446 adds the content-free deletion read; CL-517 adds the round list")
         XCTAssertEqual(MediaWorkerContract.settingMethods.count, 16)
         XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_rework_preview"))
         XCTAssertEqual(CommandMethods.mediaWorkerReads, MediaWorkerContract.readMethods)
@@ -31,6 +31,22 @@ final class MediaWorkerContractTests: XCTestCase {
         }
         XCTAssertNoThrow(try MediaWorkerContract.validate("media_type_list", parameters: ["project_id": "project"]))
         XCTAssertThrowsError(try MediaWorkerContract.validate("media_type_list", parameters: ["project_id": "project", "include_draft": true]))
+    }
+
+    func testRoundListIsAClosedReadWithStateTaskLimitAndCursor() throws {
+        XCTAssertTrue(MediaWorkerContract.readMethods.contains("media_round_list"))
+        XCTAssertFalse(MediaWorkerContract.settingMethods.contains("media_round_list"))
+        XCTAssertTrue(CommandMethods.coreReads.contains("media_round_list"))
+        let schema = try XCTUnwrap(MediaWorkerContract.inputSchema("media_round_list"))
+        XCTAssertEqual(schema["required"] as? [String], ["project_id"])
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_round_list", parameters: ["project_id": "p"]))
+        XCTAssertNoThrow(try MediaWorkerContract.validate("media_round_list", parameters: [
+            "project_id": "p", "state": MediaWorkerContract.roundListStates, "task_id": "CL-1", "limit": 100, "cursor": "ml1.x"]))
+        for bad: [String: Any] in [["state": []], ["state": ["deleted"]], ["state": "open"], ["limit": 0], ["limit": 101],
+                                   ["task_id": ""], ["command_id": UUID().uuidString], ["include_deleted": true]] {
+            var p = bad; p["project_id"] = "p"
+            XCTAssertThrowsError(try MediaWorkerContract.validate("media_round_list", parameters: p), "\(bad)")
+        }
     }
 
     func testRoundDeletionRequiresReasonRevisionAndFreshCommandEnvelope() throws {
