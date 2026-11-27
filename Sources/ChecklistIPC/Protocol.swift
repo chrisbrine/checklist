@@ -24,10 +24,12 @@ public struct ChecklistError: LocalizedError {
     /// A detached value snapshot: callers never receive shared diagnostic objects.
     public var details: [String: Any] { detailValues.mapValues(\.value) }
     public var errorDescription: String? {
+        let details = self.details
         let identity = (details["command_id"] as? String).map { " Command ID: \($0)." } ?? ""
+        let operation = (details["operation_id"] as? String).map { " Operation ID: \($0)." } ?? ""
         let reason = ["BACKUP_CAPACITY_EXCEEDED", "BACKUP_DEADLINE_EXCEEDED"].contains(code)
             ? (details["reason"] as? String).map { " Reason: \($0)." } ?? "" : ""
-        return "\(code): \(message)" + reason + identity
+        return "\(code): \(message)" + reason + identity + operation
     }
     public init(_ code: String, _ message: String, details: [String: Any] = [:]) { self.code = code; self.message = message; self.detailValues = details.mapValues(DiagnosticValue.init) }
 }

@@ -232,7 +232,7 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['result']['counts']['media_item'] = -1
     reject('media-round-deletion', bad, 'negative record count')
-    for section in ('accepted', 'operation_get', 'operation_wait', 'operation_result'):
+    for section in ('accepted', 'operation_get', 'operation_wait', 'operation_wait_failed', 'operation_result'):
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad.pop(section)
         reject('media-round-deletion', bad, 'missing operation example ' + section)
@@ -252,6 +252,13 @@ def check() -> dict:
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad['operation_wait']['params']['wait_seconds'] = value
         reject('media-round-deletion', bad, 'invalid operation wait duration')
+    for field in ('command_id', 'operation_id'):
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_wait_failed']['error']['details'].pop(field)
+        reject('media-round-deletion', bad, 'wait failure missing ' + field)
+        bad = copy.deepcopy(examples['media-round-deletion'])
+        bad['operation_wait_failed']['error']['details'][field] = 'not-a-uuid'
+        reject('media-round-deletion', bad, 'wait failure invalid ' + field)
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_result']['data']['state'] = 'running'
     reject('media-round-deletion', bad, 'completion claim for running operation')

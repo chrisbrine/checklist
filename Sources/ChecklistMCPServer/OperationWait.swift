@@ -140,6 +140,12 @@ public enum OperationWait {
                     let commandID = data["command_id"] as? String
                     var failure: [String: Any] = [:]
                     failure["error"] = data["error"]
+                    if let operationID = identity["operation_id"], var error = data["error"] as? [String: Any] {
+                        var details = error["details"] as? [String: Any] ?? [:]
+                        details["operation_id"] = operationID
+                        error["details"] = details
+                        failure["error"] = error
+                    }
                     failure["command_id"] = commandID
                     _ = try CommandReply.decode(try jsonData(failure), method: "", commandID: commandID)
                     throw CommandReply.unknown(commandID: commandID, reason: "invalid_error_envelope")

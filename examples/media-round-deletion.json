@@ -127,6 +127,17 @@
       "wait_seconds": 45
     }
   },
+  "operation_wait_failed": {
+    "error": {
+      "code": "CLEANUP_INVENTORY_LIMIT",
+      "message": "CLEANUP_INVENTORY_LIMIT: A round deletion pass exceeded its writer budget. Read deletion progress before resuming. Command ID: 00000000-0000-4000-8000-000000000926. Operation ID: 00000000-0000-4000-8000-000000000927.",
+      "details": {
+        "command_id": "00000000-0000-4000-8000-000000000926",
+        "operation_id": "00000000-0000-4000-8000-000000000927",
+        "command_outcome": "rejected"
+      }
+    }
+  },
   "operation_result": {
     "data": {
       "operation_id": "00000000-0000-4000-8000-000000000907",

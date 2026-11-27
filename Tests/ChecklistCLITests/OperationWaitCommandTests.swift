@@ -109,7 +109,9 @@ final class OperationWaitCommandTests: XCTestCase {
             XCTAssertEqual(error.code, "BACKUP_CAPACITY_EXCEEDED")
             XCTAssertEqual(error.details["command_outcome"] as? String, "rejected")
             XCTAssertEqual(error.details["command_id"] as? String, commandID)
+            XCTAssertEqual(error.details["operation_id"] as? String, operationID)
             XCTAssertTrue(error.localizedDescription.contains("Reason: snapshot_manifest_capacity."), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("Operation ID: \(operationID)."), error.localizedDescription)
         }
     }
 

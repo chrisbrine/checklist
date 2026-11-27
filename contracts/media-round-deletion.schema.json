@@ -99,6 +99,31 @@
         "params"
       ]
     },
+    "operation_wait_failed": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The wait returned the terminal operation's original error and its accepted operation ID.",
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {"$ref": "#/$defs/text"},
+            "message": {"$ref": "#/$defs/text"},
+            "details": {
+              "type": "object",
+              "properties": {
+                "command_id": {"$ref": "#/$defs/uuid"},
+                "operation_id": {"$ref": "#/$defs/uuid"}
+              },
+              "required": ["command_id", "operation_id"]
+            }
+          },
+          "required": ["code", "message", "details"]
+        }
+      },
+      "required": ["error"]
+    },
     "operation_result": {
       "type": "object",
       "additionalProperties": false,
@@ -327,6 +352,7 @@
     "accepted",
     "operation_get",
     "operation_wait",
+    "operation_wait_failed",
     "operation_result"
   ],
   "$defs": {

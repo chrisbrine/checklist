@@ -719,6 +719,10 @@ extension CommandRouter {
         // below the same safe bound; unrelated prose needs no second traversal.
         try self.streamTicketCleanupRows(snapshot,needles:needles.union(deletionTasks),holdDigests:holdDigests,partition:partition) {projected,size in
             selection.rowsRead += 1
+            // Classify by the streamed identity before loading a large
+            // payload. A resumed pass has already hidden the owned rows.
+            guard !owned.contains(projected.key) else {return}
+
             func projectMatches(_ row: PurgeRow) throws -> Bool {
                 var inventory = TicketCleanupInventory();inventory.needles = needles
                 return try self.ticketCleanupBatchLargeMatch(snapshot,row:row,inventory:inventory)
@@ -730,7 +734,6 @@ extension CommandRouter {
                 guard size <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected deletion reference exceeds the 4 MiB payload limit; nothing was removed.")}
                 row = .init(id:row.id,type:row.type,project:row.project,value:try self.record(snapshot,row.id,type:row.type))
             }
-            if owned.contains(row.key) {return}
             var value = row.value
             if retainedAttachments.contains(row.key) {
                 guard handoffOnlyIDs.contains(row.key) else {return}

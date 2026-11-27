@@ -133,6 +133,7 @@ final class OperationWaitMCPTests: XCTestCase {
         let reply = try await client.callTool(name: OperationWait.toolName, arguments: ["operation_id": .string(id), "project_id": .string(projectID)])
         XCTAssertEqual(reply.isError, true, text(reply))
         XCTAssertTrue(text(reply).contains("NOT_FOUND"), text(reply))
+        XCTAssertTrue(text(reply).contains("Operation ID: \(id)."), text(reply))
         print("CL-364 failed operation over MCP: \(text(reply))")
     }
 

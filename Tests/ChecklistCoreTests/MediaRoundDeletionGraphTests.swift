@@ -232,21 +232,54 @@ extension MediaRoundDeletionTests {
         let caller = Caller(role:"worker",installation:try XCTUnwrap(registration["installation"] as? String),
                             projectIDs:[f.project],sessionID:f.worker.sessionID,workspace:f.workspace.path)
         let lane = DispatchQueue(label:"test-media-graph-interruption")
+        let erased = LockedTestState(false)
         f.router.configureCommandOperations(on:lane)
-        f.router.mediaRoundDeletionGraphProbe = {
-            throw CoreError("TEST_INTERRUPT","Stopped after the visibility commit.")
+        f.router.mediaRoundDeletionWriterProbe = {phase,_,committed in
+            if phase == "media_round_graph_erase" && committed {erased.withLock {$0 = true}}
         }
-        let accepted = try worker(f,"media_round_delete",input(f,round),as:caller)
+        f.router.mediaRoundDeletionGraphProbe = {
+            if erased.withLock({$0}) {throw CoreError("TEST_INTERRUPT","Stopped after a committed erase pass.")}
+        }
+        let params = try input(f,round)
+        let accepted = try worker(f,"media_round_delete",params,as:caller)
         XCTAssertEqual(accepted["state"] as? String,"queued")
         let ready = DispatchSemaphore(value:0)
         lane.async {ready.signal()}
         XCTAssertEqual(ready.wait(timeout:.now() + 30),.success)
-        let reply = try f.router.handle(method:"operation_get",params:["project_id":f.project,
-            "operation_id":try XCTUnwrap(accepted["operation_id"] as? String)],caller:caller)
-        let operation = try XCTUnwrap(reply["data"] as? JSON)
+        let firstID = try XCTUnwrap(accepted["operation_id"] as? String)
+        func status(_ id: String) throws -> JSON {
+            let reply = try f.router.handle(method:"operation_get",params:["project_id":f.project,"operation_id":id],caller:caller)
+            return try XCTUnwrap(reply["data"] as? JSON)
+        }
+        let operation = try status(firstID)
+        XCTAssertEqual(operation["operation_id"] as? String,firstID)
         XCTAssertEqual(operation["state"] as? String,"failed")
         XCTAssertEqual((operation["error"] as? JSON)?["code"] as? String,"TEST_INTERRUPT")
-        XCTAssertEqual(try deletion(f,round)["deletion_state"] as? String,"deleting")
+        XCTAssertEqual((operation["error"] as? JSON)?["message"] as? String,"Stopped after a committed erase pass.")
+        let partial = try deletion(f,round)
+        XCTAssertEqual(partial["deletion_state"] as? String,"deleting")
+        XCTAssertGreaterThan(int(partial,"removed_records"),0)
+        XCTAssertLessThan(int(partial,"removed_records"),int(partial,"total_records"))
+        let key = try MediaRoundDeletionGraph.key(MediaRoundDeletionHistory.progressKey(project:f.project,round:round["id"] as! String))
+        let provisional = try f.router.dbQueue.read {try XCTUnwrap(MediaRoundDeletionGraph.load($0,key,as:MediaRoundDeletionGraph.Progress.self)).receipt}
+
+        try f.reopen()
+        XCTAssertEqual(try jsonString(deletion(f,round)),try jsonString(partial))
+        let finished = DispatchSemaphore(value:0)
+        f.router.configureCommandOperations(on:lane) {_, terminal in if terminal {finished.signal()}}
+        let original = try worker(f,"media_round_delete",params,as:caller,command:try XCTUnwrap(accepted["command_id"] as? String))
+        XCTAssertEqual(original["operation_id"] as? String,firstID)
+        XCTAssertEqual(original["state"] as? String,"failed")
+        var retry = params
+        retry["expected_revision"] = partial["expected_revision"]
+        let fresh = try worker(f,"media_round_delete",retry,as:caller)
+        let freshID = try XCTUnwrap(fresh["operation_id"] as? String)
+        XCTAssertNotEqual(freshID,firstID)
+        XCTAssertEqual(finished.wait(timeout:.now() + 30),.success)
+        let resumed = try status(freshID)
+        let diagnostic = try jsonString(resumed)
+        XCTAssertEqual(resumed["state"] as? String,"succeeded",diagnostic)
+        XCTAssertEqual(try deletion(f,round)["byte_deletion_receipt_id"] as? String,provisional)
     }
 
     func testSmallRoundMatchesEarlierAtomicGraphAndHistoryWrites() throws {
