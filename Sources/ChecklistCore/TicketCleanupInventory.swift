@@ -3,12 +3,34 @@ import ChecklistFileAccess
 import OSLog
 import GRDB
 
+struct TicketCleanupRowRange: Sendable {
+    let lower: Int64
+    let upper: Int64?
+
+    static func split(_ db: Database,count: Int) throws -> [Self] {
+        guard let bounds = try Row.fetchOne(db,sql:"""
+            SELECT (SELECT rowid FROM records ORDER BY rowid LIMIT 1) lower,
+                   (SELECT rowid FROM records ORDER BY rowid DESC LIMIT 1) upper
+            """),let first: Int64 = bounds["lower"],let last: Int64 = bounds["upper"] else {return []}
+        // Shift signed rowids into an ordered unsigned space before subtracting.
+        let sign = UInt64(1) << 63
+        let start = UInt64(bitPattern:first) ^ sign
+        let end = UInt64(bitPattern:last) ^ sign
+        let width = (end-start)/UInt64(count)
+        func boundary(_ index: Int) -> Int64 {
+            Int64(bitPattern:(start + width*UInt64(index)) ^ sign)
+        }
+        return (0..<count).map {Self(lower:boundary($0),upper:$0+1 < count ? boundary($0+1) : nil)}
+    }
+}
+
 /// Read-lane, ticket-specific inventory. The corpus is streamed, never cached.
 /// Every envelope is decoded/validated; only ownership and exact relevant
 /// references survive the observation. Limits fail closed before any admission.
 struct TicketCleanupInventory {
     static let byteLimit = 16 * 1024 * 1024
     static let rowByteLimit = 4 * 1024 * 1024
+    static let rowLimit = 4096
     static let projectionByteLimit = 16 * 1024
     var rows: [PurgeRow] = []
     var tokens: [Data:Set<Data>] = [:]
@@ -19,7 +41,8 @@ struct TicketCleanupInventory {
 
     static func strings(_ value: Any,_ visit: (String) -> Void,depth: Int = 0,budget: inout Int) throws {
         budget -= 1
-        guard depth <= 64,budget >= 0 else {throw CoreError("REFERENCE_GRAPH_LIMIT","Cleanup reference traversal exceeded its bound; bytes retained.")}
+        guard depth <= 64 else {throw CoreError("REFERENCE_GRAPH_LIMIT","Cleanup reference traversal exceeded its 64-level nesting limit; bytes retained.")}
+        guard budget >= 0 else {throw CoreError("REFERENCE_GRAPH_LIMIT","Cleanup reference traversal exceeded its node budget; bytes retained.")}
         if let s = value as? String {visit(s)}
         else if let a = value as? [Any] {for v in a {try strings(v,visit,depth:depth+1,budget:&budget)}}
         else if let d = value as? JSON {for (k,v) in d {visit(k);try strings(v,visit,depth:depth+1,budget:&budget)}}
@@ -68,7 +91,12 @@ struct TicketCleanupInventory {
         retainedBytes += bytes;rows.append(row);tokens[row.key] = observation.tokens
     }
     private func checkAdmission(bytes: Int) throws {
-        guard bytes <= Self.rowByteLimit,retainedBytes + bytes <= Self.byteLimit,rows.count < 4096 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the bounded cleanup inventory; bytes retained.")}
+        try Self.checkAdmission(rows:rows.count+1,retainedBytes:retainedBytes,rowBytes:bytes)
+    }
+    static func checkAdmission(rows: Int,retainedBytes: Int,rowBytes: Int) throws {
+        guard rowBytes <= rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected cleanup record exceeds the 4 MiB payload limit; bytes retained.")}
+        guard rows <= rowLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the 4,096-record cleanup inventory limit; bytes retained.")}
+        guard rowBytes <= byteLimit - retainedBytes else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the 16 MiB cleanup inventory limit; bytes retained.")}
     }
     mutating func path(_ path: String,root: URL,prefix: Bool = false) {
         let relative = path.hasPrefix(root.path + "/") ? String(path.dropFirst(root.path.count + 1)) : path
@@ -90,7 +118,7 @@ extension CommandRouter {
     /// Unrelated payloads above 16 KiB use canonical/ownership headers. Check
     /// compatibility with Foundation through 4 MiB; larger payloads retain the
     /// 64 KiB UTF-8 streaming path. SQLite matches complete references.
-    func streamTicketCleanupRows(_ db: Database,needles: Set<Data> = [],holdDigests: Set<Data> = [],prefixes: Set<String> = [],fullPayloads: Bool = false,partition: (index: Int, count: Int)? = nil,_ body: (PurgeRow,Int) throws -> Void) throws {
+    func streamTicketCleanupRows(_ db: Database,needles: Set<Data> = [],holdDigests: Set<Data> = [],prefixes: Set<String> = [],fullPayloads: Bool = false,partition: TicketCleanupRowRange? = nil,_ body: (PurgeRow,Int) throws -> Void) throws {
         let keys = "'id','project_id','revision','kind','project_ids','owner_id','owner_kind','attachment_id','expires_at','task_id','source_task_id','message_id','attempt_id','parent_attempt_id','request_id','review_request_id','manifest_id','membership_id','delegation_id','conversation_id','source_capture_id'"
         let projection = "(SELECT '{'||COALESCE(group_concat(json_quote(key)||':'||CASE WHEN key='project_ids' THEN CASE WHEN type='array' AND NOT EXISTS(SELECT 1 FROM json_each(CASE WHEN type='array' THEN value ELSE '[]' END) grant_value WHERE grant_value.type!='text' OR length(CAST(grant_value.value AS BLOB))=0) THEN '[]' ELSE 'null' END WHEN length(CAST(records.data -> fullkey AS BLOB))>65536 THEN 'null' WHEN key='revision' THEN records.data -> fullkey WHEN type='true' THEN 'true' WHEN type='false' THEN 'false' ELSE json_quote(value) END),'')||'}' FROM json_each(records.data) WHERE key IN (" + keys + "))"
         let bounded = "CASE WHEN octet_length(records.data)<=\(TicketCleanupInventory.projectionByteLimit) THEN records.data WHEN json_valid(records.data) AND json_type(records.data)='object' THEN " + projection + " ELSE '{}' END"
@@ -103,7 +131,9 @@ extension CommandRouter {
         func matches(_ field: String) -> String {
             "(CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?)) OR (instr(\(field),'/')>0 AND EXISTS(SELECT 1 FROM cleanup_prefixes p WHERE CAST(\(field) AS BLOB)>=p.lo AND CAST(\(field) AS BLOB)<p.hi)) OR (records.type='storage_hold' AND CAST(\(field) AS BLOB) IN (SELECT CAST(value AS BLOB) FROM json_each(?))))"
         }
-        let partitionFilter = partition.map {" WHERE ((records.rowid % \($0.count)) + \($0.count)) % \($0.count) = \($0.index)"} ?? ""
+        let partitionFilter = partition.map { range in
+            " WHERE records.rowid>=\(range.lower)" + (range.upper.map {" AND records.rowid<\($0)"} ?? "")
+        } ?? ""
         let sql = """
             WITH cleanup_prefixes AS MATERIALIZED (SELECT CAST(value||'/' AS BLOB) lo,CAST(value||'0' AS BLOB) hi FROM json_each(?))
             SELECT CASE WHEN octet_length(id)<=\(TicketCleanupInventory.rowByteLimit) THEN id END AS id,
@@ -185,7 +215,7 @@ extension CommandRouter {
     private func ticketCleanupReferenceObservation(_ db: Database,row: PurgeRow,inventory: TicketCleanupInventory) throws -> TicketCleanupInventory.TokenObservation? {
         do {return try inventory.tokens[row.key].map {TicketCleanupInventory.TokenObservation(tokens:$0)} ?? TicketCleanupInventory.TokenObservation(row.value)}
         catch let error as CoreError where error.code == "REFERENCE_GRAPH_LIMIT" {
-            if try row.type == "project" || ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {throw error}
+            if try ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {throw error}
             return nil
         }
     }
@@ -249,7 +279,7 @@ extension CommandRouter {
             // stream still validates their complete canonical payload first.
             guard !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) else {return}
             guard let observation = try ticketCleanupReferenceObservation(db,row:row,inventory:result) else {return}
-            if row.type == "project" || row.key == Data(tid.utf8) || bool(row.value,"_cleanup_large_match") || result.mentions(observation,includeDigests:row.type == "storage_hold") {
+            if row.key == Data(tid.utf8) || bool(row.value,"_cleanup_large_match") || result.mentions(observation,includeDigests:row.type == "storage_hold") {
                 try result.add(row,bytes:size,observation:observation)
             }
         }
@@ -263,7 +293,7 @@ extension CommandRouter {
         try streamTicketCleanupRows(db,needles:result.needles,holdDigests:result.holdDigests,prefixes:result.prefixes,fullPayloads:true) {row,size in
             guard !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) else {return}
             guard let observation = try ticketCleanupReferenceObservation(db,row:row,inventory:result) else {return}
-            if row.type == "project" || bool(row.value,"_cleanup_large_match") || result.mentions(observation,includeDigests:row.type == "storage_hold") {try result.add(row,bytes:size,observation:observation)}
+            if bool(row.value,"_cleanup_large_match") || result.mentions(observation,includeDigests:row.type == "storage_hold") {try result.add(row,bytes:size,observation:observation)}
         }
         return result
     }
@@ -278,7 +308,8 @@ extension CommandRouter {
         // Known deletion receipts are accounting, never media roots. Their
         // complete canonical payload was already validated by the corpus stream;
         // a large receipt must not make every unrelated media observation fail.
-        let cursor = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type IN (" + placeholders + ") AND NOT (type='storage_job' AND json_valid(data) AND COALESCE(json_extract(data,'$.kind')='ticket_object_delete',0)) ORDER BY rowid",arguments:StatementArguments(types))
+        let mediaRows = "SELECT rowid FROM records INDEXED BY records_scope WHERE type IN (" + placeholders + ")"
+        let cursor = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE rowid IN (" + mediaRows + ") AND NOT (type='storage_job' AND json_valid(data) AND COALESCE(json_extract(data,'$.kind')='ticket_object_delete',0)) ORDER BY rowid",arguments:StatementArguments(types))
         // A target, candidate or anchor can belong to many overlapping
         // closures. Reuse those exact decoded rows only in this SQLite
         // snapshot. Each root still walks its complete closure and pays its

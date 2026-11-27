@@ -105,6 +105,7 @@ extension CommandRouter {
 
     private func executeMediaRoundDeletionPass(_ p: JSON,_ c: Caller,command: String,digest: String,preparation: inout TimeInterval,phases: inout [String:Double]) throws -> JSON? {
         var configuration = Configuration();configuration.readonly = true
+        configuration.qos = .default
         configuration.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
         defer {try? observer.close()}
@@ -378,15 +379,21 @@ extension CommandRouter {
         let retainedAttachments = Set(keptAttachments.compactMap {($0["id"] as? String).map {Data($0.utf8)}})
         let graphFinished = ProcessInfo.processInfo.systemUptime
         let deletionTasks = tasks
-        @Sendable func observeReferences(_ snapshot: Database,partition: (index: Int, count: Int)? = nil,budget: MediaRoundDeletionReferenceBudget) throws -> MediaRoundDeletionReferences {
+        @Sendable func observeReferences(_ snapshot: Database,partition: TicketCleanupRowRange? = nil,budget: MediaRoundDeletionReferenceBudget) throws -> MediaRoundDeletionReferences {
             var selection = MediaRoundDeletionReferences()
             // The shared stream validates complete unrelated envelopes but returns
             // only headers above 16 KiB. Exact SQL matching admits relevant payloads
             // below the same safe bound; unrelated prose needs no second traversal.
             try self.streamTicketCleanupRows(snapshot,needles:needles.union(deletionTasks),holdDigests:holdDigests,partition:partition) {projected,size in
+                func projectMatches(_ row: PurgeRow) throws -> Bool {
+                    var inventory = TicketCleanupInventory();inventory.needles = needles
+                    return try self.ticketCleanupBatchLargeMatch(snapshot,row:row,inventory:inventory)
+                }
                 var row = projected
-                if size > TicketCleanupInventory.projectionByteLimit,(row.type == "project" || bool(row.value,"_cleanup_large_match")) {
-                    guard size <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected deletion reference exceeds its safe bound; nothing was removed.")}
+                if size > TicketCleanupInventory.projectionByteLimit,bool(row.value,"_cleanup_large_match") {
+                    // Linked ticket IDs only protect pending owner requests.
+                    if row.type == "project",!deletionTasks.isEmpty,try !projectMatches(row) {return}
+                    guard size <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected deletion reference exceeds the 4 MiB payload limit; nothing was removed.")}
                     row = .init(id:row.id,type:row.type,project:row.project,value:try self.record(snapshot,row.id,type:row.type))
                 }
                 if owned.contains(row.key) {return}
@@ -399,12 +406,17 @@ extension CommandRouter {
                 var matches = large,pendingReference = false,traversalBudget = 2_000_000
                 // Traverse every value under the existing graph bounds. Most text
                 // atoms have no matching byte length and need no Data allocation.
-                try TicketCleanupInventory.strings(row.value,{text in
-                    guard (!matches || pending && !pendingReference),lengths.contains(text.utf8.count) else {return}
-                    let token = Data(text.utf8)
-                    matches = matches || targets.contains(token)
-                    pendingReference = pendingReference || pending && keys.contains(token)
-                },budget:&traversalBudget)
+                do {
+                    try TicketCleanupInventory.strings(row.value,{text in
+                        guard (!matches || pending && !pendingReference),lengths.contains(text.utf8.count) else {return}
+                        let token = Data(text.utf8)
+                        matches = matches || targets.contains(token)
+                        pendingReference = pendingReference || pending && keys.contains(token)
+                    },budget:&traversalBudget)
+                } catch let error as CoreError where row.type == "project" && error.code == "REFERENCE_GRAPH_LIMIT" {
+                    if try projectMatches(row) {throw error}
+                    return
+                }
                 if pending,deletionTasks.contains(Data((row.value["task_id"] as? String ?? "").utf8)) || pendingReference || large {
                     throw CoreError("MEDIA_OWNER_REQUEST_PENDING","Answer or cancel the unresolved owner request before deleting this round.")
                 }
@@ -413,10 +425,10 @@ extension CommandRouter {
                 if !hold,matches {
                     throw CoreError("MEDIA_ROUND_REFERENCED","Another retained round, ticket or record still uses this round's records or files; nothing was removed.",details:["record_id":row.id,"record_type":row.type])
                 }
-                if row.type == "project" || hold && matches {
+                if hold && matches {
                     try budget.charge(size)
                     var value = row.value;value["record_type"] = row.type;selection.rows.append(value)
-                    if row.type != "project" {selection.ids.insert(row.key)}
+                    selection.ids.insert(row.key)
                 }
             }
             return selection
@@ -424,11 +436,11 @@ extension CommandRouter {
         var referenced = MediaRoundDeletionReferences(),referencesSeconds: TimeInterval = 0
         var parallelHistory: (MediaRoundDeletionHistory,TimeInterval)?
         let parallelBudget = MediaRoundDeletionReferenceBudget()
+        let ranges = try TicketCleanupRowRange.split(db,count:MediaRoundDeletionReadWork.partitions)
         if let pieces = try MediaRoundDeletionReadWork.perform(db,read:{snapshot,index in
-            let partitions = MediaRoundDeletionReadWork.partitions
             let began = ProcessInfo.processInfo.systemUptime
-            if index < partitions {
-                let selection = try observeReferences(snapshot,partition:(index,partitions),budget:parallelBudget)
+            if index < ranges.count {
+                let selection = try observeReferences(snapshot,partition:ranges[index],budget:parallelBudget)
                 return .references(selection,ProcessInfo.processInfo.systemUptime-began)
             }
             let history = try MediaRoundDeletionHistory.select(snapshot,project:project,owned:owned,continuing:progress != nil)

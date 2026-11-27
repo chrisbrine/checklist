@@ -407,8 +407,9 @@ extension CommandRouter {
                     outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page);return .commit
                 }
                 let references = prepared.references,mediaAuthorityComplete = prepared.mediaAuthorityComplete,backup = prepared.backup
+                let workspaces = try self.ticketObjectDeletionWorkspaces(db,objects:objects,candidatePaths:prepared.candidatePaths)
                 for i in objects.indices where prepared.page == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
-                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
+                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
                     if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
                 }
                 prepared.page?.links.apply(&objects)
@@ -422,7 +423,7 @@ extension CommandRouter {
                     let object = objects[index]
                     var result = object
                     do {
-                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
+                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
                         if !holds.isEmpty {result["state"] = "retained";result["reasons"] = holds.sorted()}
                         else {
                             guard let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,

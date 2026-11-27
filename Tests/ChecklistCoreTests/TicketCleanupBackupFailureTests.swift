@@ -17,7 +17,7 @@ extension TicketLifecycleCleanupTests {
             let backup = self.router.observeTicketCleanupBackupRetentionIndex(db,objects:[object])
             let reason = "backup_index_error:CLEANUP_INVENTORY_LIMIT"
             XCTAssertEqual(backup.cleanupFailureReason,reason)
-            let holds = try self.router.ticketObjectDeletionHolds(db,object:object,references:TicketObjectDeletionReferenceIndex([]),backup:backup,mediaAuthorityComplete:true)
+            let holds = try self.router.ticketObjectDeletionHolds(db,object:object,references:TicketObjectDeletionReferenceIndex([]),workspaces:CleanupWorkspaceProtection(db,paths:[]),backup:backup,mediaAuthorityComplete:true)
             XCTAssertEqual(holds,[reason])
             XCTAssertTrue(CommandRouter.ticketObjectDeletionReasonsRetryable(holds))
             XCTAssertFalse(CommandRouter.ticketObjectDeletionReasonsRetryable([reason,"keep_original"]))

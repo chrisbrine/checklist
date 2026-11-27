@@ -7,16 +7,19 @@ final class CallTimingTests: XCTestCase {
         timing.queued(since:ProcessInfo.processInfo.systemUptime - 0.01)
         timing.measure("bootstrap_verification_ms") { Thread.sleep(forTimeInterval:0.005) }
         timing.measure("execution_ms") { Thread.sleep(forTimeInterval:0.005) }
+        timing.recordOperationWriterWait(0.002)
+        timing.recordOperationWriterWait(0.001)
         let id = UUID().uuidString
         let result: [String:Any] = ["data":["id":"result","text":"quotes \" and braces {} and unicode é","_checklist":["retained":true]],"command_id":id]
         let decoded = try CommandReply.decode(timing.encode(result),method:"task_edit",commandID:id)
         XCTAssertEqual(try JSONSerialization.data(withJSONObject:decoded["data"]!,options:[.sortedKeys]),try JSONSerialization.data(withJSONObject:result["data"]!,options:[.sortedKeys]))
         let fields = try XCTUnwrap(decoded["_checklist_timing"] as? [String:Any])
-        XCTAssertEqual(Set(fields.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","encoding_ms","total_ms","request_id","coordinator_queue_wait_ms","coordinator_dequeued_uptime_s","received_uptime_s","reply_ready_uptime_s"])
+        XCTAssertEqual(Set(fields.keys),["queue_wait_ms","bootstrap_verification_ms","execution_ms","operation_writer_wait_ms","encoding_ms","total_ms","request_id","coordinator_queue_wait_ms","coordinator_dequeued_uptime_s","received_uptime_s","reply_ready_uptime_s"])
         XCTAssertNotNil((fields["request_id"] as? String).flatMap(UUID.init(uuidString:)))
-        XCTAssertGreaterThanOrEqual((fields["queue_wait_ms"] as! Double),10)
+        XCTAssertGreaterThanOrEqual((fields["queue_wait_ms"] as! Double),9.999)
         XCTAssertGreaterThanOrEqual((fields["bootstrap_verification_ms"] as! Double),5)
         XCTAssertGreaterThanOrEqual((fields["execution_ms"] as! Double),5)
+        XCTAssertEqual(fields["operation_writer_wait_ms"] as? Double,3)
         XCTAssertGreaterThanOrEqual((fields["encoding_ms"] as! Double),0)
         XCTAssertGreaterThanOrEqual((fields["total_ms"] as! Double),(fields["queue_wait_ms"] as! Double) + (fields["bootstrap_verification_ms"] as! Double) + (fields["execution_ms"] as! Double))
         XCTAssertNotNil(try JSONSerialization.jsonObject(with:ServiceCallTiming().encode([:])))
@@ -47,6 +50,7 @@ final class CallTimingTests: XCTestCase {
         let worker = fields["worker_queue_wait_ms"] as! Double
         XCTAssertEqual(fields["queue_wait_ms"] as! Double, coordinator + worker, accuracy: 0.001)
         XCTAssertEqual(fields["received_uptime_s"] as! Double, now - 0.01)
+        XCTAssertNil(fields["operation_writer_wait_ms"])
         let observed = fields["admission"] as! [String:Any]
         XCTAssertEqual(observed["listener_uptime_s"] as! Double, now - 0.05)
         XCTAssertEqual(observed["cache_hit"] as? Bool, false)

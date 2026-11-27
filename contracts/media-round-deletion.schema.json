@@ -183,6 +183,7 @@
       ]
     },
     "operation_work_limit": {
+      "description": "A failed operation names the exceeded bound for the selected deletion, including a workspace authority, matched reference, or indivisible history bound.",
       "type": "object",
       "additionalProperties": false,
       "description": "Optional failed-operation example for a graph, import or indivisible history bound. Aggregate matched history count and identity bytes can continue across passes.",

@@ -98,7 +98,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
     let workHealthQueue = DispatchQueue(label:"org.checklist.work-health",qos:.utility,autoreleaseFrequency:.workItem)
     let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
-    let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.userInitiated,attributes:.concurrent,autoreleaseFrequency:.workItem)
+    let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.default,attributes:.concurrent,autoreleaseFrequency:.workItem)
     var storageRunning = false
     var storageWakePlanning = false
     var storageWakeReplan = false
@@ -876,7 +876,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                     let result: [String:Any]
                     do {
                         let params = try JSONSerialization.jsonObject(with:paramsBytes) as? [String:Any] ?? [:]
-                        result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller) }
+                        result = try ServiceCallTiming.measure(timing,"execution_ms") { try router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:timing.map { $0.recordOperationWriterWait }) }
                     } catch { result = ["error":Self.publicError(error)] }
                     reply(Self.responseBytes(result,timing:timing))
                     let succeeded = result["error"] == nil && !["queued","accepted"].contains(result["command_outcome"] as? String ?? "")
@@ -885,7 +885,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                 }}
             case .router(let method,let params,let caller):
                 let result: [String:Any]
-                do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller) } } catch { result = ["error":Self.publicError(error)] }
+                do { result = try ServiceCallTiming.measure(timing,"execution_ms") { try coordinator.router.handle(method:method,params:params,caller:caller,observeOperationWriterWait:timing.map { $0.recordOperationWriterWait }) } } catch { result = ["error":Self.publicError(error)] }
                 finish(result,timing:timing,runHooks:Self.requiresAfterCommand(method),method:method,reply:reply)
             }
             }

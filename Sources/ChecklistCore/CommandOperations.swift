@@ -223,7 +223,12 @@ final class CommandOperations: @unchecked Sendable {
         }
     }
     private func schedule(_ job: Job,on queue: DispatchQueue,router: CommandRouter) {
-        queue.async { [self,router] in
+        let deletion = job.mediaRoundDeletionProject != nil
+        let qos: DispatchQoS = deletion ? .default : .unspecified
+        // Submitting from an ordinary request must not donate its priority to
+        // the deletion's full preparation. The shared writer still serializes
+        // only the operation's fenced commits.
+        queue.async(qos:qos,flags:deletion ? .enforceQoS : []) { [self,router] in
             let finished = router.runCommandOperation(job)
             let callback = lock.withLock { () -> (@Sendable (String,Bool) -> Void)? in
                 scheduled.remove(job.id)
@@ -378,7 +383,7 @@ extension CommandRouter {
         }
         return value
     }
-    func commandOperationRead(params: JSON,caller: Caller,byCommand: Bool = false) throws -> JSON? {
+    func commandOperationRead(params: JSON,caller: Caller,byCommand: Bool = false,observeWriterWait: ((TimeInterval) -> Void)? = nil) throws -> JSON? {
         let readLease = try storageAdmission.acquire();defer {readLease.finish()}
         let id: String
         if byCommand {id = Self.commandOperationID(principal:caller.principal,command:try text(params,"command_id",max:100))}
@@ -411,7 +416,11 @@ extension CommandRouter {
             guard let reply = try backupWrites.withImmediateAccess({
                 let lease = try storageAdmission.acquire();defer {lease.finish()}
                 return try ArchiveStorageGate.withExclusive(root:root) { _ in
-                    try dbQueue.writeWithoutTransaction {try read($0,credentials:true)}
+                    let queued = observeWriterWait.map {_ in ProcessInfo.processInfo.systemUptime}
+                    return try dbQueue.writeWithoutTransaction {db in
+                        if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime-queued)}
+                        return try read(db,credentials:true)
+                    }
                 }
             }) else {throw CoreError("BACKUP_CAPTURE_ACTIVE","The operation succeeded; credential projection waits for backup write admission. Read the same operation again.",details:["command_outcome":"unknown","operation_id":id])}
             return reply
@@ -426,7 +435,7 @@ extension CommandRouter {
             throw CoreError("OPERATION_PENDING","Read the original operation before applying this command.",details:["operation_id":id,"status_method":"operation_get"])
         }
     }
-    func acceptCommandOperation(method: String,params input: JSON,caller: Caller) throws -> JSON {
+    func acceptCommandOperation(method: String,params input: JSON,caller: Caller,observeWriterWait: ((TimeInterval) -> Void)? = nil) throws -> JSON {
         var params = input
         if Self.readMethods.contains(method),params["command_id"] == nil {params["command_id"] = uuid()}
         let command = try text(params,"command_id",max:100)
@@ -494,7 +503,13 @@ extension CommandRouter {
         let operation: JSON
         // Admission and the capture flag share one atomic writer count: capture
         // cannot acquire its SQLite lease between this check and the SQL write.
-        if let canonical = try backupWrites.withImmediateAccess({try dbQueue.write {try accept($0,persist:true)}}) {operation = canonical}
+        if let canonical = try backupWrites.withImmediateAccess({
+            let queued = observeWriterWait.map {_ in ProcessInfo.processInfo.systemUptime}
+            return try dbQueue.write {db in
+                if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime-queued)}
+                return try accept(db,persist:true)
+            }
+        }) {operation = canonical}
         else {
             let staged = try readForPreparation {db -> (JSON,String?) in
                 let base = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])

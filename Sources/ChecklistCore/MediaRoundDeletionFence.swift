@@ -70,25 +70,10 @@ struct MediaRoundDeletionFence {
         tokens = try jsonString(needles.map {String(decoding:$0,as:UTF8.self)})
         tasks = try jsonString(pendingRequestTasks.map {String(decoding:$0,as:UTF8.self)})
         digests = try jsonString(holdDigests.map {String(decoding:$0,as:UTF8.self)})
-        self.filePaths = filePaths;workspaceProtections = try Self.workspaceProtections(db,paths:filePaths)
+        self.filePaths = filePaths;workspaceProtections = try CleanupWorkspaceProtection(db,paths:filePaths).signatures
     }
     static func changed(_ check: String,type: String,id: Data) -> CoreError {
         CoreError("MEDIA_CONTEXT_CHANGED","A round record, deletion-plan row or relevant reference changed during preparation; no records changed.",details:["check":check,"record_type":type,"record_id":String(decoding:id,as:UTF8.self)])
-    }
-
-    private static func workspaceProtections(_ db: Database,paths: [String]) throws -> Set<Data> {
-        guard !paths.isEmpty else {return []}
-        let targets = paths.map {URL(fileURLWithPath:$0).resolvingSymlinksInPath().standardizedFileURL.path}
-        let projects = try Row.fetchCursor(db,sql:"SELECT CAST(id AS BLOB) id,json_extract(data,'$.root_path') root FROM records WHERE type='project'")
-        var result = Set<Data>()
-        while let row = try projects.next() {
-            guard let path: String = row["root"] else {continue}
-            let workspace = URL(fileURLWithPath:path).resolvingSymlinksInPath().standardizedFileURL.path
-            if targets.contains(where:{$0 == workspace || $0.hasPrefix(workspace + "/")}) {
-                var key: Data = row["id"];key.append(0);key.append(contentsOf:workspace.utf8);result.insert(key)
-            }
-        }
-        return result
     }
 
     func validate(_ db: Database,changes: MediaRoundDeletionChanges,writerVersion: Int64) throws {
@@ -98,7 +83,7 @@ struct MediaRoundDeletionFence {
         guard try !Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(changes.name)_overflow)")! else {throw Self.changed("change_journal_overflow",type:"journal",id:Data(changes.name.utf8))}
         // Project counters may move with unrelated writes. Only a root that
         // starts/stops protecting a selected file changes deletion authority.
-        let currentProtections = try Self.workspaceProtections(db,paths:filePaths)
+        let currentProtections = try CleanupWorkspaceProtection(db,paths:filePaths).signatures
         if let difference = currentProtections.symmetricDifference(workspaceProtections).sorted(by:{$0.lexicographicallyPrecedes($1)}).first {
             // Filesystem paths contain no NUL; opaque project IDs may do so.
             let separator = difference.lastIndex(of:0)!

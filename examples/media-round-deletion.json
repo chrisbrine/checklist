@@ -282,7 +282,7 @@
       "finished_at": "2026-11-01T12:00:06Z",
       "error": {
         "code": "CLEANUP_INVENTORY_LIMIT",
-        "message": "A matched history row exceeds the 16 MiB work limit for one pass. The round remains present.",
+        "message": "Selected paths exceed the 4,096-entry workspace authority limit; bytes retained.",
         "retryable": false,
         "details": {}
       }

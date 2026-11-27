@@ -53,9 +53,9 @@ private struct CleanupOwnershipGraph {
         let tid = Data(task.utf8)
         var found = seeds[task] ?? [],level = Array(found),bytes = 0
         func check(_ key: Data) throws {
-            guard let node = nodes[key],node.bytes <= TicketCleanupInventory.rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected cleanup row exceeds its bound; bytes retained.")}
+            guard let node = nodes[key] else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected cleanup ownership header is missing; bytes retained.")}
+            try TicketCleanupInventory.checkAdmission(rows:found.count,retainedBytes:bytes,rowBytes:node.bytes)
             bytes += node.bytes
-            guard found.count <= 4096,bytes <= TicketCleanupInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the bounded cleanup inventory; bytes retained.")}
         }
         for key in level {try check(key)}
         var depth = 0
@@ -97,7 +97,7 @@ extension CommandRouter {
             for tid in selected.keys.sorted() {
                 do {
                     let inventory = try ticketCleanupInventory(db,task:selected[tid]!)
-                    guard bytes + inventory.retainedBytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its memory bound; this ticket is deferred.")}
+                    guard bytes + inventory.retainedBytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its 64 MiB inventory limit; this ticket is deferred.")}
                     bytes += inventory.retainedBytes;result.inventories[tid] = inventory
                 } catch let error as CoreError {result.errors[tid] = error}
             }
@@ -120,7 +120,7 @@ extension CommandRouter {
                 for row in try mediaDoneCleanupHistory(db,task:selected[tid]!) {try inventory.add(row,bytes:jsonString(row.value).utf8.count) {row.value}}
                 inventory.needles = Set(inventory.rows.map(\.key)).union([Data(tid.utf8)])
                 try ticketCleanupBatchOwnershipPaths(db,inventory:&inventory)
-                guard retainedBytes + inventory.retainedBytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its memory bound; this ticket is deferred.")}
+                guard retainedBytes + inventory.retainedBytes <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its 64 MiB inventory limit; this ticket is deferred.")}
                 retainedBytes += inventory.retainedBytes;result.inventories[tid] = inventory
             } catch let error as CoreError {result.errors[tid] = error}
         }
@@ -151,22 +151,22 @@ extension CommandRouter {
                 // whose exact references would require that bounded traversal.
                 for tid in tickets {
                     guard let inventory = result.inventories[tid] else {continue}
-                    if try row.type == "project" || row.key == Data(tid.utf8) || self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {
+                    if try row.key == Data(tid.utf8) || self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {
                         retainedBytes -= inventory.retainedBytes
                         result.inventories.removeValue(forKey:tid);result.errors[tid] = error
                     }
                 }
                 return
             }
-            guard row.type == "project" || bool(row.value,"_cleanup_large_match") || union.mentions(observation,includeDigests:row.type == "storage_hold") else {return}
+            guard bool(row.value,"_cleanup_large_match") || union.mentions(observation,includeDigests:row.type == "storage_hold") else {return}
             for tid in tickets {
                 guard var inventory = result.inventories.removeValue(forKey:tid) else {continue}
                 retainedBytes -= inventory.retainedBytes
                 do {
-                    let relevant = try row.type == "project" || row.key == Data(tid.utf8) || inventory.mentions(observation,includeDigests:row.type == "storage_hold") ||
+                    let relevant = try row.key == Data(tid.utf8) || inventory.mentions(observation,includeDigests:row.type == "storage_hold") ||
                         (size > TicketCleanupInventory.rowByteLimit && bool(row.value,"_cleanup_large_match") && self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory))
                     if relevant {
-                        guard retainedBytes + inventory.retainedBytes + (inventory.tokens[row.key] == nil ? size : 0) <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its memory bound; this ticket is deferred.")}
+                        guard retainedBytes + inventory.retainedBytes + (inventory.tokens[row.key] == nil ? size : 0) <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its 64 MiB inventory limit; this ticket is deferred.")}
                         try inventory.add(row,bytes:size,observation:observation)
                     }
                     retainedBytes += inventory.retainedBytes;result.inventories[tid] = inventory
@@ -203,22 +203,22 @@ extension CommandRouter {
             catch let error as CoreError where error.code == "REFERENCE_GRAPH_LIMIT" {
                 for id in ids {
                     guard let inventory = result.inventories[id] else {continue}
-                    if try row.type == "project" || self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {
+                    if try self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory) {
                         retainedBytes -= inventory.retainedBytes
                         result.inventories.removeValue(forKey:id);result.errors[id] = error
                     }
                 }
                 return
             }
-            guard row.type == "project" || bool(row.value,"_cleanup_large_match") || union.mentions(observation,includeDigests:row.type == "storage_hold") else {return}
+            guard bool(row.value,"_cleanup_large_match") || union.mentions(observation,includeDigests:row.type == "storage_hold") else {return}
             for id in ids {
                 guard var inventory = result.inventories.removeValue(forKey:id) else {continue}
                 retainedBytes -= inventory.retainedBytes
                 do {
-                    let relevant = try row.type == "project" || inventory.mentions(observation,includeDigests:row.type == "storage_hold") ||
+                    let relevant = try inventory.mentions(observation,includeDigests:row.type == "storage_hold") ||
                         (size > TicketCleanupInventory.rowByteLimit && bool(row.value,"_cleanup_large_match") && self.ticketCleanupBatchLargeMatch(db,row:row,inventory:inventory))
                     if relevant {
-                        guard retainedBytes + inventory.retainedBytes + (inventory.tokens[row.key] == nil ? size : 0) <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its memory bound; this receipt is deferred.")}
+                        guard retainedBytes + inventory.retainedBytes + (inventory.tokens[row.key] == nil ? size : 0) <= TicketCleanupBatchInventory.byteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The cleanup batch exceeds its 64 MiB inventory limit; this receipt is deferred.")}
                         try inventory.add(row,bytes:size,observation:observation)
                     }
                     retainedBytes += inventory.retainedBytes;result.inventories[id] = inventory

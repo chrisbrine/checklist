@@ -15,6 +15,12 @@ extension TicketLifecycleCleanupTests {
                     "sample":[-2.25,3,0]]
                 try self.router.save(db,record,type:"message")
             }
+            for position in [Int64.min, -71, -1, 900_002, Int64.max] {
+                let id = uuid()
+                let value: JSON = ["id":id,"project_id":projectID,"revision":1,"body":"exact-reference"]
+                try db.execute(sql:"INSERT INTO records(rowid,id,project_id,type,revision,data) VALUES(?,?,?,'message',1,?)",
+                               arguments:[position,id,projectID,try jsonString(value)])
+            }
         }
         try XCTUnwrap(router.readers).read {db in
             var before: [String] = [],after: [String] = []
@@ -26,12 +32,12 @@ extension TicketLifecycleCleanupTests {
             }
             XCTAssertEqual(after,before)
             var partitioned: [String] = []
-            for index in 0..<MediaRoundDeletionReadWork.partitions {
-                try self.router.streamTicketCleanupRows(db,needles:[needle],partition:(index,MediaRoundDeletionReadWork.partitions)) {row,bytes in
+            for range in try TicketCleanupRowRange.split(db,count:MediaRoundDeletionReadWork.partitions) {
+                try self.router.streamTicketCleanupRows(db,needles:[needle],partition:range) {row,bytes in
                     partitioned.append(try jsonString([row.id,row.type,bytes,row.value]))
                 }
             }
-            XCTAssertEqual(partitioned.sorted(),before.sorted())
+            XCTAssertEqual(partitioned,before)
         }
     }
 
@@ -62,6 +68,7 @@ extension TicketLifecycleCleanupTests {
             let other = try call("task_create",["project_id":pid,"title":"Unrelated synthetic ticket"])
             let otherID = other["id"] as! String,attachmentID = attachment["id"] as! String
             let parent = uuid(),child = uuid(),capture = uuid(),accounting = uuid(),hold = uuid()
+            let referenceProject = uuid(),unrelatedProject = uuid()
             let prefix = "source-captures/" + pid + "/" + capture + "/source"
             let rows = (0..<count).map {_ in uuid()}
             let generatedIDs = Set((rows + [parent,child,capture,accounting,hold,attachmentID]).map {Data($0.utf8)})
@@ -78,6 +85,8 @@ extension TicketLifecycleCleanupTests {
                 try save(capture,"source_capture",["task_id":tid,"snapshot_path":prefix,"files":[]])
                 try save(accounting,"storage_job",["kind":"ticket_object_delete","task_id":tid,"state":"completed","objects":[["owner_ids":[attachmentID]]]])
                 try save(hold,"storage_hold",["kind":"reader","state":"active","body":[attachment["sha256"] as! String:"exact digest"]])
+                try self.router.save(db,["id":referenceProject,"project_id":referenceProject,"revision":1,"root_path":"","body":[attachmentID:"exact project reference"]],type:"project")
+                try self.router.save(db,["id":unrelatedProject,"project_id":unrelatedProject,"revision":1,"root_path":"","body":attachmentID + "-longer"],type:"project")
                 for (index,id) in rows.enumerated() {
                     let padding = index.isMultiple(of:5) ? String(repeating:"payload-",count:2400) : "short synthetic payload"
                     switch index % 7 {
@@ -106,7 +115,10 @@ extension TicketLifecycleCleanupTests {
                 let new = try self.router.ticketCleanupInventory(db,task:task)
                 let ownedOld = self.router.ticketPurgeOwnedKeys(all:old.rows,pid:pid,tid:tid)
                 let ownedNew = self.router.ticketPurgeOwnedKeys(all:new.rows,pid:pid,tid:tid)
-                let refsOld = Set(old.rows.map(\.key)).subtracting(ownedOld)
+                let oldSelected = old.rows.filter {row in
+                    row.type != "project" || old.mentions(.init(tokens:old.tokens[row.key] ?? []))
+                }
+                let refsOld = Set(oldSelected.map(\.key)).subtracting(ownedOld)
                 let refsNew = Set(new.rows.map(\.key)).subtracting(ownedNew)
                 XCTAssertEqual(ownedNew,ownedOld,"Generated row count: \(count)")
                 XCTAssertEqual(refsNew,refsOld,"Generated row count: \(count)")
@@ -116,8 +128,9 @@ extension TicketLifecycleCleanupTests {
                 for (index,id) in rows.enumerated() where index % 7 >= 5 {
                     XCTAssertFalse(refsNew.contains(Data(id.utf8)))
                 }
-                XCTAssertEqual(new.tokens,old.tokens)
-                XCTAssertEqual(new.retainedBytes,old.retainedBytes)
+                XCTAssertTrue(refsNew.contains(Data(referenceProject.utf8)))
+                XCTAssertFalse(refsNew.contains(Data(unrelatedProject.utf8)))
+                XCTAssertEqual(new.tokens,old.tokens.filter {refsOld.contains($0.key) || ownedOld.contains($0.key)})
             }
         }
     }

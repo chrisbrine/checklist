@@ -413,20 +413,23 @@ public final class CommandRouter: @unchecked Sendable {
         return Int(sequence)
     }
     public func handle(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
-        // CL-362: a transient descriptor shortage must not fail an ordinary attachment.
-        guard method == "attachment_add" else {return try handleAttempt(method:method,params:params,caller:caller)}
-        return try StorageFailureReport.retryingTransient {try handleAttempt(method:method,params:params,caller:caller)}
+        try handle(method:method,params:params,caller:caller,observeOperationWriterWait:nil)
     }
-    private func handleAttempt(method: String, params: [String: Any], caller: Caller) throws -> [String: Any] {
+    public func handle(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?) throws -> [String: Any] {
+        // CL-362: a transient descriptor shortage must not fail an ordinary attachment.
+        guard method == "attachment_add" else {return try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait)}
+        return try StorageFailureReport.retryingTransient {try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait)}
+    }
+    private func handleAttempt(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?) throws -> [String: Any] {
         // Validation, preparation and owner projection also bridge Foundation
         // objects outside the SQL callbacks. Bound their lifetime on this thread.
         try autoreleasepool {
             guard ["owner","worker","assistant"].contains(caller.role),!caller.installation.isEmpty else {throw CoreError("FORBIDDEN","An authenticated connection is required.")}
             guard let encoded = try? JSONSerialization.data(withJSONObject:params),encoded.count <= 2_000_000 else {throw CoreError("INVALID_INPUT","Command input is too large or invalid.")}
             try validateInput(method,params,caller)
-            if method == "operation_get" {return addingWriteAdmission(try commandOperationRead(params:params,caller:caller)!)}
+            if method == "operation_get" {return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,observeWriterWait:observeOperationWriterWait)!)}
             if method == "command_status" {
-                return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,byCommand:true) ?? backupCommandStatus(params:params,caller:caller))
+                return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,byCommand:true,observeWriterWait:observeOperationWriterWait) ?? backupCommandStatus(params:params,caller:caller))
             }
             var admittedWrite = false
             let admittedReply: JSON? = try commandOperations.withAdmission(principal:caller.principal,command:params["command_id"] as? String) {
@@ -434,7 +437,7 @@ public final class CommandRouter: @unchecked Sendable {
                 let scheduled = Thread.current.threadDictionary[commandOperations.contextKey] != nil
                 if commandOperations.enabled,!scheduled,
                    try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
-                    return try acceptCommandOperation(method:method,params:params,caller:caller)
+                    return try acceptCommandOperation(method:method,params:params,caller:caller,observeWriterWait:observeOperationWriterWait)
                 }
                 // The scheduled deletion admits its own bounded writer steps.
                 if scheduled,method == "media_round_delete",!legacyReserved {return nil}

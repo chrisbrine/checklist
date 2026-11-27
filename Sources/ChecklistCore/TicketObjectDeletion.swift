@@ -67,11 +67,10 @@ final class TicketCleanupBackupCopy {
 struct TicketObjectDeletionReferenceIndex {
     let graph: [JSON]
     let reverse: [Data:Set<Int>]
-    let projects: Set<Int>
     static let historyContainers: Set<String> = ["group","batch","batch_claim","delivery","cleanup_job","cleanup_preview"]
     init(_ graph: [JSON], tokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = []) throws {
         self.graph = graph
-        var reverse: [Data:Set<Int>] = [:],projects = Set<Int>(),edges = 0
+        var reverse: [Data:Set<Int>] = [:],edges = 0
         func visit(_ value: Any,row: Int,depth: Int = 0) throws {
             edges += 1
             guard depth <= 64,edges <= 2000000 else {throw CoreError("REFERENCE_GRAPH_LIMIT","The object ownership inventory exceeds the safe deletion limit.")}
@@ -87,13 +86,12 @@ struct TicketObjectDeletionReferenceIndex {
             }}
         }
         for (index,value) in graph.enumerated() {
-            if value["record_type"] as? String == "project" {projects.insert(index)}
             if value["record_type"] as? String == "storage_job",["ticket_object_delete","archive_cleanup_delete","archive_cleanup_cursor"].contains(value["kind"] as? String ?? "") {continue}
             if let tokens,let id = value["id"] as? String {
                 for token in tokens[Data(id.utf8)] ?? [] where !(Self.historyContainers.contains(value["record_type"] as? String ?? "") && historicalOwners.contains(token)) {reverse[token,default:[]].insert(index)}
             } else {try visit(value,row:index)}
         }
-        self.reverse = reverse;self.projects = projects
+        self.reverse = reverse
     }
 }
 
@@ -423,11 +421,12 @@ extension CommandRouter {
         if let backupObservation {backup = backupObservation.index}
         else {backup = observeTicketCleanupBackupRetentionIndex(db,objects:objects)}
         let references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens,historicalOwners:historicalOwners)
+        let workspaces = try ticketObjectDeletionWorkspaces(db,objects:objects)
         let mediaComplete = mediaAuthorityComplete ?? ((try? ticketCleanupValidateMediaAuthority(db)) != nil)
         var result: [JSON] = []
         for var item in objects {
             if item["state"] as? String == "pending" {
-                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:preserveTicketMedia)
+                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:preserveTicketMedia)
                 if !holds.isEmpty {item["state"] = "retained";item["reasons"] = holds.sorted()}
             }
             result.append(item)
@@ -439,7 +438,16 @@ extension CommandRouter {
         return .init(objects:result)
     }
 
-    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false) throws -> Set<String> {
+    func ticketObjectDeletionWorkspaces(_ db: Database,objects: [JSON],candidatePaths: Set<String>? = nil) throws -> CleanupWorkspaceProtection {
+        let paths = objects.compactMap {object -> String? in
+            guard object["state"] as? String == "pending",let path = object["relative_path"] as? String,
+                  candidatePaths == nil || candidatePaths?.contains(path) == true || object["kind"] as? String == "symlink" else {return nil}
+            return root.appendingPathComponent(path).path
+        }
+        return try CleanupWorkspaceProtection(db,paths:paths)
+    }
+
+    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, workspaces: CleanupWorkspaceProtection, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false) throws -> Set<String> {
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
         var holds = try sourceBuildCacheDeletionHolds(db,object:object)
         if preserveTicketMedia {
@@ -462,6 +470,7 @@ extension CommandRouter {
         }
         if !mediaAuthorityComplete {holds.insert("media_authority_unavailable")}
         let absolute = root.appendingPathComponent(relative).path
+        if workspaces.protects(absolute) {holds.insert("workspace_file")}
         var tokens = Set((object["owner_ids"] as? [String] ?? []).map {Data($0.utf8)})
         tokens.formUnion([relative,absolute,object["stored_path"] as? String ?? ""].filter {!$0.isEmpty}.map {Data($0.utf8)})
         if let cache = object["cache_path"] as? String {tokens.formUnion([Data(cache.utf8),Data(root.appendingPathComponent(cache).path.utf8)])}
@@ -470,14 +479,9 @@ extension CommandRouter {
         for token in tokens {matched.formUnion(references.reverse[token] ?? [])}
         // Typed holds can name a content digest instead of a path/record ID.
         matched.formUnion((references.reverse[Data(sha.utf8)] ?? []).filter {references.graph[$0]["record_type"] as? String == "storage_hold"})
-        for index in matched.union(references.projects) {
+        for index in matched {
             let value = references.graph[index]
             let type = value["record_type"] as? String ?? ""
-            if type == "project",let path = value["root_path"] as? String {
-                let workspace = URL(fileURLWithPath:path).resolvingSymlinksInPath().standardizedFileURL.path
-                let target = root.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL.path
-                if target == workspace || target.hasPrefix(workspace + "/") {holds.insert("workspace_file")}
-            }
             if ["cleanup_job","cleanup_preview"].contains(type) {continue}
             if type == "storage_job" {
                 let kind = value["kind"] as? String ?? ""

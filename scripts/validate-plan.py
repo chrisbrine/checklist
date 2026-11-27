@@ -352,6 +352,11 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_work_limit']['data']['result'] = copy.deepcopy(bad['operation_result']['data']['result'])
     reject('media-round-deletion', bad, 'work refusal claiming deletion')
+    history_limit = copy.deepcopy(examples['media-round-deletion'])
+    history_limit['operation_work_limit']['data']['error']['message'] = (
+        'A matched history row exceeds the 16 MiB work limit for one pass. The round remains present.')
+    if not validators['media-round-deletion'].is_valid(history_limit):
+        errors.append('media-round-deletion: a named history limit was rejected')
     for field, value in (('format', 2), ('state', 'active'), ('owner_kind', 'task'),
                          ('attachment_owner_id', '00000000-0000-0000-0000-000000000908')):
         bad = copy.deepcopy(examples['media-round-deletion'])

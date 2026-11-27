@@ -172,8 +172,9 @@ extension CommandRouter {
             return .init(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:nil,mediaAuthorityComplete:mediaComplete,candidatePaths:[],verifications:[:],verificationFailures:[:])
         }
         var objects = receipt["objects"] as? [JSON] ?? []
+        let workspaces = try ticketObjectDeletionWorkspaces(db,objects:objects)
         for i in objects.indices where pageLinks == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
-            let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
+            let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
             if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
         }
         pageLinks?.apply(&objects)
@@ -192,11 +193,11 @@ extension CommandRouter {
             if candidates.count >= 256 || !candidates.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 1 {break}
             guard let path = object["relative_path"] as? String else {continue}
             candidates.insert(path)
-            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty else {continue}
+            guard try ticketObjectDeletionHolds(db,object:object,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty else {continue}
             let deadline = ProcessInfo.processInfo.systemUptime + 60
             let check = {guard ProcessInfo.processInfo.systemUptime < deadline else {throw StorageSnapshotFailure.deadline}}
             backup?.verifyCopy(for:object,check:check)
-            guard try ticketObjectDeletionHolds(db,object:object,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty,
+            guard try ticketObjectDeletionHolds(db,object:object,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge").isEmpty,
                   object["kind"] as? String == "file",let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {continue}
             do {
                 verifications[path] = try TicketObjectRemovalVerification(root:root,relative:path,sha256:sha,size:size,check:check)

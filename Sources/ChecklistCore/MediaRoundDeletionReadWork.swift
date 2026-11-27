@@ -17,9 +17,11 @@ final class MediaRoundDeletionReferenceBudget: @unchecked Sendable {
 
     func charge(_ count: Int) throws {
         try lock.withLock {
-            guard count <= TicketCleanupInventory.rowByteLimit,
-                  count <= TicketCleanupInventory.byteLimit - bytes else {
-                throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected deletion holds exceed their safe bound; nothing was removed.")
+            guard count <= TicketCleanupInventory.rowByteLimit else {
+                throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected deletion hold exceeds the 4 MiB payload limit; nothing was removed.")
+            }
+            guard count <= TicketCleanupInventory.byteLimit - bytes else {
+                throw CoreError("CLEANUP_INVENTORY_LIMIT","Selected deletion holds exceed the 16 MiB reference limit; nothing was removed.")
             }
             bytes += count
         }

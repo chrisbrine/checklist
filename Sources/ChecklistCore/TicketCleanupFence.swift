@@ -106,7 +106,7 @@ struct TicketCleanupFence {
         self.commands = Set(commands.map {$0["cleanup_row"] as Int64})
     }
     private static func roots(_ db: Database) throws -> String {
-        let projects = try Row.fetchAll(db,sql:"SELECT CAST(id AS BLOB) AS id,json_quote(json_extract(data,'$.root_path')) AS root FROM records WHERE type='project' ORDER BY CAST(id AS BLOB)")
+        let projects = try Row.fetchAll(db,sql:"SELECT CAST(id AS BLOB) AS id,json_quote(json_extract(data,'$.root_path')) AS root FROM records WHERE rowid IN (\(CleanupWorkspaceProtection.projectRowIDs)) ORDER BY CAST(id AS BLOB)")
         return try jsonString(projects.map {["id":($0["id"] as Data).base64EncodedString(),"root":$0["root"] as String]})
     }
     func validate(_ db: Database) throws {
