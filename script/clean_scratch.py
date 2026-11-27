@@ -1065,9 +1065,8 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
     # Recheck each shared tree once. Revalidate child inventories and installed
     # identities afterward, so a slow shared scan cannot make those checks stale.
     parents = {Path(d['path']).parent for d in decisions}
-    round_holds = shared_round_holds(
-        {parent: items for parent, items in (rounds or {}).items() if parent in parents},
-        fingerprint, previous)
+    shared_rounds_in_batch = {parent: items for parent, items in (rounds or {}).items() if parent in parents}
+    round_holds = shared_round_holds(shared_rounds_in_batch, fingerprint, previous)
     for decision in decisions:
         item = Path(decision['path'])
         try:
@@ -1105,6 +1104,21 @@ def apply_batch(batch, installed_info, fingerprint, process_reader, mover,
     confirmed = set()
     destinations, retry = {}, []
     try:
+        if paths and shared_rounds_in_batch:
+            # Shared receipt scans can take long enough for a worker to open a
+            # checkout without changing its inventory. Refresh before handing
+            # any paths from this batch to the Trash backend.
+            ready = {Path(d['path']): d for d, _ in selected}
+            try:
+                active = used_items(process_reader(), ready)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                for decision in ready.values():
+                    move_error(decision, error, stop=True)
+            else:
+                for item, decision in ready.items():
+                    if item in active:
+                        move_error(decision, ValueError('running process began using item; stopped'), stop=True)
+            paths = [path for path in paths if not by_path[path].get('stopped')]
         if paths:
             for path, destination in mover(paths):
                 # stopOnError receipts must be an ordered prefix. Unknown or

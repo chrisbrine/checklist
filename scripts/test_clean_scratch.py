@@ -1476,6 +1476,38 @@ class CleanScratchTests(unittest.TestCase):
         self.assertTrue(payload.is_file())
         self.assertEqual(list(self.trash.iterdir()), [])
 
+    def test_apply_rechecks_process_use_after_shared_round_scan(self):
+        container = self.item('round')
+        self.write(container, '.build/CACHEDIR.TAG')
+        checkout = container / 'checkout'
+        payload = self.write(checkout, 'src/work.py', b'workspace payload')
+        sibling = container / 'idle'
+        self.write(sibling, 'src/work.py')
+        for workspace in (checkout, sibling):
+            self.mark(workspace, release=True)
+
+        original = cleanup.shared_round_receipts
+        scans = 0
+        observed_paths = []
+        def scan(root, workspaces):
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                observed_paths.append(payload)
+            yield from original(root, workspaces)
+
+        with patch.object(cleanup, 'shared_round_receipts', side_effect=scan):
+            result, rows = self.run_cleanup(apply=True, process_reader=lambda: list(observed_paths))
+        self.assertEqual(result, 1)
+        self.assertEqual(scans, 2)
+        self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                         [str(sibling)])
+        decision = next(row for row in rows if row.get('path') == str(checkout))
+        self.assertIn('running process began', decision['reason'])
+        self.assertEqual(decision['moved_count'], 0)
+        self.assertEqual(payload.read_bytes(), b'workspace payload')
+        self.assertTrue(checkout.is_dir())
+
     def test_apply_rechecks_child_marker_after_shared_round_scan(self):
         container = self.item('round')
         self.write(container, '.build/CACHEDIR.TAG')
