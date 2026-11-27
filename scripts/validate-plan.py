@@ -363,14 +363,15 @@ def check() -> dict:
     bad = copy.deepcopy(examples['media-round-deletion'])
     bad['operation_failure']['data']['error']['details']['preparation_timings']['unknown_phase'] = 0
     reject('media-round-deletion', bad, 'unknown refusal preparation phase')
-    for field in ('record_id', 'record_type'):
-        bad = copy.deepcopy(examples['media-round-deletion'])
-        bad['operation_successor_refusal']['data']['error']['details'].pop(field)
-        reject('media-round-deletion', bad, 'successor refusal missing ' + field)
-    for field, value in (('record_id', ' '), ('record_type', 'media_item'), ('title', 'Private round title')):
-        bad = copy.deepcopy(examples['media-round-deletion'])
-        bad['operation_successor_refusal']['data']['error']['details'][field] = value
-        reject('media-round-deletion', bad, 'successor refusal invalid ' + field)
+    for section in ('operation_successor_refusal', 'operation_attachment_reference_refusal'):
+        for field in ('record_id', 'record_type'):
+            bad = copy.deepcopy(examples['media-round-deletion'])
+            bad[section]['data']['error']['details'].pop(field)
+            reject('media-round-deletion', bad, section + ' missing ' + field)
+        for field, value in (('record_id', ' '), ('record_type', 'media_item'), ('title', 'Private record title')):
+            bad = copy.deepcopy(examples['media-round-deletion'])
+            bad[section]['data']['error']['details'][field] = value
+            reject('media-round-deletion', bad, section + ' invalid ' + field)
     for field in ('code', 'message'):
         bad = copy.deepcopy(examples['media-round-deletion'])
         bad['operation_work_limit']['data']['error'].pop(field)

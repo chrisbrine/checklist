@@ -495,23 +495,18 @@ final class MediaRoundDeletionTests: XCTestCase {
         }
     }
 
-    private func checkSuccessorHandoff(category: String,bounded: Bool) throws {
-        let f = try Fixture();try trash(f)
+    private func successorDoneHandoff(_ f: Fixture) throws -> (predecessor: JSON,successor: JSON,task: JSON,borrowed: JSON) {
         let predecessor = try imageRound(f,"first-pass.png"),task = try results.task(f)
         _ = try f.publish(predecessor);try f.acceptEach(predecessor)
         _ = try f.call("media_round_finish",actions.fence(f.get(predecessor)))
         let predecessorView = try f.get(predecessor)
         let item = try XCTUnwrap((predecessorView["items"] as? [JSON])?.first)
         let borrowed = try XCTUnwrap(f.rows("attachment").first)
-        let borrowedID = try XCTUnwrap(borrowed["id"] as? String)
-        let borrowedOwnerID = try XCTUnwrap(borrowed["attachment_owner_id"] as? String)
-        let borrowedJobID = try XCTUnwrap(borrowed["storage_job_id"] as? String)
         var successorInput = actions.fence(predecessorView)
         successorInput["source_round_id"] = successorInput.removeValue(forKey:"round_id")
         successorInput["title"] = "Published follow-up pass"
         successorInput["items"] = [["item_id":item["id"]!]]
         let successor = try f.call("media_round_successor",successorInput)
-        let successorID = try XCTUnwrap(successor["id"] as? String)
         let plan = try intake.confirm(f,intake.preview(f,successor,[intake.source(f,"follow-up.png",1)]))
         _ = try intake.capture(f,plan)
         _ = try results.link(f,successor,task)
@@ -519,6 +514,31 @@ final class MediaRoundDeletionTests: XCTestCase {
         _ = try f.call("media_round_send_result",results.sendInput(f,successor))
         try MediaLinkedTaskCleanupTests().done(f,task)
         XCTAssertEqual(try f.get(successor)["state"] as? String,"archived")
+        return (predecessor,successor,task,borrowed)
+    }
+
+    private func forceSuccessorGraph(_ f: Fixture,successor: JSON) throws {
+        let id = try XCTUnwrap(successor["id"] as? String)
+        try f.router.dbQueue.writeWithoutTransaction {db in
+            XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db))
+            try db.inTransaction {
+                // These structural children plus the round exceed one pass.
+                for _ in 0..<MediaRoundDeletionGraph.rowLimit {
+                    try f.router.save(db,["id":uuid(),"project_id":f.project,"revision":1,"round_id":id,
+                        "record_references":[["type":"media_round","id":id]]],type:"media_intake_row")
+                }
+                return .commit
+            }
+        }
+    }
+
+    private func checkSuccessorHandoff(category: String,bounded: Bool) throws {
+        let f = try Fixture();try trash(f)
+        let (predecessor,successor,task,borrowed) = try successorDoneHandoff(f)
+        let successorID = try XCTUnwrap(successor["id"] as? String)
+        let borrowedID = try XCTUnwrap(borrowed["id"] as? String)
+        let borrowedOwnerID = try XCTUnwrap(borrowed["attachment_owner_id"] as? String)
+        let borrowedJobID = try XCTUnwrap(borrowed["storage_job_id"] as? String)
         if category == "canceled" {
             try f.router.dbQueue.writeWithoutTransaction {db in
                 try f.router.withValidatedDomainTransaction(db) {
@@ -550,15 +570,8 @@ final class MediaRoundDeletionTests: XCTestCase {
         let successorDeletion = try input(f,successor)
         if bounded {
             let key = try MediaRoundDeletionGraph.key(MediaRoundDeletionHistory.progressKey(project:f.project,round:successorID))
-            try f.router.dbQueue.writeWithoutTransaction {db in
-                XCTAssertNil(try f.router.reconcileManagedAttachmentImports(db))
-                try db.inTransaction {
-                    for _ in 0..<MediaRoundDeletionGraph.rowLimit {
-                        try f.router.save(db,["id":uuid(),"project_id":f.project,"revision":1,"round_id":successorID,
-                            "record_references":[["type":"media_round","id":successorID]]],type:"media_intake_row")
-                    }
-                    return .commit
-                }
+            try forceSuccessorGraph(f,successor:successor)
+            try f.router.dbQueue.write {db in
                 try db.execute(sql:"""
                     CREATE TEMP TRIGGER interrupt_successor_publication BEFORE DELETE ON metadata
                     WHEN OLD.key='\(key)' BEGIN SELECT RAISE(ABORT,'synthetic interruption before publication'); END
@@ -573,12 +586,16 @@ final class MediaRoundDeletionTests: XCTestCase {
             checks.checkError("OUTCOME_UNKNOWN") {try worker(f,"media_round_delete",successorDeletion)}
             XCTAssertTrue(rolledBackPublication.withLock {$0})
             f.router.mediaRoundDeletionWriterProbe = nil
-            try f.router.dbQueue.write {try $0.execute(sql:"DROP TRIGGER interrupt_successor_publication")}
+            try f.reopen()
             let progress = try deletion(f,successor)
             XCTAssertEqual(progress["deletion_state"] as? String,"deleting")
             XCTAssertEqual(progress["removed_records"] as? Int,progress["total_records"] as? Int)
             checks.checkError("NOT_FOUND") {try f.record(successorID,"media_round")}
             try refusePredecessor()
+            if category == "done" {
+                let proof = try predecessorIntake(f,predecessor:predecessor,borrowed:borrowed)
+                try assertChangedIntakeRefusesGraphResume(f,successor:successor,params:successorDeletion,intake:proof)
+            }
         }
         let deleted = try worker(f,"media_round_delete",successorDeletion)
         let kept = try XCTUnwrap(deleted["kept_attachments"] as? [JSON])
@@ -605,6 +622,222 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertEqual(try exactRecords(f,["task","message","delivery"]),ticketRecords)
         _ = try f.router.runTicketObjectDeletionCohort()
         XCTAssertEqual(try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))},originalBytes)
+    }
+
+    private func assertSuccessorAttachmentReference(_ f: Fixture,successor: JSON,attachmentID: String,
+                                                    file: StaticString = #filePath,line: UInt = #line) throws {
+        let params = try input(f,successor)
+        let before = try f.allState()
+        XCTAssertThrowsError(try worker(f,"media_round_delete",params),file:file,line:line) {error in
+            let error = error as? CoreError
+            XCTAssertEqual(error?.code,"MEDIA_ROUND_REFERENCED",file:file,line:line)
+            XCTAssertEqual(error?.details["record_id"] as? String,attachmentID,file:file,line:line)
+            XCTAssertEqual(error?.details["record_type"] as? String,"attachment",file:file,line:line)
+            XCTAssertNil(error?.details["task_id"],"The marker must go through ordinary reference validation",file:file,line:line)
+        }
+        XCTAssertTrue(try f.allState() == before,"Refusal changed records, events or receipts",file:file,line:line)
+        checks.checkError("NOT_FOUND",{try deletion(f,successor)},file:file,line:line)
+    }
+
+    private func checkForeignSuccessorMarker(ticketCategory: String,bounded: Bool = false) throws {
+        let f = try Fixture(),(_,successor,_,_) = try successorDoneHandoff(f)
+        let foreignRound = try imageRound(f,"foreign-round.png",index:2),foreignTask = try results.task(f)
+        var foreign = try XCTUnwrap(f.rows("attachment").first {$0["task_id"] == nil})
+        let foreignID = try XCTUnwrap(foreign["id"] as? String)
+        XCTAssertNotNil(foreign["attachment_owner_id"])
+        XCTAssertNotNil(foreign["storage_job_id"])
+        foreign["task_id"] = foreignTask["id"]
+        foreign["media_cleanup_round_id"] = successor["id"]
+        try f.router.dbQueue.writeWithoutTransaction {db in
+            try f.router.withValidatedDomainTransaction(db) {
+                var ticket = foreignTask
+                ticket["status_id"] = try f.router.status(db,f.project,ticketCategory)["id"]
+                try f.router.save(db,f.router.revised(ticket),type:"task")
+                try f.router.save(db,foreign,type:"attachment")
+                return .commit
+            }
+        }
+        XCTAssertEqual(try f.get(foreignRound)["state"] as? String,"draft")
+        if bounded {try forceSuccessorGraph(f,successor:successor)}
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:foreignID)
+    }
+
+    func testSuccessorRefusesForeignCaptureMarkerOnAnotherDoneTicket() throws {
+        try checkForeignSuccessorMarker(ticketCategory:"done")
+    }
+
+    func testBoundedSuccessorRefusesForeignCaptureMarkerOnAnotherDoneTicket() throws {
+        try checkForeignSuccessorMarker(ticketCategory:"done",bounded:true)
+    }
+
+    func testSuccessorRefusesForeignCaptureMarkerOnAnotherActiveTicket() throws {
+        try checkForeignSuccessorMarker(ticketCategory:"active")
+    }
+
+    func testSuccessorRefusesAnotherExactReferenceInBorrowedAttachment() throws {
+        let f = try Fixture(),(_,successor,_,borrowed) = try successorDoneHandoff(f)
+        let id = try XCTUnwrap(borrowed["id"] as? String)
+        let items = try XCTUnwrap(f.get(successor)["items"] as? [JSON])
+        let item = try XCTUnwrap(items.first)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,id,type:"attachment")
+            attachment["reference"] = item["id"]
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+        }
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:id)
+    }
+
+    func testSuccessorRefusesOrdinaryTicketAttachmentEvenInHandoff() throws {
+        let f = try Fixture(),(_,successor,task,_) = try successorDoneHandoff(f)
+        let source = f.workspace.appendingPathComponent("ordinary-ticket-original.bin")
+        try Data("Ordinary ticket attachment".utf8).write(to:source)
+        let ordinary = try results.call(f,"attachment_add",["task_id":task["id"]!,"path":source.path,"mode":"managed_copy"])
+        let id = try XCTUnwrap(ordinary["id"] as? String)
+        let successorID = try XCTUnwrap(successor["id"] as? String)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,id,type:"attachment")
+            XCTAssertNil(attachment["attachment_owner_id"])
+            attachment["media_cleanup_round_id"] = successorID
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+            var round = try f.router.record(db,successorID,type:"media_round")
+            var handoff = try XCTUnwrap(round["done_task_cleanup"] as? JSON)
+            handoff["attachment_ids"] = strings(handoff,"attachment_ids") + [id]
+            handoff["managed_attachment_ids"] = strings(handoff,"managed_attachment_ids") + [id]
+            round["done_task_cleanup"] = handoff
+            try f.router.save(db,f.router.revised(round),type:"media_round")
+        }
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:id)
+    }
+
+    func testSuccessorRefusesPredecessorCaptureMissingFromExactTicketHandoff() throws {
+        let f = try Fixture(),(_,successor,_,borrowed) = try successorDoneHandoff(f)
+        let id = try XCTUnwrap(borrowed["id"] as? String)
+        let successorID = try XCTUnwrap(successor["id"] as? String)
+        try f.router.dbQueue.write {db in
+            var round = try f.router.record(db,successorID,type:"media_round")
+            var handoff = try XCTUnwrap(round["done_task_cleanup"] as? JSON)
+            XCTAssertTrue(strings(handoff,"managed_attachment_ids").contains(id))
+            handoff["attachment_ids"] = strings(handoff,"attachment_ids").filter {$0 != id}
+            round["done_task_cleanup"] = handoff
+            try f.router.save(db,f.router.revised(round),type:"media_round")
+        }
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:id)
+    }
+
+    func testSuccessorRefusesListedPredecessorCaptureOnAnotherDoneTicket() throws {
+        let f = try Fixture(),(_,successor,_,borrowed) = try successorDoneHandoff(f)
+        let id = try XCTUnwrap(borrowed["id"] as? String),otherTicket = try results.task(f)
+        try MediaLinkedTaskCleanupTests().done(f,otherTicket)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,id,type:"attachment")
+            attachment["task_id"] = otherTicket["id"]
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+        }
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:id)
+    }
+
+    private func predecessorIntake(_ f: Fixture,predecessor: JSON,borrowed: JSON) throws -> JSON {
+        try XCTUnwrap(f.rows("media_intake").first {
+            $0["round_id"] as? String == predecessor["id"] as? String &&
+            $0["attachment_owner_id"] as? String == borrowed["attachment_owner_id"] as? String
+        })
+    }
+
+    private func assertChangedIntakeRefusesGraphResume(_ f: Fixture,successor: JSON,params: JSON,intake: JSON) throws {
+        let id = try XCTUnwrap(intake["id"] as? String)
+        let progress = try jsonString(deletion(f,successor))
+        try f.router.dbQueue.write {db in
+            var changed = intake
+            changed.removeValue(forKey:"attachment_owner_id")
+            try f.router.save(db,changed,type:"media_intake")
+        }
+        let before = try f.allState()
+        XCTAssertThrowsError(try worker(f,"media_round_delete",params)) {error in
+            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
+            XCTAssertEqual((error as? CoreError)?.details["check"] as? String,"planned_record_changed")
+            XCTAssertEqual((error as? CoreError)?.details["record_type"] as? String,"media_intake")
+            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,id)
+        }
+        XCTAssertEqual(try f.allState(),before)
+        XCTAssertEqual(try jsonString(deletion(f,successor)),progress)
+        try f.router.dbQueue.write {try f.router.save($0,intake,type:"media_intake")}
+    }
+
+    func testBoundedSuccessorRechecksHandoffAfterDetachAndRestart() throws {
+        let f = try Fixture(),(predecessor,successor,_,borrowed) = try successorDoneHandoff(f)
+        try forceSuccessorGraph(f,successor:successor)
+        let params = try input(f,successor)
+        let id = try XCTUnwrap(borrowed["id"] as? String)
+        let proof = try predecessorIntake(f,predecessor:predecessor,borrowed:borrowed)
+        f.router.mediaRoundDeletionGraphProbe = {
+            if try f.record(id,"attachment")["media_cleanup_round_id"] == nil {
+                throw CoreError("TEST_INTERRUPT","Stopped after handoff detachment.")
+            }
+        }
+        checks.checkError("TEST_INTERRUPT") {try worker(f,"media_round_delete",params)}
+        XCTAssertNil(try f.record(id,"attachment")["media_cleanup_round_id"])
+        XCTAssertEqual(try deletion(f,successor)["removed_records"] as? Int,0)
+        try f.reopen()
+        try assertChangedIntakeRefusesGraphResume(f,successor:successor,params:params,intake:proof)
+        let reply = try worker(f,"media_round_delete",params)
+        XCTAssertEqual(reply["deleted"] as? Bool,true)
+        XCTAssertTrue((reply["kept_attachments"] as? [JSON] ?? []).contains {$0["attachment_id"] as? String == id})
+    }
+
+    func testSuccessorFencesPredecessorIntakeProvenanceAtCommit() throws {
+        let f = try Fixture(),(predecessor,successor,_,borrowed) = try successorDoneHandoff(f)
+        let intake = try predecessorIntake(f,predecessor:predecessor,borrowed:borrowed)
+        let intakeID = try XCTUnwrap(intake["id"] as? String)
+        var afterWrite: String?
+        f.router.mediaRoundDeletionPreparationProbe = {
+            try f.router.dbQueue.write {db in
+                var changed = intake
+                changed.removeValue(forKey:"attachment_owner_id")
+                try f.router.save(db,changed,type:"media_intake")
+            }
+            afterWrite = try f.allState()
+        }
+        defer {f.router.mediaRoundDeletionPreparationProbe = nil}
+        XCTAssertThrowsError(try worker(f,"media_round_delete",input(f,successor))) {error in
+            XCTAssertEqual((error as? CoreError)?.code,"MEDIA_CONTEXT_CHANGED")
+            XCTAssertEqual((error as? CoreError)?.details["check"] as? String,"planned_record_changed")
+            XCTAssertEqual((error as? CoreError)?.details["record_type"] as? String,"media_intake")
+            XCTAssertEqual((error as? CoreError)?.details["record_id"] as? String,intakeID)
+        }
+        XCTAssertTrue(try f.allState() == XCTUnwrap(afterWrite),"The fenced deletion changed the store")
+        checks.checkError("NOT_FOUND") {try deletion(f,successor)}
+    }
+
+    func testSuccessorKeepsExactPredecessorCaptureThroughItsImportJob() throws {
+        let f = try Fixture(),(_,successor,_,borrowed) = try successorDoneHandoff(f)
+        let id = try XCTUnwrap(borrowed["id"] as? String)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,id,type:"attachment")
+            attachment.removeValue(forKey:"attachment_owner_id")
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+        }
+        let reply = try worker(f,"media_round_delete",input(f,successor))
+        XCTAssertEqual(reply["deleted"] as? Bool,true)
+        XCTAssertTrue((reply["kept_attachments"] as? [JSON] ?? []).contains {$0["attachment_id"] as? String == id})
+        let retained = try f.record(id,"attachment")
+        XCTAssertNil(retained["media_cleanup_round_id"])
+        XCTAssertEqual(retained["storage_job_id"] as? String,borrowed["storage_job_id"] as? String)
+    }
+
+    func testSuccessorRefusesImportJobThatNamesADifferentAttachment() throws {
+        let f = try Fixture(),(_,successor,_,borrowed) = try successorDoneHandoff(f)
+        let id = try XCTUnwrap(borrowed["id"] as? String)
+        let jobID = try XCTUnwrap(borrowed["storage_job_id"] as? String)
+        let otherID = try XCTUnwrap(f.rows("attachment").first {$0["id"] as? String != id}?["id"] as? String)
+        try f.router.dbQueue.write {db in
+            var attachment = try f.router.record(db,id,type:"attachment")
+            attachment.removeValue(forKey:"attachment_owner_id")
+            try f.router.save(db,f.router.revised(attachment),type:"attachment")
+            var job = try f.router.record(db,jobID,type:"storage_job")
+            job["attachment_id"] = otherID
+            try f.router.save(db,f.router.revised(job),type:"storage_job")
+        }
+        try assertSuccessorAttachmentReference(f,successor:successor,attachmentID:id)
     }
 
     func testStandaloneDeletionMatchesPriorAttachmentSelectionAcrossTerminalTickets() throws {

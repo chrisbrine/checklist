@@ -44,6 +44,17 @@ struct MediaRoundDeletionChanges {
         }
         try db.execute(sql:"DROP TABLE IF EXISTS temp.\(name); DROP TABLE IF EXISTS temp.\(name)_overflow; DROP TABLE IF EXISTS temp.\(name)_budget")
     }
+
+    func validateObservation(_ db: Database,writerVersion: Int64) throws {
+        // Other sessions use this sole writer and are journaled. An untracked
+        // external SQL writer cannot be admitted without a complete observation.
+        guard try Int64.fetchOne(db,sql:"PRAGMA data_version") == writerVersion else {
+            throw MediaRoundDeletionFence.changed("untracked_writer",type:"metadata",id:Data("data_version".utf8))
+        }
+        guard try !Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(name)_overflow)")! else {
+            throw MediaRoundDeletionFence.changed("change_journal_overflow",type:"journal",id:Data(name.utf8))
+        }
+    }
 }
 
 struct MediaRoundDeletionFence: Codable {
@@ -98,10 +109,7 @@ struct MediaRoundDeletionFence: Codable {
     }
 
     func validate(_ db: Database,changes: MediaRoundDeletionChanges,writerVersion: Int64,afterVisibility: Bool = false) throws {
-        // Other sessions use this sole writer and are journaled. An untracked
-        // external SQL writer cannot be admitted without a complete observation.
-        guard try Int64.fetchOne(db,sql:"PRAGMA data_version") == writerVersion else {throw Self.changed("untracked_writer",type:"metadata",id:Data("data_version".utf8))}
-        guard try !Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(changes.name)_overflow)")! else {throw Self.changed("change_journal_overflow",type:"journal",id:Data(changes.name.utf8))}
+        try changes.validateObservation(db,writerVersion:writerVersion)
         guard try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(changes.name))") == true else {return}
         // Compare only changed project roots. Paths and the initial authority
         // were selected on the reader, and both lookups keep exact identities.

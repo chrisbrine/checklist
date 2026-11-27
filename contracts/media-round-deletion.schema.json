@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://checklist.local/contracts/media-round-deletion.schema.json",
-  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450, CL-516, CL-518, CL-519)",
+  "title": "Guarded media round deletion, command operation and content-free cleanup outcome (CL-446, CL-448\u2013450, CL-516, CL-518, CL-519, CL-521)",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -236,6 +236,39 @@
                       "properties": {
                         "record_id": {"$ref": "#/$defs/text"},
                         "record_type": {"const": "media_round"}
+                      },
+                      "required": ["record_id", "record_type"]
+                    }
+                  },
+                  "required": ["details"]
+                }
+              }
+            }
+          ]
+        },
+        "write_admission": {"$ref": "#/$defs/writeAdmission"}
+      },
+      "required": ["data"]
+    },
+    "operation_attachment_reference_refusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ordinary incoming-reference refusal for an attachment, including a cleanup marker without exact handoff and predecessor capture proof.",
+      "properties": {
+        "data": {
+          "allOf": [
+            {"$ref": "#/$defs/failedOperation"},
+            {
+              "properties": {
+                "error": {
+                  "properties": {
+                    "code": {"const": "MEDIA_ROUND_REFERENCED"},
+                    "details": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "record_id": {"$ref": "#/$defs/text"},
+                        "record_type": {"const": "attachment"}
                       },
                       "required": ["record_id", "record_type"]
                     }
@@ -506,7 +539,7 @@
           "items": {
             "$ref": "#/$defs/keptAttachment"
           },
-          "description": "Done/Canceled ticket attachments excluded from the round byte-deletion cohort and kept with their tickets. Present even when empty."
+          "description": "Done/Canceled ticket attachments excluded from the round byte-deletion cohort. Borrowed captures require exact successor handoff membership on its target ticket and capture provenance from the named predecessor. Present even when empty."
         },
         "preparation_seconds": {
           "type": "number",

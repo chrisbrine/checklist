@@ -15,6 +15,7 @@ struct MediaRoundDeletionPlan {
     let audit: JSON
     let keptAttachments: [JSON]
     let handoffOnlyIDs: Set<Data>
+    let handoffWitnessIDs: Set<Data>
     let fence: MediaRoundDeletionFence
     let recordSizes: [Data:Int]
     let batchGraph: Bool
@@ -462,34 +463,87 @@ extension CommandRouter {
             if e.type == "storage_job",let id = e.object["attachment_id"] as? String,
                try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records WHERE id=CAST(? AS TEXT) AND type='attachment')",arguments:[Data(id.utf8)]) == true {attachmentIDs.insert(Data(id.utf8))}
         }
-        var handoffOnlyIDs = Set<Data>()
+        var handoffOnlyIDs = Set<Data>(),handoffWitnessIDs = Set<Data>(),observedIDs = Set<Data>()
         var handoffBytes = 0
         let predecessor = round["predecessor_round_id"] as? String
-        if predecessor != nil {
-            // Done handoff can mark attachments under a predecessor's active
-            // capture owner. Keep the attachments without selecting that owner.
+        if let predecessorID = predecessor,
+           let handoff = round["done_task_cleanup"] as? JSON,handoff["state"] as? String == "handed_off",
+           let taskID = handoff["task_id"] as? String,!taskID.isEmpty,
+           let handedIDs = handoff["attachment_ids"] as? [String],!handedIDs.isEmpty {
+            // The handoff lists captures on its target ticket. Original capture
+            // owners belong to intakes; successor targets only borrow references.
             let handoffs = try Row.fetchCursor(db,sql:"""
-                SELECT CAST(id AS BLOB) AS id,octet_length(data) AS size FROM records
-                WHERE project_id=CAST(? AS TEXT) AND type='attachment'
-                  AND json_type(data,'$.task_id') IS NOT NULL
-                  AND json_extract(data,'$.media_cleanup_round_id')=CAST(? AS TEXT) COLLATE BINARY
-                """,arguments:[Data(project.utf8),Data(rid.utf8)])
+                WITH predecessor_intakes AS MATERIALIZED (
+                    SELECT json_extract(i.data,'$.attachment_owner_id') AS owner_id,
+                           min(i.id COLLATE BINARY) AS intake_id
+                    FROM records predecessor CROSS JOIN records i
+                    WHERE predecessor.id=CAST(? AS TEXT) AND predecessor.type='media_round'
+                      AND predecessor.project_id=CAST(? AS TEXT)
+                      AND i.type='media_intake' AND i.project_id=predecessor.project_id
+                      AND json_extract(i.data,'$.round_id')=predecessor.id COLLATE BINARY
+                      AND json_type(i.data,'$.attachment_owner_id')='text'
+                    GROUP BY owner_id COLLATE BINARY
+                )
+                SELECT CAST(a.id AS BLOB) AS id,octet_length(a.data) AS size,
+                       CAST(owner.id AS BLOB) AS owner_id,CAST(intake.intake_id AS BLOB) AS intake_id,
+                       CAST(job.id AS BLOB) AS import_id
+                FROM json_each(?) member
+                CROSS JOIN records a ON a.id=member.value COLLATE BINARY
+                LEFT JOIN records job ON json_type(a.data,'$.attachment_owner_id') IS NULL
+                    AND json_type(a.data,'$.storage_job_id')='text'
+                    AND job.id=json_extract(a.data,'$.storage_job_id') COLLATE BINARY
+                    AND job.type='storage_job' AND job.project_id=a.project_id
+                    AND json_extract(job.data,'$.kind')='attachment_import'
+                    AND json_extract(job.data,'$.state') IN ('committed','settled','repair_required')
+                    AND json_extract(job.data,'$.settled_reason') IS NOT 'canceled_media_staging'
+                    AND json_extract(job.data,'$.attachment_owner_kind')='media_intake'
+                    AND json_type(job.data,'$.attachment_owner_id')='text'
+                    AND json_extract(job.data,'$.attachment_id')=a.id COLLATE BINARY
+                JOIN records owner ON owner.id=CASE
+                    WHEN json_type(a.data,'$.attachment_owner_id')='text' THEN json_extract(a.data,'$.attachment_owner_id')
+                    ELSE json_extract(job.data,'$.attachment_owner_id') END COLLATE BINARY
+                    AND owner.type='storage_job' AND owner.project_id=a.project_id
+                    AND json_extract(owner.data,'$.kind')='media_attachment_owner'
+                    AND json_extract(owner.data,'$.owner_kind')='media_intake'
+                JOIN predecessor_intakes intake ON intake.owner_id=owner.id COLLATE BINARY
+                WHERE a.project_id=CAST(? AS TEXT) AND a.type='attachment'
+                  AND json_extract(a.data,'$.mode')='managed'
+                  AND json_extract(a.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY
+                  AND json_extract(a.data,'$.media_cleanup_round_id')=CAST(? AS TEXT) COLLATE BINARY
+                """,arguments:[Data(predecessorID.utf8),Data(project.utf8),try jsonString(handedIDs),
+                               Data(project.utf8),Data(taskID.utf8),Data(rid.utf8)])
             while let row = try handoffs.next() {
                 let id: Data = row["id"]
-                guard attachmentIDs.insert(id).inserted else {continue}
-                let size: Int = row["size"]
-                handoffBytes += size
-                guard attachmentIDs.count <= 100_000,size <= TicketCleanupInventory.rowByteLimit,
-                      selectedBytes + handoffBytes <= TicketCleanupInventory.byteLimit else {
-                    throw CoreError("CLEANUP_INVENTORY_LIMIT","The successor's ticket handoff exceeds the selected attachment or payload limit; nothing was removed.")
+                guard handoffOnlyIDs.insert(id).inserted else {continue}
+                if attachmentIDs.insert(id).inserted {
+                    let size: Int = row["size"]
+                    handoffBytes += size
+                    guard attachmentIDs.count <= 100_000,size <= TicketCleanupInventory.rowByteLimit,
+                          selectedBytes + handoffBytes <= TicketCleanupInventory.byteLimit else {
+                        throw CoreError("CLEANUP_INVENTORY_LIMIT","The successor's ticket handoff exceeds the selected attachment or payload limit; nothing was removed.")
+                    }
                 }
-                handoffOnlyIDs.insert(id)
+                let owner: Data = row["owner_id"],intake: Data = row["intake_id"]
+                handoffWitnessIDs.formUnion([id,Data(predecessorID.utf8),owner,intake])
+                if let job: Data = row["import_id"] {handoffWitnessIDs.insert(job)}
             }
         }
-        var keptAttachments: [JSON] = [],keptAudit: [JSON] = [],observedIDs = Set<Data>()
+        var keptAttachments: [JSON] = [],keptAudit: [JSON] = []
         for rawID in attachmentIDs.sorted(by:{$0.lexicographicallyPrecedes($1)}) {
             let id = String(decoding:rawID,as:UTF8.self)
             let attachment = try scoped(db,id,project,type:"attachment")
+            if predecessor != nil,EnvelopeStorageIdentity.equal(attachment["media_cleanup_round_id"] as? String,rid),
+               !handoffOnlyIDs.contains(rawID) {
+                // Candidate references alone do not prove ownership. Own
+                // captures reach this path via a selected owner or exact import.
+                let owner = (attachment["attachment_owner_id"] as? String).map {Data($0.utf8)}
+                let job = (attachment["storage_job_id"] as? String).flatMap {selected[Data($0.utf8)]}
+                let ownedCapture = owner.map(ownerIDs.contains) ?? (job?.value["kind"] as? String == "attachment_import" &&
+                    EnvelopeStorageIdentity.equal(job?.value["attachment_id"] as? String,id))
+                if !ownedCapture {
+                    continue
+                }
+            }
             if attachment["task_id"] != nil {
                 guard let taskID = attachment["task_id"] as? String,!taskID.isEmpty else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A captured attachment has malformed ticket ownership; nothing was removed.")}
                 let task = try scoped(db,taskID,project,type:"task")
@@ -497,7 +551,10 @@ extension CommandRouter {
                 guard ["done","canceled"].contains(status["category"] as? String ?? "") else {
                     throw CoreError("MEDIA_ROUND_REFERENCED","An open ticket still owns a captured attachment; nothing was removed.",details:["record_id":id,"record_type":"attachment","task_id":taskID])
                 }
-                observedIDs.formUnion([rawID,Data(taskID.utf8),Data((try StoredRecord(status,family:"status").string("id")).utf8)])
+                let ticketWitnesses = [Data(taskID.utf8),Data((try StoredRecord(status,family:"status").string("id")).utf8)]
+                observedIDs.formUnion(ticketWitnesses)
+                observedIDs.insert(rawID)
+                if handoffOnlyIDs.contains(rawID) {handoffWitnessIDs.formUnion(ticketWitnesses)}
                 keptAttachments.append(attachment)
                 keptAudit.append(["attachment_id":id,"task_id":taskID,"task_key":try StoredRecord(task,family:"task").string("key"),"status":"kept","reason":"kept_with_ticket"])
                 continue
@@ -623,6 +680,7 @@ extension CommandRouter {
         let cleanupFinished = ProcessInfo.processInfo.systemUptime
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         observedIDs.formUnion(owned)
+        observedIDs.formUnion(handoffWitnessIDs)
         let workspacePaths = objects.compactMap { object -> String? in
             guard let path = object["relative_path"] as? String else {return nil}
             // Staging objects retain their exact reference needles above. They
@@ -637,7 +695,7 @@ extension CommandRouter {
             "preparation_seconds":historyFinished-started,"preparation_timings":["graph_seconds":graphFinished-started,"references_seconds":referencesSeconds,"cleanup_seconds":cleanupFinished-historySelected,"history_seconds":historySelected-referencesFinished+historyFinished-cleanupFinished+(parallelHistory?.1 ?? 0)]]
         return .init(version:version,project:project,round:rid,predecessor:predecessor,records:removed,history:history,
                      historyProgress:progress,bytes:cleanup,audit:audit,keptAttachments:keptAttachments,
-                     handoffOnlyIDs:handoffOnlyIDs,fence:fence,recordSizes:selectedSizes,batchGraph:batchGraph)
+                     handoffOnlyIDs:handoffOnlyIDs,handoffWitnessIDs:handoffWitnessIDs,fence:fence,recordSizes:selectedSizes,batchGraph:batchGraph)
     }
 
     func mediaRoundDeletionReferences(_ snapshot: Database,owned: Set<Data>,retainedAttachments: Set<Data>,handoffOnlyIDs: Set<Data>,
@@ -666,7 +724,8 @@ extension CommandRouter {
             var value = row.value
             if retainedAttachments.contains(row.key) {
                 guard handoffOnlyIDs.contains(row.key) else {return}
-                // Only the cleanup marker is expected to refer to the successor.
+                // Only the proven handoff marker is exempt. Other exact
+                // references still protect the round.
                 value.removeValue(forKey:"media_cleanup_round_id")
             }
             let large = bool(value,"_cleanup_large_match")

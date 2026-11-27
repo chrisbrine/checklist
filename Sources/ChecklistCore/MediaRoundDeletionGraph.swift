@@ -26,6 +26,7 @@ struct MediaRoundDeletionGraph {
         let total: Int
         let slices: Int
         var pass: Int
+        var handoffWitnessCount: Int? = nil
         var phase: Phase = .staging
         var staged = 0
         var next = 0
@@ -39,6 +40,8 @@ struct MediaRoundDeletionGraph {
                   staged >= 0, next >= 0, next <= slices, sliceOffset >= 0, sliceOffset < rowLimit,
                   next < slices || sliceOffset == 0, total > 0, total <= 100_000,
                   removed >= 0, removed <= total,
+                  (handoffWitnessCount ?? 0) >= 0,
+                  (handoffWitnessCount ?? 0) == 0 || predecessor != nil,
                   phase != .staging || (staged > 0 && next == 0 && sliceOffset == 0 && removed == 0),
                   phase != .deleting || staged > 0,
                   phase != .retiring || (next == slices && removed == total) else {
@@ -99,6 +102,10 @@ struct MediaRoundDeletionGraph {
 
     static func shardKey(_ key: String, _ index: Int) -> String {
         key + ":shard:" + String(index)
+    }
+
+    static func handoffWitnessPrefix(_ key: String) -> String {
+        key + ":handoff:"
     }
 
     static func load<T: Decodable>(_ db: Database,_ key: String,as type: T.Type) throws -> T? {
