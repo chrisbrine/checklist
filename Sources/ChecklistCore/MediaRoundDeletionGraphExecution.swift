@@ -431,7 +431,7 @@ extension CommandRouter {
                     FROM json_each(?)
                 )
                 UPDATE records SET data=selected.data,revision=selected.revision FROM selected
-                WHERE records.rowid=selected.position AND records.id=selected.id COLLATE BINARY
+                WHERE records.rowid=selected.position AND records.id=selected.id
                 """,arguments:[updates])
             guard db.changesCount == slice.changes.count else {
                 throw MediaRoundDeletionFence.changed("graph_detach",type:"media_round",id:Data(context.round.utf8))

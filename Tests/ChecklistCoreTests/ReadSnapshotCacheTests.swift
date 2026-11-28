@@ -17,6 +17,7 @@ private final class VersionWALHandle {
 final class ReadSnapshotCacheTests: XCTestCase {
     func testOpaqueReadVersionChangesOnCommitAndCallerButSurvivesReaderChurnAndRollback() throws {
         let f = try ReadPerformanceFixture("CL-254-read-version"),r = f.router,reader = try XCTUnwrap(r.readers)
+        try f.save([("message",["id":"version-seed","project_id":"project","revision":1])])
         func version(_ caller: Caller) throws -> String {
             try reader.read {db in try r.readSnapshotCache.withSnapshot(db,caller:caller) {
                 try XCTUnwrap(r.readSnapshotCache.readVersion(db))

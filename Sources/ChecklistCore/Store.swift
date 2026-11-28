@@ -21,12 +21,9 @@ public final class CommandRouter: @unchecked Sendable {
     var fixtureStoreStatement: ((Database, String, StatementArguments) throws -> Void)?
     var fixtureStoreRows: ((Database, String, StatementArguments) throws -> [Row])?
     let dbQueue: any TransactionStorage
-    /// Read-only connections for pure reads (CL-72). Nil when the store cannot open them;
-    /// reads then use the writer path.
-    let readers: DatabasePool?
+    let readerPool: ReadOnlyDatabasePool
+    var readers: DatabasePool? {readerPool.current}
     let cursorKey: SymmetricKey
-    // Writer connection only, including startup and maintenance callbacks.
-    var lastRoutinePrune: Date?
     var workHealthScanPosition: Int64 = 0
     let workHealthPreparationLock = NSLock()
     /// Owned-test seam at the expensive work-health read boundary.
@@ -117,17 +114,17 @@ public final class CommandRouter: @unchecked Sendable {
         try self.init(root:root,serviceLease:serviceLease,cliCommand:cliCommand,providerPlugins:providerPlugins,
                       automaticBackupRetentionTrashRoot:automaticBackupRetentionTrashRoot,fixtureTrackEpicReferences:true)
     }
+    package convenience init(root: URL, serviceLease: StorageServiceLease, cliCommand: String, openingCheck: StoreOpeningCheck?) throws {
+        try self.init(root: root, serviceLease: serviceLease, cliCommand: cliCommand, providerPlugins: .bundled,
+                      automaticBackupRetentionTrashRoot: nil, fixtureTrackEpicReferences: true, openingCheck: openingCheck)
+    }
     /// CL-363: a test-support statement about a store that the caller cloned from a published
     /// template a moment ago, into a folder that had fresh scaffolding only. No product code
     /// makes one. The startup then leaves out work that changes nothing for such a store:
     /// the read-only schema preflight (the caller wrote `identity` to the database and to the
-    /// receipt file), and, for a clone that the caller found `empty` (no row in `records`,
-    /// `commands` or `cursors`, and no managed file or staging folder), the three sweeps of
-    /// pending captures, exports and imports (they find nothing) and the statements of the
-    /// routine pruning pass that can match no row. The retention mark of that pass is written
-    /// as always, so the write-ahead log has its first frame as after a complete startup.
-    /// The first storage maintenance pass, recovery of sources and operations, admission and
-    /// the reader pool are unchanged. A clone that is not `empty` keeps the complete pass.
+    /// receipt file). A clone that the caller found `empty` omits the three sweeps of pending
+    /// captures, exports and imports. For a nonempty clone, those crash-recovery sweeps
+    /// still run. The service schedules routine maintenance after storage opens.
     struct FixtureFreshStore {
         let identity: StoreIdentityReceipt
         let empty: Bool
@@ -135,7 +132,8 @@ public final class CommandRouter: @unchecked Sendable {
     /// Disposable component fixtures may omit the derived deletion proof only.
     /// Production, storage, durability and deletion tests keep the public default.
     init(root: URL, serviceLease: StorageServiceLease?, cliCommand: String, providerPlugins: ProviderPluginRegistry,
-         automaticBackupRetentionTrashRoot: URL?, fixtureTrackEpicReferences: Bool, fixtureFreshStore: FixtureFreshStore? = nil) throws {
+         automaticBackupRetentionTrashRoot: URL?, fixtureTrackEpicReferences: Bool, fixtureFreshStore: FixtureFreshStore? = nil,
+         openingCheck: StoreOpeningCheck? = nil) throws {
         self.fixtureOmitsEpicReferenceIndex = !fixtureTrackEpicReferences
         let root = StoreDirectory.anchoredRoot(root)
         self.root = root
@@ -144,23 +142,19 @@ public final class CommandRouter: @unchecked Sendable {
         self.providerPlugins = providerPlugins
         self.automaticBackupRetentionTrashRoot = automaticBackupRetentionTrashRoot
         let opened: StorageBootstrap.Opened
-        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,knownCurrentIdentity:fixtureFreshStore?.identity,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
+        do { opened = try StorageBootstrap.open(root:root,serviceLease:serviceLease,knownCurrentIdentity:fixtureFreshStore?.identity,openingCheck:openingCheck,prepareDatabase:{ Self.installTicketSearchFunctions($0) }) }
+        catch let refusal as StoreOpeningCheck.Refusal { throw refusal }
         catch { StoreRecovery.recordFailure(root:root,error:error);throw error }
         Self.qualificationStartupObserve?("bootstrap_end")
         let gateFiles = try StorageObjectFiles(root:root,pinRootForGates:true)
         self.gateFiles = gateFiles
-        self.managedCapturePaths = try opened.queue.read { try ManagedPathRelocation.captureBindings($0, root: root) }
+        let storage = GRDBTransactionAdapter(queue: opened.queue)
+        self.managedCapturePaths = try storage.read { try ManagedPathRelocation.captureBindings($0, root: root) }
         Self.qualificationStartupObserve?("capture_bindings_end")
-        self.dbQueue = GRDBTransactionAdapter(queue: opened.queue)
+        self.dbQueue = storage
         self.incarnation = opened.incarnation
-        self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try opened.queue.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
-        var readerConfiguration = Configuration()
-        readerConfiguration.readonly = true
-        readerConfiguration.prepareDatabase { db in
-            try SchemaMigrations.installStorageCollation(db); Self.installTicketSearchFunctions(db)
-            try db.execute(sql:"PRAGMA busy_timeout=5000")
-        }
-        self.readers = Self.disableReaderPoolForTesting ? nil : try? DatabasePool(path: root.appendingPathComponent("checklist.sqlite").path, configuration: readerConfiguration)
+        self.cursorKey = (try? ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in try storage.write { db in try SealedCursor.storeKey(db) } }) ?? SymmetricKey(size: .bits256)
+        self.readerPool = ReadOnlyDatabasePool(root:root)
         // Authority reconciliation must commit even when unrelated maintenance is broken.
         do {
             try commandOperations.restoreAdmissions(root:root,incarnation:incarnation) {try self.validateOperationRecord($0,id:$1)}
@@ -179,7 +173,7 @@ public final class CommandRouter: @unchecked Sendable {
         do {
             let startupLease = try storageAdmission.acquire()
             defer { startupLease.finish() }
-            try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { permit in
+            try ArchiveStorageGate.withExclusive(root: root,files:gateFiles) { _ in
                 dbQueue.writeWithoutTransaction { db in
                     if fixtureFreshStore?.empty != true {
                         // CL-70: files left by commands that never committed, before any new command.
@@ -190,14 +184,6 @@ public final class CommandRouter: @unchecked Sendable {
                     if fixtureFreshStore?.empty != true { try? self.sweepAbandonedManagedImports(db) }
                     Self.qualificationStartupObserve?("abandoned_imports_end")
                     self.managedImportStageReferences = try? ManagedImportStageReferences(db)
-                    _ = self.performStorageMaintenance(db, permit: permit)
-                    Self.qualificationStartupObserve?("storage_maintenance_end")
-                    if fixtureFreshStore?.empty == true {
-                        // With no cursor, command or record row, the pruning pass is its mark write alone.
-                        let now = Date()
-                        self.lastRoutinePrune = now
-                        try? db.inTransaction { _ = try self.commandRetentionCutoff(db, now: now.timeIntervalSince1970); return .commit }
-                    } else { _ = self.pruneRoutineRecordsIfDue(db) }
                 }
             }
         } catch {
@@ -207,9 +193,6 @@ public final class CommandRouter: @unchecked Sendable {
         if fixtureTrackEpicReferences { try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) } }
         try backupWrites.restore(root:root,incarnation:incarnation,admission:storageAdmission)
         backupWrites.resume(router:self)
-        // The bootstrap gate and any protected capture are released before
-        // retention reconciles an original intent or a just-completed backup.
-        applyAutomaticBackupRetention(after:opened.completedProtectedBackupOperation)
     }
     static let canonicalRecordColumns = "id,project_id,type,revision,data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(data AS BLOB) AS _envelope_data_bytes"
     // CASE guards every JSON operation. A foreign malformed payload is never
@@ -230,12 +213,9 @@ public final class CommandRouter: @unchecked Sendable {
         return value
     }
     func records(_ db: Database, type: String, project: String? = nil) throws -> [JSON] {
-        // The project catalog is small, but a type-only table scan touches every
-        // large retained history payload on a cold store. Enumerate its rowids
-        // from the existing narrow scope index, then load only those records.
         let catalog = type == "project" && project == nil
         var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE " + (catalog
-            ? "rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type = CAST(? AS TEXT))"
+            ? "rowid IN (\(Self.projectCatalogRowIDs))"
             : "type = CAST(? AS TEXT)")
         var arguments: [DatabaseValueConvertible] = [Data(type.utf8)]
         if MediaRoundDeletionGraph.mayOwn(type) {query += " AND " + MediaRoundDeletionGraph.visibleSQL()}
@@ -247,6 +227,19 @@ public final class CommandRouter: @unchecked Sendable {
             try self.fetchStoreRows(db,sql:query + " ORDER BY rowid",arguments:StatementArguments(arguments))
         }
     }
+    // The scope index starts with project_id. Seek to each next project_id and
+    // look up its project row by (project_id,type), regardless of history size.
+    // The final NULL also searches any legacy row with a NULL scope.
+    private static let projectCatalogRowIDs = """
+        WITH RECURSIVE scopes(project_id) AS (
+            SELECT min(project_id) FROM records INDEXED BY records_scope WHERE project_id IS NOT NULL
+            UNION ALL
+            SELECT (SELECT min(project_id) FROM records INDEXED BY records_scope WHERE project_id > scopes.project_id)
+            FROM scopes WHERE scopes.project_id IS NOT NULL
+        )
+        SELECT records.rowid FROM scopes CROSS JOIN records INDEXED BY records_scope
+        WHERE records.project_id IS scopes.project_id AND records.type = CAST(? AS TEXT)
+        """
     /// A pure read runs on a read-only connection; a write there asks for the writer path.
     func requireWriter(_ db: Database) throws {
         // The media preparation overlay writes only TEMP rows on its read-only connection.
@@ -342,7 +335,11 @@ public final class CommandRouter: @unchecked Sendable {
         for field in ["triage_id","epic_id","from_epic_id","to_epic_id"] {
             if let id = data[field] as? String,let group = try? record(db,id,type:"group") { data[String(field.dropLast(3)) + "_key"] = group["key"] ?? "";data[String(field.dropLast(3)) + "_name"] = group["name"] ?? "" }
         }
-        try executeStoreStatement(db,sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?, ?,CAST(? AS TEXT))",arguments:[Data(uuid().utf8),project.map {Data($0.utf8)},entity.map {Data($0.utf8)},Data(caller.principal.utf8),kind,now(),Data((try jsonString(data)).utf8)])
+        try appendEncodedEvent(db,caller:caller,project:project,entity:entity,kind:kind,data:Data((try jsonString(data)).utf8))
+    }
+    func appendEncodedEvent(_ db: Database,caller: Caller,project: String?,entity: String?,kind: String,data: Data) throws {
+        try requireWriter(db)
+        try executeStoreStatement(db,sql:"INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?, ?,CAST(? AS TEXT))",arguments:[Data(uuid().utf8),project.map {Data($0.utf8)},entity.map {Data($0.utf8)},Data(caller.principal.utf8),kind,now(),data])
     }
     func revised(_ record: JSON) -> JSON { var r = record; r["revision"] = int(r,"revision") + 1; r["updated_at"] = now(); return r }
     func revision(_ p: JSON, _ r: JSON) throws {
@@ -426,23 +423,42 @@ public final class CommandRouter: @unchecked Sendable {
                        observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,expectedAuthorizationGeneration: String? = nil) throws -> [String: Any] {
         // CL-362: a transient descriptor shortage must not fail an ordinary attachment.
         func attempt() throws -> JSON {
-            try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait,
-                              observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+            try ServiceHoldWatchdog.withWorkLabel(method) {
+                try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait,
+                                  observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+            }
         }
         guard method == "attachment_add" else {return try attempt()}
         return try StorageFailureReport.retryingTransient {try attempt()}
     }
+    /// The service supplies authenticated reads from its independent lane.
+    /// Existing authority-changing continuations keep their ordinary admission.
+    public func handleIndependentRead(method: String,params: [String: Any],caller: Caller,expectedAuthorizationGeneration: String? = nil,
+                                      observeOperationWriterWait: ((TimeInterval) -> Void)? = nil) throws -> [String: Any] {
+        guard Self.readMethods.contains(method) else {throw CoreError("UNSUPPORTED_METHOD","This command needs write admission.")}
+        if readers == nil {
+            let unavailable = readerUnavailable()
+            guard method == "service_info", !caller.isOwner, caller.sessionID == nil, params.isEmpty else {throw unavailable}
+            let lease = try storageAdmission.acquire();defer {lease.finish()}
+            return addingWriteAdmission(["data":unboundServiceInfo(caller)])
+        }
+        return try handleAttempt(method:method,params:params,caller:caller,observeOperationWriterWait:observeOperationWriterWait,
+            observeStoragePhase:nil,expectedAuthorizationGeneration:expectedAuthorizationGeneration,independentRead:true)
+    }
     private func handleAttempt(method: String, params: [String: Any], caller: Caller,observeOperationWriterWait: ((TimeInterval) -> Void)?,
-                               observeStoragePhase: ((String,TimeInterval) -> Void)?,expectedAuthorizationGeneration: String?) throws -> [String: Any] {
+                               observeStoragePhase: ((String,TimeInterval) -> Void)?,expectedAuthorizationGeneration: String?,
+                               independentRead: Bool = false) throws -> [String: Any] {
         // Validation, preparation and owner projection also bridge Foundation
         // objects outside the SQL callbacks. Bound their lifetime on this thread.
         try autoreleasepool {
             guard ["owner","worker","assistant"].contains(caller.role),!caller.installation.isEmpty else {throw CoreError("FORBIDDEN","An authenticated connection is required.")}
             guard let encoded = try? JSONSerialization.data(withJSONObject:params),encoded.count <= 2_000_000 else {throw CoreError("INVALID_INPUT","Command input is too large or invalid.")}
             try validateInput(method,params,caller)
-            if method == "operation_get" {return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,observeWriterWait:observeOperationWriterWait)!)}
+            if method == "operation_get" {return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,
+                observeWriterWait:observeOperationWriterWait,independentRead:independentRead)!)}
             if method == "command_status" {
-                return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,byCommand:true,observeWriterWait:observeOperationWriterWait) ?? backupCommandStatus(params:params,caller:caller))
+                return addingWriteAdmission(try commandOperationRead(params:params,caller:caller,byCommand:true,
+                    observeWriterWait:observeOperationWriterWait,independentRead:independentRead) ?? backupCommandStatus(params:params,caller:caller))
             }
             var admittedWrite = false
             let admittedReply: JSON? = try commandOperations.withAdmission(principal:caller.principal,command:params["command_id"] as? String) {
@@ -451,7 +467,7 @@ public final class CommandRouter: @unchecked Sendable {
                 if commandOperations.enabled,!scheduled,
                    try hasCommandOperation(params:params,caller:caller) || (!legacyReserved && needsCommandOperation(method:method,params:params,caller:caller)) {
                     return try acceptCommandOperation(method:method,params:params,caller:caller,observeWriterWait:observeOperationWriterWait,
-                        expectedGeneration:expectedAuthorizationGeneration)
+                        expectedGeneration:expectedAuthorizationGeneration,preferImmediateWriter:independentRead)
                 }
                 // The scheduled deletion admits its own bounded writer steps.
                 if scheduled,method == "media_round_delete",!legacyReserved {return nil}
@@ -475,11 +491,13 @@ public final class CommandRouter: @unchecked Sendable {
             // Admission locks never span file work or domain execution.
             defer {if admittedWrite {backupWrites.finishWrite()}}
             return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller,
-                observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration))
+                observeStoragePhase:observeStoragePhase,expectedAuthorizationGeneration:expectedAuthorizationGeneration,independentRead:independentRead))
         }
     }
     func executeBackupQueuedWrite(method: String,params: JSON,caller: Caller) throws -> JSON {
-        try autoreleasepool {try handleCommand(method:method,params:params,caller:caller)}
+        try ServiceHoldWatchdog.withWorkLabel(method) {
+            try autoreleasepool {try handleCommand(method:method,params:params,caller:caller)}
+        }
     }
     /// Internal native-send fences require a committed receipt before external
     /// I/O. Nil defers the entire send without creating an uncertainty record.
@@ -489,13 +507,16 @@ public final class CommandRouter: @unchecked Sendable {
         if try hasCommandOperation(params:params,caller:caller) {return nil}
         guard backupWrites.admitWithoutQueue() else {return nil}
         defer {backupWrites.finishWrite()}
-        return addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+        return try ServiceHoldWatchdog.withWorkLabel(method) {
+            addingWriteAdmission(try handleCommand(method:method,params:params,caller:caller))
+        }
     }
     public func withImmediateWriteAccess<T>(_ body: () throws -> T) rethrows -> T? {
         try backupWrites.withImmediateAccess(body)
     }
     private func handleCommand(method: String, params: [String: Any], caller: Caller,
-                               observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,expectedAuthorizationGeneration: String? = nil) throws -> [String: Any] {
+                               observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,expectedAuthorizationGeneration: String? = nil,
+                               independentRead: Bool = false) throws -> [String: Any] {
         func storagePhaseStart() -> TimeInterval? { observeStoragePhase.map { _ in ProcessInfo.processInfo.systemUptime } }
         func finishStoragePhase(_ phase: String, since start: TimeInterval?) {
             if let start { observeStoragePhase?(phase,ProcessInfo.processInfo.systemUptime-start) }
@@ -522,7 +543,7 @@ public final class CommandRouter: @unchecked Sendable {
             defer {if writerRead {backupWrites.finishWrite()}}
             do {
                 let value = try executeMediaWorkerChannel(method:method,params:params,caller:caller,
-                    expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+                    expectedAuthorizationGeneration:expectedAuthorizationGeneration,observeStoragePhase:observeStoragePhase)
                 var reply: JSON = ["data":value]
                 if !Self.mediaWorkerReads.contains(method) { reply["command_id"] = params["command_id"] }
                 return reply
@@ -546,7 +567,7 @@ public final class CommandRouter: @unchecked Sendable {
             }
             defer {if writerRead {backupWrites.finishWrite()}}
             do {
-                let value = try executeMediaOwnerChannel(method:method,params:params,caller:caller)
+                let value = try executeMediaOwnerChannel(method:method,params:params,caller:caller,observeStoragePhase:observeStoragePhase)
                 var reply: JSON = ["data":value]
                 if !Self.mediaOwnerReads.contains(method) {reply["command_id"] = params["command_id"]}
                 return reply
@@ -582,7 +603,11 @@ public final class CommandRouter: @unchecked Sendable {
         // writer. A read that turns out to write (for example a first cleanup preview) runs
         // again on the writer path below.
         if Self.pureReadMethods.contains(method),let readers {
-            do { return commandManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller),caller:caller,command:params["command_id"] as? String) }
+            do {
+                let generation = independentRead ? expectedAuthorizationGeneration : nil
+                return commandManagedPathProjection(try executePureRead(readers,method:method,params:params,caller:caller,
+                    expectedAuthorizationGeneration:generation),caller:caller,command:params["command_id"] as? String)
+            }
             catch let error where Self.needsWriter(error) {}
         }
         // A read-only attempt may discover a required hold, availability
@@ -635,8 +660,7 @@ public final class CommandRouter: @unchecked Sendable {
         // CL-410 F6: with a reader pool, the recipient scans run after the writer and the object gate are free.
         var noticesAfterWriter = false
         let write: (Database,ArchiveStoragePermit,PreparedManualTicketPurge?) throws -> JSON = {db,permit,preparedPurge in
-            // Decode/encode temporaries belong to this command, including its
-            // post-commit maintenance and notices. Drain on the writer's thread;
+            // Decode/encode temporaries belong to this command. Drain on the writer's thread;
             // a pool on the calling service queue cannot guarantee that lifetime.
             self.commandPreparation = preparation; self.inlineSourceCaptures = []; self.consumedSourceCaptures = []; self.exportPublications = []
             defer { createdCaptures += self.inlineSourceCaptures; publishedExports += self.exportPublications; self.commandPreparation = CommandPreparation(); self.inlineSourceCaptures = []; self.consumedSourceCaptures = []; self.exportPublications = [] }
@@ -720,18 +744,7 @@ public final class CommandRouter: @unchecked Sendable {
                 }
                 throw error
             }
-            // Unused-Epic deletion promises to preserve every unrelated row,
-            // including on receipt replay. Defer ordinary maintenance to another
-            // command or startup instead of coupling it to this narrow deletion.
-            var maintenanceWarning: StorageMaintenanceWarning?
-            if method != "epic_delete" {
-                let started = storagePhaseStart()
-                maintenanceWarning = self.performStorageMaintenance(db, permit: permit)
-                finishStoragePhase("post_commit_maintenance_ms",since:started)
-                let pruneStarted = storagePhaseStart()
-                _ = self.pruneRoutineRecordsIfDue(db)
-                finishStoragePhase("routine_prune_ms",since:pruneStarted)
-            }
+            var maintenanceWarning = method == "epic_delete" ? nil : self.currentStorageMaintenanceWarning()
             do {output = try self.addingTicketObjectDeletionReceipt(db,output:output)}
             catch {maintenanceWarning = maintenanceWarning ?? .retryPending}
             // Dynamic recipient notices are not part of the durable command outcome.
@@ -788,7 +801,7 @@ public final class CommandRouter: @unchecked Sendable {
     public func closeStore() throws {
         epicReferenceIndex.stop()
         try ticketCleanupReaders?.close()
-        try readers?.close()
+        try readerPool.close()
         try dbQueue.close()
     }
     /// Every read method starts on the read-only connections (finding 2a41447f). A read that
@@ -802,8 +815,15 @@ public final class CommandRouter: @unchecked Sendable {
         if let error = error as? DatabaseError { return error.resultCode == .SQLITE_READONLY }
         return false
     }
-    func executePureRead(_ readers: DatabasePool,method: String,params: [String: Any],caller: Caller) throws -> [String: Any] {
+    func executePureRead(_ readers: DatabasePool,method: String,params: [String: Any],caller: Caller,
+                         expectedAuthorizationGeneration: String? = nil) throws -> [String: Any] {
         try readers.read { db in try readSnapshotCache.withSnapshot(db,caller:caller) {
+            if let expectedAuthorizationGeneration, let project = caller.projectIDs.first {
+                let generation = try self.backupWriteAuthorization(db,params:["project_id":project],caller:caller)
+                guard generation == expectedAuthorizationGeneration else {
+                    throw CoreError("CONNECTION_REVOKED","The session registration changed before the read could start.")
+                }
+            }
             if !caller.isOwner,let pid = params["project_id"] as? String {
                 _ = try self.scope(db,["project_id":pid],caller)
                 if caller.role == "assistant" { try self.assistantPermission(caller,pid,["message_ack","assistant_inbox"].contains(method) ? "receive_messages" : "read") }

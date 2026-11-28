@@ -30,6 +30,43 @@ final class ArchiveCleanupJournalBudgetTests: XCTestCase {
         try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM archive_cleanup_scan_changes WHERE id IS NULL AND atom IS NULL)") == true
     }
 
+    func testCanceledJournalInstallationLeavesPriorArchiveAndTicketTriggersDisarmed() throws {
+        let queue = try DatabaseQueue()
+        try queue.writeWithoutTransaction { db in
+            try db.execute(sql:"""
+                CREATE TABLE records(id TEXT PRIMARY KEY,project_id TEXT,type TEXT,data TEXT);
+                CREATE TABLE events(id TEXT,project_id TEXT,entity_id TEXT,data TEXT);
+                CREATE TABLE commands(command_id TEXT,result TEXT);
+                CREATE TABLE metadata(key TEXT,value TEXT);
+                """)
+            let observedTables = ["archive_cleanup_scan_changes","ticket_cleanup_changes"]
+            let initial = CleanupJournalActivity()
+            func install(_ activity: CleanupJournalActivity, refuse: Bool = false) throws {
+                try activity.install(db) {
+                    try ArchiveCleanupScanJournal.install(db,activity:activity)
+                    try TicketCleanupChanges.install(db,activity:activity)
+                    if refuse {throw MaintenanceStepDeferred()}
+                }
+            }
+            func count(_ table: String) throws -> Int {try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM " + table) ?? 0}
+            try install(initial)
+            try db.execute(sql:"INSERT INTO records VALUES('first','project','task','{}')")
+            for table in observedTables {XCTAssertEqual(try count(table),1)}
+
+            initial.stop()
+            XCTAssertThrowsError(try install(CleanupJournalActivity(),refuse:true)) { error in
+                XCTAssertTrue(error is MaintenanceStepDeferred,"Unexpected installation failure: \(error)")
+            }
+            try db.execute(sql:"INSERT INTO records VALUES('unrelated','project','task','{}')")
+            for table in observedTables {XCTAssertEqual(try count(table),1)}
+
+            try install(CleanupJournalActivity())
+            for table in observedTables {XCTAssertEqual(try count(table),0)}
+            try db.execute(sql:"INSERT INTO records VALUES('later','project','task','{}')")
+            for table in observedTables {XCTAssertEqual(try count(table),1)}
+        }
+    }
+
     func testOversizeLegacyReceiptRecordsIdentityAndRefusesWithoutIndexingItsPayload() throws {
         // A legacy settlement updates all descriptors in one receipt. Its data
         // is valid JSON but exceeds the changed-payload parsing budget.

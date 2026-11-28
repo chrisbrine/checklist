@@ -14,11 +14,16 @@ struct CleanupWorkspaceProtection {
         paths.reduce(into: Set<String>()) { $0.formUnion(ancestors(of:canonical($1))) }
     }
 
-    init(_ db: Database,paths: [String]) throws {
-        try self.init(db,ancestors:Self.pathAncestors(paths))
+    init(_ db: Database,paths: [String],check: () throws -> Void = {}) throws {
+        var ancestors = Set<String>()
+        for path in paths {
+            try check()
+            ancestors.formUnion(Self.ancestors(of:Self.canonical(path)))
+        }
+        try self.init(db,ancestors:ancestors,check:check)
     }
 
-    init(_ db: Database,ancestors: Set<String>) throws {
+    init(_ db: Database,ancestors: Set<String>,check: () throws -> Void = {}) throws {
         guard !ancestors.isEmpty else {return}
         let projects = try Row.fetchCursor(db,sql:"""
             SELECT CAST(id AS BLOB) id,json_extract(data,'$.root_path') root
@@ -26,6 +31,7 @@ struct CleanupWorkspaceProtection {
             """)
         var bytes = 0
         while let row = try projects.next() {
+            try check()
             let path: String = row["root"]
             guard !path.isEmpty else {continue}
             guard let workspace = Self.matchingWorkspace(path,ancestors:ancestors) else {continue}

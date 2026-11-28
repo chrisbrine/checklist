@@ -255,12 +255,18 @@ final class AttachmentOwnershipTests: XCTestCase {
         try ArchiveStorageGate.withExclusive(root:f.root) { permit in
             DispatchQueue.global().async { entered.signal();defer { finished.signal() };try? router.runStorageMaintenance() }
             XCTAssertEqual(entered.wait(timeout:.now()+3),.success)
-            XCTAssertEqual(finished.wait(timeout:.now()+0.05),.timedOut)
+            XCTAssertEqual(finished.wait(timeout:.now()+3),.success)
+            XCTAssertEqual(try ArchiveCleanupJob(record:get(f,job["id"] as! String,"cleanup_job")).state,.queued)
             published = try f.router!.dbQueue.write { db in
                 try f.router!.transferMediaAttachmentReferences(db,permit:permit,project:pid,source:source,referenceIDs:[r["id"] as! String],destination:target,prepared:prepared,caller:f.owner,commitManifest:{ _ in })
             }
         }
-        XCTAssertEqual(finished.wait(timeout:.now()+5),.success)
+        // The contended pass arms a later wake. Drive that wake on the fixture
+        // after the publication instead of expecting an immediate second pass.
+        XCTAssertNotNil(router.storageMaintenanceRetryAt)
+        XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
+        router.storageMaintenanceRetryAt = .distantPast
+        try router.runStorageMaintenance()
         let final = try ArchiveCleanupJob(record:get(f,job["id"] as! String,"cleanup_job"))
         XCTAssertTrue(final.items[0].holds.contains(.sharedLiveReference));XCTAssertEqual(final.state,.held)
         XCTAssertEqual(try f.router!.readMediaAttachment(project:pid,referenceID:published.1[0]["id"] as! String,owner:published.0,caller:f.owner),Data(repeating:37,count:128))

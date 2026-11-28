@@ -74,6 +74,13 @@ struct StorageSettingsView: View {
             }
             Section("Last verified backup") {
                 ForEach(StorageSettingsSummary.observation(info["last_verified_backup"])) {row in LabeledContent(row.label,value:row.value)}
+                if let attention = info["backup_capacity_attention"] as? [String: Any] {
+                    Text(StorageSettingsSummary.backupAttentionTitle(attention)).checklistFont(.bodyStrong)
+                    if let step = attention["next_step"] as? String {Text(step).checklistFont(.callout)}
+                }
+            }
+            Section("Automatic backup") {
+                ForEach(StorageSettingsSummary.automaticBackup(info["automatic_backup"])) {row in LabeledContent(row.label,value:row.value)}
             }
             Section("Last verified rehearsal") {
                 ForEach(StorageSettingsSummary.observation(info["last_verified_rehearsal"])) {row in LabeledContent(row.label,value:row.value)}

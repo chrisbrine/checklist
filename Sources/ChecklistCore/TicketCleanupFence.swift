@@ -1,6 +1,33 @@
 import Foundation
 import GRDB
 
+/// End observation even if the writer cannot take a TEMP cleanup turn yet.
+final class CleanupJournalActivity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observing = true
+
+    func register(_ db: Database, name: String) {
+        db.add(function:DatabaseFunction(name,argumentCount:0) { [self] _ in
+            lock.withLock {observing}
+        })
+    }
+
+    func stop() {
+        lock.withLock {observing = false}
+    }
+
+    func install(_ db: Database, _ body: () throws -> Void) throws {
+        do {
+            try db.inSavepoint {try body();return .commit}
+        } catch {
+            // A rollback can restore earlier triggers under the same function
+            // name. Keep them disarmed before returning the writer.
+            stop()
+            throw error
+        }
+    }
+}
+
 /// A per-attempt TEMP index on the sole writer. Transactional triggers index only
 /// writes made during preparation, including direct SQL and deletions. Unrelated
 /// write volume consumes no retained Swift graph. A fixed TEMP budget fails
@@ -9,7 +36,11 @@ import GRDB
 struct TicketCleanupChanges {
     static let rowLimit = 32768
     static let byteLimit = 8 * 1024 * 1024
-    static func install(_ db: Database) throws {
+    static func install(_ db: Database,activity: CleanupJournalActivity = .init()) throws {
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM temp.sqlite_master WHERE name='ticket_cleanup_changes')") == true {
+            try remove(db)
+        }
+        activity.register(db,name:"ticket_cleanup_observing")
         try db.execute(sql:"""
             CREATE TEMP TABLE ticket_cleanup_changes(kind INTEGER,position INTEGER,id BLOB,project BLOB,type TEXT,PRIMARY KEY(kind,position,id)) WITHOUT ROWID;
             CREATE INDEX temp.ticket_cleanup_changed_id ON ticket_cleanup_changes(kind,id);
@@ -60,7 +91,7 @@ struct TicketCleanupChanges {
                         """
                     if kind == 1 {sql += "INSERT INTO ticket_cleanup_edges SELECT CAST(NEW.entity_id AS BLOB),0 WHERE NEW.entity_id IS NOT NULL ON CONFLICT DO NOTHING;"}
                 }
-                try db.execute(sql:"CREATE TEMP TRIGGER ticket_cleanup_\(table)_\(action.lowercased()) AFTER \(action) ON main.\(table) WHEN (SELECT active FROM ticket_cleanup_accounting)=0 BEGIN " + sql + " END")
+                try db.execute(sql:"CREATE TEMP TRIGGER ticket_cleanup_\(table)_\(action.lowercased()) AFTER \(action) ON main.\(table) WHEN ticket_cleanup_observing() AND (SELECT active FROM ticket_cleanup_accounting)=0 BEGIN " + sql + " END")
             }
         }
     }

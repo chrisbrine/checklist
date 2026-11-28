@@ -178,10 +178,36 @@ def check() -> dict:
             invalid['unknown_field'] = True
         reject(name, invalid, 'unknown field')
 
+    authority_operation = examples['work-authority-operation']
+    if authority_operation['command_id'] != authority_operation['data']['command_id']:
+        errors.append('work-authority-operation: acceptance must preserve the original command_id')
+    for field in ('result', 'claim_token'):
+        invalid = copy.deepcopy(authority_operation)
+        invalid['data'][field] = 'premature result'
+        reject('work-authority-operation', invalid, 'accepted operation with ' + field)
+
+    holds = examples['service-hold-status']
+    boundary = copy.deepcopy(holds)
+    boundary['recent'][0]['duration_ms'] = 1000
+    reject('service-hold-status', boundary, 'hold at the one-second threshold')
+    active_as_recent = copy.deepcopy(holds)
+    active_as_recent['recent'][0]['active'] = True
+    reject('service-hold-status', active_as_recent, 'active hold in recent completions')
+    recent_as_active = copy.deepcopy(holds)
+    recent_as_active['active'].append(recent_as_active['recent'].pop())
+    reject('service-hold-status', recent_as_active, 'completed hold in active list')
+
     for name, fields in [('group-reference', ('key', 'name')), ('agent-message-subject', ('key', 'title', 'project_name'))]:
         for field in fields:
             bad = copy.deepcopy(examples[name]); bad.pop(field)
             reject(name, bad, 'missing ' + field)
+    for field in ('command_id', 'error_code', 'failed_at', 'reason', 'next_step', 'required_free_bytes'):
+        bad = copy.deepcopy(examples['backup-capacity-attention'])
+        bad.pop(field)
+        reject('backup-capacity-attention', bad, 'missing ' + field)
+    bad = copy.deepcopy(examples['backup-capacity-attention'])
+    bad['reason'] = 'snapshot_deadline'
+    reject('backup-capacity-attention', bad, 'deadline with capacity error code')
     for section, field, value in [('preview', 'path', '/synthetic/outside-backups'),
                                   ('retire', 'include_unrecorded', True),
                                   ('retire', 'preview_sha256', 'not-an-exact-preview'),

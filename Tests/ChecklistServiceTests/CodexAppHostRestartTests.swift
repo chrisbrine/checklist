@@ -82,7 +82,22 @@ final class CodexAppHostRestartTests: XCTestCase {
     @discardableResult private func call(_ method: String, _ input: JSON, _ caller: Caller? = nil) throws -> JSON {
         var input = input
         if !CommandRouter.readMethods.contains(method) { input["command_id"] = UUID().uuidString }
-        return try router.handle(method: method, params: input, caller: caller ?? owner)["data"] as! JSON
+        let caller = caller ?? owner
+        let reply = try router.handle(method: method, params: input, caller: caller)
+        let data = try XCTUnwrap(reply["data"] as? JSON)
+        guard reply["command_outcome"] as? String == "accepted" else {return data}
+        let id = try XCTUnwrap(data["operation_id"] as? String)
+        let deadline = DispatchTime.now() + 30
+        while DispatchTime.now() < deadline {
+            let status = try router.handle(method:"operation_get",params:["project_id":input["project_id"]!,"operation_id":id],caller:caller)
+            let value = try XCTUnwrap(status["data"] as? JSON)
+            if let result = value["result"] as? JSON {return try XCTUnwrap(result["data"] as? JSON)}
+            if let error = value["error"] as? JSON {
+                throw CoreError(error["code"] as? String ?? "OPERATION_FAILED",error["message"] as? String ?? "Operation failed.",details:error["details"] as? JSON ?? [:])
+            }
+            Thread.sleep(forTimeInterval:0.02)
+        }
+        throw CoreError("TEST_TIMEOUT", "The owned operation did not settle within 30 seconds.")
     }
     private func worker(_ value: Enrollment? = nil) -> Caller {
         let e = value ?? enrollment!

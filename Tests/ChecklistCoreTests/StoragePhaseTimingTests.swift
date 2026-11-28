@@ -25,27 +25,30 @@ final class StoragePhaseTimingTests: XCTestCase {
         }
     }
 
-    func testRealSnapshotRecordsBothIndependentVerificationPasses() throws {
+    func testRealSnapshotVerifiesOnceAndIndependentRecoveryReturnsTheSameDigest() throws {
         let f = try StorageFixture(), operation = UUID()
         let identity = try StoreIdentityReceipt.decode(Data(contentsOf: f.root.appendingPathComponent(StoreIdentityReceipt.fileName)))
         var lines: [String] = []
         let budget = StorageSnapshotBudget.production()
         budget.measurement.phaseTiming = StoragePhaseTiming(operation: "protected_backup", command: nil,
             uptime: budget.uptime, sink: { lines.append($0) })
-        _ = try ArchiveStorageGate.withExclusive(root: f.root) { permit in
+        let receipt = try ArchiveStorageGate.withExclusive(root: f.root) { permit in
             try StorageSnapshot.build(StorageSnapshotSource(source: f.root, parent: f.base,
                 storeID: identity.logical_store_id, permit: permit), operation: operation, budget: budget)
         }
         budget.finishTiming(outcome: "complete")
         let rows = try lines.map { try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? JSON) }
         let phases = rows.compactMap { $0["next_phase"] as? String }
-        XCTAssertEqual(phases.filter { $0 == "verify_started" }.count, 2)
-        XCTAssertEqual(phases.filter { $0 == "verify_finished" }.count, 2)
+        XCTAssertEqual(phases.filter { $0 == "verify_started" }.count, 1)
+        XCTAssertEqual(phases.filter { $0 == "verify_finished" }.count, 1)
+        XCTAssertTrue(phases.contains("published_before_parent_flush"))
         XCTAssertTrue(phases.contains("inventory_started"))
         XCTAssertTrue(phases.contains("objects_finished"))
         XCTAssertTrue(phases.contains("manifest_written"))
         XCTAssertEqual(phases.last, "complete")
         XCTAssertNil(budget.measurement.phaseTiming)
+        let recovered = try StorageSnapshot.reconcile(parent: f.base, operation: operation, budget: .production())
+        XCTAssertEqual(recovered.manifestSHA256, receipt.manifestSHA256)
     }
 
     func testGraphPreparationLogsStartEndAndMeasuredRows() throws {

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Owner backup capacity attention",
+  "type": "object",
+  "required": ["command_id", "error_code", "failed_at", "reason", "next_step"],
+  "properties": {
+    "command_id": {"type": "string", "format": "uuid"},
+    "error_code": {"enum": ["BACKUP_CAPACITY_EXCEEDED", "BACKUP_DEADLINE_EXCEEDED"]},
+    "failed_at": {"type": "string", "format": "date-time"},
+    "reason": {"enum": ["snapshot_capacity", "snapshot_object_capacity", "snapshot_object_bytes", "snapshot_manifest_capacity", "snapshot_working_capacity", "snapshot_receipt_capacity", "snapshot_free_space", "snapshot_deadline"]},
+    "next_step": {"type": "string", "minLength": 1},
+    "measured_bytes": {"type": "integer", "minimum": 0},
+    "measured_objects": {"type": "integer", "minimum": 0},
+    "required_free_bytes": {"type": "integer", "minimum": 0},
+    "available_bytes": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"reason": {"const": "snapshot_deadline"}}},
+      "then": {"properties": {"error_code": {"const": "BACKUP_DEADLINE_EXCEEDED"}}},
+      "else": {"properties": {"error_code": {"const": "BACKUP_CAPACITY_EXCEEDED"}}}
+    },
+    {
+      "if": {"properties": {"reason": {"const": "snapshot_free_space"}}},
+      "then": {"required": ["required_free_bytes", "available_bytes"]}
+    }
+  ]
+}

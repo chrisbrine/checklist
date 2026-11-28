@@ -43,15 +43,31 @@ extension CommandRouter {
                 var config = Configuration();config.readonly = true;config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
                 let database = try DatabaseQueue(path:source.appendingPathComponent("database.sqlite").path,configuration:config)
                 defer {try? database.close()}
-                let projects = try database.read {db in try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='project' ORDER BY id").map {row -> JSON in
-                    let value = try GRDBRecordEnvelopeAdapter.decode(row).object
-                    return ["id":value["id"]!,"name":value["name"] ?? "","archived":value["archived"] ?? false]
-                }}
+                let (projects, projectCount) = try database.read { db in
+                    let columns = Self.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength
+                    let first = try Row.fetchCursor(db, sql: "SELECT " + columns + " FROM records WHERE type='project' ORDER BY id LIMIT 200")
+                    var working = StorageSnapshotWorkingBytes(budget)
+                    var projects: [JSON] = []
+                    while let row = try first.next() {
+                        try budget.check()
+                        try autoreleasepool {
+                            try working.requireEnvelope(row)
+                            let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
+                            let name = envelope.object["name"] ?? ""
+                            let archived = envelope.object["archived"] ?? false
+                            let projection: JSON = ["id":envelope.id,"name":name,"archived":archived]
+                            try working.retain(128 + (try jsonString(projection)).utf8.count)
+                            projects.append(projection)
+                        }
+                    }
+                    let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE type='project'") ?? 0
+                    return (projects, count)
+                }
                 let families: [String:Int]
                 if let captured = manifest.recordFamilies {families = captured}
                 else {families = try database.read {try StorageSnapshot.recordFamilyCounts($0)}}
                 timingOutcome = "complete"
-                return ["data":["state":"complete","manifest_sha256":digest,"path":source.path,"schema":manifest.schema,"store_id":manifest.storeID,"source_root":manifest.sourceRoot,"captured_at":manifest.capturedAt as Any? ?? NSNull(),"verified_at":now(),"record_families":families,"projects":Array(projects.prefix(200)),"project_count":projects.count,"managed_files":manifest.objects.count,"managed_bytes":manifest.objects.reduce(Int64(0)) {$0 + $1.size},"unavailable":manifest.unavailable.map {["authority":$0.authority,"reason":$0.reason]},"external_references":manifest.externalReferences,"destination_parent":root.appendingPathComponent("restore").path,"existing_store_preserved":true,"authority":"new_incarnation_recovery_required"]]
+                return ["data":["state":"complete","manifest_sha256":digest,"path":source.path,"schema":manifest.schema,"store_id":manifest.storeID,"source_root":manifest.sourceRoot,"captured_at":manifest.capturedAt as Any? ?? NSNull(),"verified_at":now(),"record_families":families,"projects":projects,"project_count":projectCount,"managed_files":manifest.objects.count,"managed_bytes":manifest.objects.reduce(Int64(0)) {$0 + $1.size},"unavailable":manifest.unavailable.map {["authority":$0.authority,"reason":$0.reason]},"external_references":manifest.externalReferences,"destination_parent":root.appendingPathComponent("restore").path,"existing_store_preserved":true,"authority":"new_incarnation_recovery_required"]]
             }
             guard try text(params,"manifest_sha256",max:64) == digest else {throw CoreError("RESTORE_PREVIEW_CHANGED","The backup changed after preview. Preview it again before restoring.")}
             let result = try StorageSnapshotRetention.withCapture(root:root) { _ in
@@ -172,11 +188,13 @@ extension CommandRouter {
             try db.execute(sql:"DELETE FROM cursors")
             try db.execute(sql:"DELETE FROM metadata WHERE key='cursor_seal_key'")
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES ('restore_receipt',?)",arguments:[try jsonString(receipt)])
-            let rows = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type IN ('session','attempt','task','delivery','group','handoff','delegation','task_session','recipient_target','ordinary_mention_plan')")
+            let working = StorageSnapshotWorkingBytes(budget)
+            let rows = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength + " FROM records WHERE type IN ('session','attempt','task','delivery','group','handoff','delegation','task_session','recipient_target','ordinary_mention_plan')")
             // Update in place with canonical validation; stable IDs, revisions,
             // historical actors and all immutable evidence remain in this store.
             while let row = try rows.next() {
                 try budget.check()
+                try working.requireEnvelope(row)
                 try autoreleasepool {
                 let decoded = try GRDBRecordEnvelopeAdapter.decode(row)
                 var value = decoded.object

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Initial Checklist work authority operation acceptance",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "command_id": {"type": "string", "format": "uuid"},
+    "command_outcome": {"const": "accepted"},
+    "write_admission": {"type": "object"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid"},
+        "command_id": {"type": "string", "format": "uuid"},
+        "method": {"enum": ["work_checkpoint", "work_child_accept"]},
+        "project_id": {"type": "string", "format": "uuid"},
+        "state": {"const": "queued"},
+        "status_method": {"const": "operation_get"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"}
+      },
+      "required": ["operation_id", "command_id", "method", "project_id", "state", "status_method", "created_at", "updated_at"]
+    }
+  },
+  "required": ["command_id", "command_outcome", "data"]
+}

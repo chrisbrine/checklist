@@ -218,20 +218,33 @@ extension CommandRouter {
     }
 
     static func ticketObjectDeletionSummary(_ objects: [JSON]) -> JSON {
-        var totals: JSON = [:]
-        for state in ["pending","removed","already_missing","retained"] {
-            let selected = objects.filter { $0["state"] as? String == state }
-            totals[state + "_count"] = selected.count
-            totals[state + "_bytes"] = selected.reduce(Int64(0)) { $0 + (($1["size"] as? NSNumber)?.int64Value ?? 0) }
-        }
+        ticketObjectDeletionSummary(objects,check:{})
+    }
+
+    static func ticketObjectDeletionSummary(_ objects: [JSON],check: () throws -> Void) rethrows -> JSON {
+        let states = ["pending","removed","already_missing","retained"]
+        var counts: [String:Int] = [:],bytes: [String:Int64] = [:]
         var reasons: [String: (count: Int, bytes: Int64)] = [:]
-        for object in objects where object["state"] as? String == "retained" {
-            for reason in object["reasons"] as? [String] ?? [] {
-                var count = reasons[reason] ?? (count: 0, bytes: 0)
-                count.count += 1
-                count.bytes += (object["size"] as? NSNumber)?.int64Value ?? 0
-                reasons[reason] = count
+        for object in objects {
+            try check()
+            guard let state = object["state"] as? String,states.contains(state) else {continue}
+            let size = (object["size"] as? NSNumber)?.int64Value ?? 0
+            counts[state,default:0] += 1
+            bytes[state,default:0] += size
+            if state == "retained" {
+                for reason in object["reasons"] as? [String] ?? [] {
+                    try check()
+                    var count = reasons[reason] ?? (count:0,bytes:0)
+                    count.count += 1
+                    count.bytes += size
+                    reasons[reason] = count
+                }
             }
+        }
+        var totals: JSON = [:]
+        for state in states {
+            totals[state + "_count"] = counts[state,default:0]
+            totals[state + "_bytes"] = bytes[state,default:0]
         }
         totals["retained_reasons"] = reasons.mapValues { ["count": $0.count, "bytes": $0.bytes] as JSON }
         totals["physical_reclamation"] = "unmeasured"
@@ -242,6 +255,11 @@ extension CommandRouter {
     /// Pending links also block unlink of their targets until the links are gone.
     /// Rebuild this graph at each unlink boundary, including resumed old intents.
     static func retainTicketObjectDeletionLinkTargets(_ objects: inout [JSON]) -> Set<String> {
+        // Only the supplied check can interrupt link accounting.
+        try! retainTicketObjectDeletionLinkTargets(&objects,check:{})
+    }
+
+    static func retainTicketObjectDeletionLinkTargets(_ objects: inout [JSON],check: () throws -> Void) throws -> Set<String> {
         var entries: [String:StorageSnapshotObject] = [:],closures: [Int:[String]] = [:]
         var uncertainCaptures = Set<String>(),uncertainAll = false
         func capturePrefix(_ path: String) -> String? {
@@ -251,42 +269,58 @@ extension CommandRouter {
             return parts.prefix(4).joined(separator:"/")
         }
         for object in objects {
+            try check()
             guard let path = object["relative_path"] as? String else {continue}
             entries[path] = .init(relativePath:path,kind:object["kind"] as? String ?? "",expectedSHA256:object["sha256"] as? String,expectedSize:(object["size"] as? NSNumber)?.int64Value,executable:object["executable"] as? Bool == true,linkTarget:object["link_target"] as? String,authorities:[])
         }
-        let cachePaths = entries.keys.filter {$0.hasPrefix("source-build-cache/")}
+        let cachePaths = try entries.keys.filter {
+            try check()
+            return $0.hasPrefix("source-build-cache/")
+        }
         var cacheVisits = 0
-        for index in objects.indices where objects[index]["kind"] as? String == "symlink" && ["pending","retained"].contains(objects[index]["state"] as? String ?? "") {
+        for index in objects.indices {
+            try check()
+            guard objects[index]["kind"] as? String == "symlink",["pending","retained"].contains(objects[index]["state"] as? String ?? "") else {continue}
             guard let path = objects[index]["relative_path"] as? String else {uncertainAll = true;continue}
             do {
                 // An ambiguous or changed link may have a different live target.
                 // Its recorded chain alone cannot authorize deleting its capture.
                 guard !(objects[index]["reasons"] as? [String] ?? []).contains("ambiguous_identity"),objects[index]["last_failure"] as? String != "CLEANUP_IDENTITY_CHANGED" else {throw StorageSnapshotFailure.unsupportedAuthority}
-                closures[index] = try path.hasPrefix("source-build-cache/") ? sourceBuildCacheLinkClosure(path,entries:entries,cachePaths:cachePaths,visits:&cacheVisits) : StorageSnapshotAuthority.capturedLinkClosure(path,entries:entries)
+                closures[index] = try path.hasPrefix("source-build-cache/") ? sourceBuildCacheLinkClosure(path,entries:entries,cachePaths:cachePaths,visits:&cacheVisits,check:check) : StorageSnapshotAuthority.capturedLinkClosure(path,entries:entries)
+            } catch is MaintenanceStepDeferred {
+                throw MaintenanceStepDeferred()
             } catch {
                 if let capture = capturePrefix(path) {uncertainCaptures.insert(capture)} else {uncertainAll = true}
             }
         }
-        for index in objects.indices where objects[index]["state"] as? String == "pending" {
+        for index in objects.indices {
+            try check()
+            guard objects[index]["state"] as? String == "pending" else {continue}
             let capture = (objects[index]["relative_path"] as? String).flatMap(capturePrefix)
             if uncertainAll || capture.map({uncertainCaptures.contains($0)}) == true {
                 objects[index]["state"] = "retained";objects[index]["reasons"] = ["link_closure_unavailable"]
             }
         }
         var retainedTargets = Set<String>(),pendingTargets = Set<String>()
-        for (index,closure) in closures where objects[index]["state"] as? String == "retained" {retainedTargets.formUnion(closure.dropFirst())}
-        for index in objects.indices where objects[index]["state"] as? String == "pending" {
+        for (index,closure) in closures where objects[index]["state"] as? String == "retained" {
+            for path in closure.dropFirst() {try check();retainedTargets.insert(path)}
+        }
+        for index in objects.indices {
+            try check()
+            guard objects[index]["state"] as? String == "pending" else {continue}
             if let path = objects[index]["relative_path"] as? String,retainedTargets.contains(path) {
                 objects[index]["state"] = "retained";objects[index]["reasons"] = ["retained_link_target"]
             }
         }
-        for (index,closure) in closures where objects[index]["state"] as? String == "pending" {pendingTargets.formUnion(closure.dropFirst())}
+        for (index,closure) in closures where objects[index]["state"] as? String == "pending" {
+            for path in closure.dropFirst() {try check();pendingTargets.insert(path)}
+        }
         return pendingTargets
     }
 
     /// Cache aliases may resolve to directories (SwiftPM's debug alias). Only
     /// recorded descendants inside this exact cache entry enter the closure.
-    private static func sourceBuildCacheLinkClosure(_ path: String,entries: [String:StorageSnapshotObject],cachePaths: [String],visits totalVisits: inout Int) throws -> [String] {
+    private static func sourceBuildCacheLinkClosure(_ path: String,entries: [String:StorageSnapshotObject],cachePaths: [String],visits totalVisits: inout Int,check: () throws -> Void) throws -> [String] {
         let parts = try StorageObjectFiles.parts(path)
         guard parts.count >= 3,parts[0] == "source-build-cache" else {throw StorageSnapshotFailure.unsupportedAuthority}
         let prefix = Array(parts.prefix(2))
@@ -294,6 +328,7 @@ extension CommandRouter {
         defer {totalVisits = visits}
         guard visits < 2000000 else {throw StorageSnapshotFailure.limit}
         func visit(_ path: String,depth: Int) throws {
+            try check()
             visits += 1;guard visits <= 2000000 else {throw StorageSnapshotFailure.limit}
             guard depth <= 32,!visiting.contains(path),let entry = entries[path] else {throw StorageSnapshotFailure.unsupportedAuthority}
             if closure.contains(path) {return}
@@ -316,6 +351,7 @@ extension CommandRouter {
                 // A directory has no unlink descriptor; protect every inventoried
                 // descendant, including any further link chains. Never follow it.
                 for candidate in cachePaths {
+                    try check()
                     visits += 1;guard visits <= 2000000 else {throw StorageSnapshotFailure.limit}
                     if candidate.hasPrefix(resolved + "/") {
                         guard !visiting.contains(candidate) else {throw StorageSnapshotFailure.unsupportedAuthority}
@@ -438,22 +474,25 @@ extension CommandRouter {
         return .init(objects:result)
     }
 
-    func ticketObjectDeletionWorkspaces(_ db: Database,objects: [JSON],candidatePaths: Set<String>? = nil) throws -> CleanupWorkspaceProtection {
-        let paths = objects.compactMap {object -> String? in
+    func ticketObjectDeletionWorkspaces(_ db: Database,objects: [JSON],candidatePaths: Set<String>? = nil,check: () throws -> Void = {}) throws -> CleanupWorkspaceProtection {
+        let paths = try objects.compactMap {object -> String? in
+            try check()
             guard object["state"] as? String == "pending",let path = object["relative_path"] as? String,
                   candidatePaths == nil || candidatePaths?.contains(path) == true || object["kind"] as? String == "symlink" else {return nil}
             return root.appendingPathComponent(path).path
         }
-        return try CleanupWorkspaceProtection(db,paths:paths)
+        return try CleanupWorkspaceProtection(db,paths:paths,check:check)
     }
 
-    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, workspaces: CleanupWorkspaceProtection, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false) throws -> Set<String> {
+    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, workspaces: CleanupWorkspaceProtection, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false,check: () throws -> Void = {}) throws -> Set<String> {
+        try check()
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
         var holds = try sourceBuildCacheDeletionHolds(db,object:object)
         if preserveTicketMedia {
             let owners = try jsonString(strings(object,"owner_ids"))
             let current = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
             while let row = try current.next() {
+                try check()
                 if try Self.isKeptMediaRoundAttachment(GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object) {holds.insert("kept_with_ticket")}
             }
         }
@@ -462,8 +501,9 @@ extension CommandRouter {
             // canonical owners at the final writer boundary as well as planning;
             // an older descriptor must never unlink a newly marked original.
             let owners = try jsonString(strings(object,"owner_ids"))
-            let current = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
-            for row in current {
+            let current = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='attachment' AND id IN (SELECT value FROM json_each(?))",arguments:[owners])
+            while let row = try current.next() {
+                try check()
                 let attachment = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"attachment").object
                 if attachment["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(attachment) {holds.insert("media_trash_required")}
             }
@@ -476,10 +516,16 @@ extension CommandRouter {
         if let cache = object["cache_path"] as? String {tokens.formUnion([Data(cache.utf8),Data(root.appendingPathComponent(cache).path.utf8)])}
         if let capture = object["capture_path"] as? String {tokens.formUnion([Data(capture.utf8),Data(root.appendingPathComponent(capture).path.utf8)])}
         var matched = Set<Int>()
-        for token in tokens {matched.formUnion(references.reverse[token] ?? [])}
+        for token in tokens {
+            for index in references.reverse[token] ?? [] {try check();matched.insert(index)}
+        }
         // Typed holds can name a content digest instead of a path/record ID.
-        matched.formUnion((references.reverse[Data(sha.utf8)] ?? []).filter {references.graph[$0]["record_type"] as? String == "storage_hold"})
+        for index in references.reverse[Data(sha.utf8)] ?? [] {
+            try check()
+            if references.graph[index]["record_type"] as? String == "storage_hold" {matched.insert(index)}
+        }
         for index in matched {
+            try check()
             let value = references.graph[index]
             let type = value["record_type"] as? String ?? ""
             if ["cleanup_job","cleanup_preview"].contains(type) {continue}

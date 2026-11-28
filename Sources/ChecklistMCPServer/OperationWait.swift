@@ -21,7 +21,7 @@ public enum OperationWait {
     private static let firstPause: TimeInterval = 0.1, longestPause: TimeInterval = 2
 
     static let tool = Tool(name: toolName,
-        description: "Wait for a long command that returned command_outcome=accepted, without an operation_get loop. Returns the original command's final reply when the operation succeeds and its error when the operation fails. After wait_seconds (default and maximum \(Int(longestToolWait))) it returns the operation with its state and wait.finished=false: call this tool again with the same operation_id; do not send a new command. Other calls of this conversation run during the wait. A wait never cancels the operation. Each final read of a work_claim, batch_claim or work_takeover operation issues a fresh claim token; use the latest one. Tool descriptions name the commands that can return an operation.",
+        description: "Wait for a long command that returned command_outcome=accepted, without an operation_get loop. Returns the original command's final reply when the operation succeeds and its error when the operation fails. After wait_seconds (default and maximum \(Int(longestToolWait))) it returns the operation with its state and wait.finished=false: call this tool again with the same operation_id; do not send a new command. Other calls of this conversation run during the wait. A wait never cancels the operation. Each final read of a work_claim, batch_claim, work_takeover or work_child_accept operation issues a fresh claim token; use the latest one. Tool descriptions name the commands that can return an operation.",
         inputSchema: .object(["type": .string("object"), "properties": .object([
             "operation_id": .object(["type": .string("string"), "format": .string("uuid")]),
             "project_id": .object(["type": .string("string"), "description": .string("The original command's project.")]),
@@ -121,7 +121,8 @@ public enum OperationWait {
                 reply = try object(try await bounded(budget) { try await status(budget) })
             }
             catch is LimitExpired { return try unfinished("timed_out", transient) }
-            catch let error as ChecklistError where ServiceWait.applies(error) { transient = error } // A restart or a busy service.
+            catch let error as ChecklistError where ServiceWait.applies(error)
+                || ["OPERATION_RESULT_BUSY","BACKUP_CAPTURE_ACTIVE"].contains(error.code) {transient = error}
             catch let error as CancellationError { throw error }
             catch {
                 guard observed else { throw error }

@@ -1,10 +1,38 @@
 import Foundation
 import GRDB
 import Darwin
+import SQLite3
+
+package struct StoreOpeningCheck: Sendable {
+    package enum Boundary: Sendable { case beforeOpen, readOnlyOpened, writerOpened }
+    package struct Refusal: Error {
+        package let cause: any Error
+    }
+
+    private let verify: @Sendable (Boundary) throws -> Void
+
+    package init(_ verify: @escaping @Sendable (Boundary) throws -> Void) {
+        self.verify = verify
+    }
+
+    func require(_ boundary: Boundary, database: Database? = nil) throws {
+        do {
+            try verify(boundary)
+            if let database {
+                var moved: Int32 = 0
+                guard sqlite3_file_control(database.sqliteConnection, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK,
+                      moved == 0 else {
+                    throw CoreError("SLOT_DATABASE_MOVED", "The opened SQLite database differs from its named file.")
+                }
+            }
+        } catch { throw Refusal(cause: error) }
+    }
+}
 
 /// One fixed canonical store. Existing bytes are opened read/write without
 /// CREATE only after read-only shape/integrity/version checks have passed.
 enum StorageBootstrap {
+    static let writerBusyTimeoutMS: Int32 = 5_000
     /// Internal owned-copy qualification only; production installs no callback.
     nonisolated(unsafe) static var qualificationObserve: ((String,TimeInterval) -> Void)?
     /// Opt-in component attribution; the default executes the original operation.
@@ -25,12 +53,13 @@ enum StorageBootstrap {
     /// from a published template a moment ago and wrote this identity to it and to its receipt
     /// file. The read-only preflight would read that identity again, so it does not run. Nil
     /// (every product caller) keeps the preflight. Every later check of this function is unchanged.
-    static func open(root: URL, serviceLease: StorageServiceLease? = nil, knownCurrentIdentity: StoreIdentityReceipt? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
+    static func open(root: URL, serviceLease: StorageServiceLease? = nil, knownCurrentIdentity: StoreIdentityReceipt? = nil, openingCheck: StoreOpeningCheck? = nil, prepareDatabase: @escaping @Sendable (Database)throws->Void = { _ in }, observe: (Boundary)->Void = { _ in }) throws -> Opened {
         let root = StoreDirectory.anchoredRoot(root)
         defer {StorageUpgradeProgress.clear(root:root)}
         let directory = try measured("filesystem.directory") { try StoreDirectory(root:root) }
         if let serviceLease { try serviceLease.requireRoot(root) }
         return try ArchiveStorageGate.withExclusive(root:root) { permit in
+            try openingCheck?.require(.beforeOpen)
             let database = root.appendingPathComponent("checklist.sqlite")
             let hasDatabase = try directory.regularFileExists("checklist.sqlite")
             let external = try directory.regularFileExists(StoreIdentityReceipt.fileName) ? StoreIdentityReceipt.decode(directory.readReceipt(StoreIdentityReceipt.fileName)) : nil
@@ -38,12 +67,17 @@ enum StorageBootstrap {
             guard hasDatabase || external == nil else { throw StoreRecovery.required("initialized_database_missing") }
             let identity: StoreIdentityReceipt, fresh: Bool
             if hasDatabase {
-                if let external,external.schema_revision < SchemaMigrations.currentSchema {
+                let needsUpgrade = external.map { $0.schema_revision < SchemaMigrations.currentSchema } ?? false
+                if needsUpgrade && openingCheck == nil {
                     StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
                 }
                 let state: SchemaMigrations.State
                 if let knownCurrentIdentity { state = .current(knownCurrentIdentity) }
-                else { state = try measured("schema.preflight", { try readOnlyPreflight(database) }) }
+                else { state = try measured("schema.preflight", { try readOnlyPreflight(database, openingCheck: openingCheck) }) }
+                // Keep the inspected root unchanged until its first connection verifies it.
+                if needsUpgrade && openingCheck != nil {
+                    StorageUpgradeProgress.update(root:root,stage:"preparation_validation",seconds:90)
+                }
                 switch state {
                 case .legacy(let incarnation):
                     guard serviceLease != nil else { throw StoreRecovery.required("upgrade_requires_exclusive_service") }
@@ -70,19 +104,22 @@ enum StorageBootstrap {
             }
             var configuration = Configuration()
             configuration.prepareDatabase { db in
+                if !fresh { try openingCheck?.require(.writerOpened, database: db) }
                 try SchemaMigrations.installStorageCollation(db);try prepareDatabase(db)
-                try db.execute(sql:"PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000")
+                try db.execute(sql:"PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=\(Self.writerBusyTimeoutMS)")
             }
             let queue: DatabaseQueue
             do { queue = try measured("sqlite.writer-open") { try DatabaseQueue(path:writableURI(database),configuration:configuration) } }
+            catch let refusal as StoreOpeningCheck.Refusal { throw refusal }
             catch { throw StoreRecovery.required("writable_database_unavailable") }
+            let bootstrapWriter = GRDBTransactionAdapter(queue: queue)
             do {
                 var protectedOperation: String?
-                let version = try queue.read { try Int.fetchOne($0,sql:"PRAGMA user_version") ?? -1 }
+                let version = try bootstrapWriter.read { try Int.fetchOne($0,sql:"PRAGMA user_version") ?? -1 }
                 if version < 1 && fresh {
-                    try queue.write { try SchemaMigrations.adoptBaseline($0,identity:identity.withSchema(1),fresh:fresh) }
+                    try bootstrapWriter.write { try SchemaMigrations.adoptBaseline($0,identity:identity.withSchema(1),fresh:fresh) }
                 }
-                try queue.writeWithoutTransaction { db in
+                try bootstrapWriter.writeWithoutTransaction { db in
                     guard try String.fetchOne(db,sql:"PRAGMA journal_mode=WAL")?.lowercased() == "wal" else { throw StoreRecovery.required("wal_configuration_failed") }
                 }
                 try measured("filesystem.objects") { try directory.ensureObjectsDirectory() }
@@ -100,10 +137,10 @@ enum StorageBootstrap {
                     protectedOperation = protected["operation_id"] as? String
                     if fresh { protectedOperation = nil }
                     let prepared = identity.withSchema(SchemaMigrations.currentSchema).withState("preparing")
-                    let plan = version < 3 ? try queue.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) } : ManagedPathRelocation.Plan(decisions:[:])
+                    let plan = version < 3 ? try bootstrapWriter.read { try ManagedPathRelocation.plan($0, root: root, budget: .production()) } : ManagedPathRelocation.Plan(decisions:[:])
                     if !fresh {StorageUpgradeProgress.update(root:root,stage:"final_migration",seconds:90)}
                     try directory.publishReceipt(prepared.encoded(),name:StoreIdentityReceipt.fileName,replacingPreparedReceipt:true)
-                    try queue.write { db in
+                    try bootstrapWriter.write { db in
                         if let expected = protected["source_fingerprint"] as? String {
                             guard try SchemaMigrations.contentFingerprint(db) == expected else { throw StoreRecovery.required("migration_source_changed_after_rehearsal") }
                         }
@@ -122,7 +159,7 @@ enum StorageBootstrap {
                 // Derived membership data is warmed before any maintenance turn.
                 // Missing historical backup bytes refuse accounting/cleanup, not
                 // access to the restored store's unrelated tickets.
-                do {try measured("schema.backup-index") { try queue.read {try StorageBackupManifestIndex.warm($0,root:root)} }}
+                do {try measured("schema.backup-index") { try bootstrapWriter.read {try StorageBackupManifestIndex.warm($0,root:root)} }}
                 catch {fputs("Backup membership indexes unavailable; cleanup will retain bytes.\n",stderr)}
                 let ready = identity.withSchema(SchemaMigrations.currentSchema).withState("ready")
                 // A crash after SQL COMMIT finishes pending compaction/publication.
@@ -132,7 +169,7 @@ enum StorageBootstrap {
                 }
                 // Group labels are an independent additive backfill. Protocol 3
                 // still fences earlier binaries from the managed-path representation.
-                try measured("schema.backfill") { try queue.write { try GroupKeys.backfill($0) } }
+                try measured("schema.backfill") { try bootstrapWriter.write { try GroupKeys.backfill($0) } }
                 return Opened(queue:queue,incarnation:identity.incarnation,completedProtectedBackupOperation:protectedOperation)
             } catch let error as CoreError { try? queue.close();throw error }
             catch { try? queue.close();throw StoreRecovery.required("compatible_bootstrap_transaction_failed") }
@@ -166,13 +203,17 @@ enum StorageBootstrap {
         defer {qualificationObserve?("migration_rehearsal",ProcessInfo.processInfo.systemUptime-rehearsalStarted)}
         return try StorageUpgradePreparation.rehearse(root:root,identity:identity,operation:operation,manifestSHA256:receipt.manifestSHA256,budget:budget)
     }
-    private static func readOnlyPreflight(_ database: URL) throws -> SchemaMigrations.State {
+    private static func readOnlyPreflight(_ database: URL, openingCheck: StoreOpeningCheck?) throws -> SchemaMigrations.State {
         var config = Configuration();config.readonly = true
-        config.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db);try db.execute(sql:"PRAGMA busy_timeout=5000") }
+        config.prepareDatabase { db in
+            try openingCheck?.require(.readOnlyOpened, database: db)
+            try SchemaMigrations.installStorageCollation(db);try db.execute(sql:"PRAGMA busy_timeout=5000")
+        }
         do {
             let queue = try DatabaseQueue(path:database.path,configuration:config);defer { try? queue.close() }
             return try queue.read { try SchemaMigrations.inspect($0) }
-        } catch let error as CoreError { throw error }
+        } catch let refusal as StoreOpeningCheck.Refusal { throw refusal }
+        catch let error as CoreError { throw error }
         catch { throw StoreRecovery.required("existing_database_preflight_failed") }
     }
 }

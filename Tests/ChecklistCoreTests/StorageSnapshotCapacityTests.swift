@@ -58,23 +58,22 @@ final class StorageSnapshotCapacityTests: XCTestCase {
     private struct StopBeforeCopy: Error {}
     private static let gibibyte: Int64 = 1_073_741_824
 
-    func testV54RecordCapacityMustNotBecomeFreeSpaceRefusal() throws {
-        let f = try Fixture()
-        _ = try f.capture([])
-        try f.save(["id": "capture2", "project_id": "project", "revision": 1,
-                    "snapshot_path": f.root.appendingPathComponent("source-captures/project/capture2/source").path,
-                    "files": []], "source_capture")
+    func testWorkingMetadataCapacityMustNotBecomeFreeSpaceRefusal() throws {
+        let fixture = try Fixture()
+        let project = "00000000-0000-0000-0000-000000000001"
+        let id = "00000000-0000-0000-0000-000000000002"
+        try fixture.save(["id": id, "project_id": project, "revision": 1,
+                          "mode": "external_reference", "path": "/example/document.txt"], "attachment")
         var budget = StorageSnapshotBudget.production()
-        budget.maximumRecords = 1
+        budget.maximumWorkingBytes = 32
         budget.availableBytes = { _ in 400 * Self.gibibyte }
-        XCTAssertThrowsError(try f.build(UUID(), budget)) { error in
-            guard let e = error as? CoreError else { return XCTFail("Unexpected error: \(error)") }
-            XCTAssertEqual(e.code, "BACKUP_CAPACITY_EXCEEDED")
-            XCTAssertEqual(e.details["reason"] as? String, "snapshot_capacity",
-                           "The record count cap must keep its existing reason; 400 GiB free is sufficient.")
-            XCTAssertEqual(e.details["maximum_records"] as? Int, 1)
-            XCTAssertNil(e.details["required_free_bytes"])
-            XCTAssertNil(e.details["available_bytes"])
+        XCTAssertThrowsError(try fixture.build(UUID(), budget)) { error in
+            guard let failure = error as? CoreError else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(failure.code, "BACKUP_CAPACITY_EXCEEDED")
+            XCTAssertEqual(failure.details["reason"] as? String, "snapshot_working_capacity")
+            XCTAssertEqual(failure.details["maximum_working_bytes"] as? Int, 32)
+            XCTAssertNil(failure.details["required_free_bytes"])
+            XCTAssertNil(failure.details["available_bytes"])
         }
     }
 
@@ -87,7 +86,7 @@ final class StorageSnapshotCapacityTests: XCTestCase {
         XCTAssertEqual(budget.maximumManifestBytes, 512 * 1_048_576)
         XCTAssertEqual(budget.maximumObjectBytes, 524_288_000)
         // CL-514: no fixed record-count ceiling; time, manifest bytes and objects bound the work.
-        XCTAssertEqual(budget.maximumRecords, .max)
+        XCTAssertEqual(budget.maximumWorkingBytes, 1_024 * 1_048_576)
         let after = ProcessInfo.processInfo.systemUptime
         XCTAssertGreaterThanOrEqual(budget.deadlineUptime, before + 1_800)
         XCTAssertLessThanOrEqual(budget.deadlineUptime, after + 1_800)
@@ -127,6 +126,119 @@ final class StorageSnapshotCapacityTests: XCTestCase {
                 XCTAssertNotNil(receipt)
             }
         }
+    }
+
+    func testNormalPublicationRefusesAReplacementForTheVerifiedStage() throws {
+        let fixture = try Fixture(), operation = UUID()
+        let names = StorageSnapshot.names(operation)
+        let staging = fixture.base.appendingPathComponent(names.staging)
+        let saved = fixture.base.appendingPathComponent("verified-stage")
+        var budget = StorageSnapshotBudget.production()
+        budget.observe = { phase in
+            guard phase == "before_publish" else { return }
+            try FileManager.default.moveItem(at: staging, to: saved)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        }
+        XCTAssertThrowsError(try fixture.build(operation, budget)) { error in
+            guard case StorageSnapshotFailure.sourceChanged = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.base.appendingPathComponent(names.published).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: saved.appendingPathComponent("manifest.json").path))
+    }
+
+    func testNormalPublicationRefusesChangedVerifiedFileUnderSameDirectory() throws {
+        let fixture = try Fixture()
+        let relative = "source-captures/project/capture/source/payload"
+        let original = fixture.root.appendingPathComponent(relative)
+        let bytes = Data("good".utf8)
+        try FileManager.default.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try bytes.write(to: original)
+        _ = try fixture.capture([["path": "payload", "kind": "file", "sha256": ChecklistCore.hash(bytes), "size": bytes.count]])
+        let destination = fixture.base.appendingPathComponent("tampered")
+        var budget = StorageSnapshotBudget.production()
+        budget.observe = { phase in
+            guard phase == "published_before_parent_flush" else { return }
+            let path = destination.appendingPathComponent("managed/" + relative)
+            let handle = try FileHandle(forWritingTo: path)
+            defer {try? handle.close()}
+            try handle.write(contentsOf: Data("evil".utf8))
+        }
+        let command = UUID().uuidString
+        XCTAssertThrowsError(try fixture.ownerBackup("tampered", command: command, budget: budget)) { error in
+            XCTAssertEqual((error as? CoreError)?.code, "BACKUP_SOURCE_CHANGED")
+        }
+        let receipts = try fixture.router.dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM commands WHERE command_id=?", arguments: [command])
+        }
+        XCTAssertEqual(receipts, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(try Data(contentsOf: original), bytes)
+    }
+
+    func testGeneratedSharedObjectAttributionMatchesTheFormerPairwiseUnion() throws {
+        let fixture = try Fixture()
+        let project = "00000000-0000-0000-0000-000000000001"
+        let payload = Data("shared fixture".utf8)
+        let relative = "objects/qualification/shared"
+        let url = fixture.root.appendingPathComponent(relative)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try payload.write(to: url)
+        let ids = (2...34).reversed().map { "00000000-0000-0000-0000-" + String(format: "%012d", $0) }
+        var old: [String] = []
+        for id in ids {
+            old = Array(Set(old + ["attachment:" + id + ":original"])).sorted()
+            try fixture.save(["id": id, "project_id": project, "revision": 1, "mode": "managed", "availability": "available",
+                              "path": relative, "size": payload.count, "sha256": ChecklistCore.hash(payload)], "attachment")
+        }
+        let inventory = try fixture.router.dbQueue.read { db in
+            try StorageSnapshotAuthority.inventory(db, root: fixture.root, budget: .production(), retainedExists: { _ in true })
+        }
+        XCTAssertEqual(inventory.objects.count, 1)
+        XCTAssertEqual(inventory.objects.first?.authorities, old)
+    }
+
+    func testBorrowedExistenceChecksMatchTheFormerDuplicatedParentWalk() throws {
+        let fixture = try Fixture()
+        let root = fixture.base
+        let deep = Array(repeating: "nested", count: 10).joined(separator: "/")
+        for directory in ["group", deep] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(directory), withIntermediateDirectories: true)
+            for index in 0..<6 {
+                try Data([UInt8(index)]).write(to: root.appendingPathComponent("\(directory)/file-\(index)"))
+            }
+        }
+        try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("folder-link").path, withDestinationPath: "group")
+        let old = try StorageObjectFiles(root: root, walkDirectories: true)
+        let new = try StorageObjectFiles(root: root, walkDirectories: true)
+        func previous(_ path: String) throws -> Bool {
+            let parent: Int32, name: String
+            do { (parent, name) = try old.parent(path) }
+            catch where StorageFolderAccess.isMissing(error) { return false }
+            defer {Darwin.close(parent)}
+            var info = stat()
+            if fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT {return false}
+                throw StorageSnapshotFailure.failed("fstatat", path: path, root: root.path)
+            }
+            guard [S_IFREG, S_IFLNK].contains(info.st_mode & S_IFMT) else {throw StorageSnapshotFailure.unsupportedAuthority}
+            return true
+        }
+        func outcome(_ operation: () throws -> Bool) -> String {
+            do {return try operation() ? "present" : "absent"}
+            catch let error as CoreError {return error.code + ":" + String(describing: error.details["posix_errno"])}
+            catch {return String(describing: error)}
+        }
+        let generated = (0..<9).flatMap { index in ["group/file-\(index)", "\(deep)/file-\(index)"] }
+        for path in generated + ["folder-link", "folder-link/file-0", "group", "missing/item"] {
+            XCTAssertEqual(outcome {try new.regularOrLinkExists(path)}, outcome {try previous(path)}, path)
+        }
+        // Invalid syntax stays unsupported even when a prior syscall left ENOENT.
+        errno = ENOENT
+        XCTAssertThrowsError(try new.regularOrLinkExists("../outside")) { error in
+            guard case StorageSnapshotFailure.unsupportedAuthority = error else {return XCTFail("\(error)")}
+        }
+        try old.finishWalk()
+        try new.finishWalk()
     }
 
     func testOwnerFreeSpaceRefusalMeasuresAllFilesAndPreservesStoreAndEarlierBackup() throws {

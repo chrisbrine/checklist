@@ -37,7 +37,7 @@ final class ArchivePreviewStoreCopyTests: XCTestCase {
             let relevant = try router.archiveCleanupRelevantReferenceRows(db,attachments:attachments)
             let start = ProcessInfo.processInfo.systemUptime
             print("CL-150 profile relevant rows=\(relevant.count) observation=\(start-relevantStart)s")
-            let graph = try router.archiveCleanupReferenceRows(db)
+            let graph = try legacyArchiveCleanupReferenceRows(db)
             let decoded = ProcessInfo.processInfo.systemUptime
             let fullIndex = try ArchiveCleanupReferenceIndex(graph)
             print("CL-150 profile rows=\(graph.count) decode=\(decoded-start)s index=\(ProcessInfo.processInfo.systemUptime-decoded)s")

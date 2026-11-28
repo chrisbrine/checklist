@@ -43,7 +43,7 @@ private struct CurrentTaskReference {
 extension CommandRouter {
     /// The only outer commit owner validates after its complete callback. Nested
     /// calls share the frame and restore its snapshot with an actual savepoint.
-    func withValidatedDomainTransaction(_ db: Database, _ body: () throws -> Database.TransactionCompletion) throws {
+    func withValidatedDomainTransaction(_ db: Database, deadline: MaintenanceDeadline? = nil, _ body: () throws -> Database.TransactionCompletion) throws {
         if let frame = taskReferenceFrame {
             guard frame.database == ObjectIdentifier(db), db.isInsideTransaction else { throw referenceBoundaryFailure() }
             let snapshot = frame.projects
@@ -66,9 +66,14 @@ extension CommandRouter {
         let frame = TaskReferenceFrame(db)
         taskReferenceFrame = frame
         defer { taskReferenceFrame = nil }
-        try db.inTransaction {
+        try deadline?.check()
+        try db.inTransaction(deadline == nil ? nil : .immediate) {
+            try deadline?.check()
             let completion = try body()
-            if case .commit = completion { try validateCurrentTaskReferences(db, frame) }
+            if case .commit = completion {
+                try validateCurrentTaskReferences(db, frame)
+                try deadline?.check()
+            }
             return completion
         }
     }

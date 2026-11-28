@@ -56,6 +56,7 @@ final class NativeBootstrapContinuation: Error, @unchecked Sendable {
     private let owner = Caller(role: "owner", installation: "native-thread-bootstrap", projectIDs: [])
     private let worker = DispatchQueue(label: "org.checklist.native-bootstrap", qos: .userInitiated, autoreleaseFrequency: .workItem)
     private var phase: Phase = .prepared
+    private var stagingEnrollment = false
     private var completion: ((Result<Coordinator.BootstrapResult, Error>) -> Void)?
 
     init(coordinator: Coordinator, existing: Enrollment, project: String, oldExecutionDomain: String, executionDomain: String,
@@ -76,6 +77,7 @@ final class NativeBootstrapContinuation: Error, @unchecked Sendable {
         worker.async { [self] in autoreleasepool {
             do {
                 if case .codexRestart(let old, let new, let effects) = kind {
+                    try closeCodexRestart(old:old,new:new,effects:effects)
                     _ = try Coordinator.verifyCodexRestartAfterClosure(effects: effects, old: old, new: new,
                         checkOwner: { try self.checkOwnerFromWorker(staged: nil) })
                 }
@@ -84,6 +86,24 @@ final class NativeBootstrapContinuation: Error, @unchecked Sendable {
                 coordinator.queue.async { [self] in finish(.failure(error)) }
             }
         } }
+    }
+
+    private func closeCodexRestart(old: NativeLifecycleRegistration, new: NativeLifecycleRegistration,
+                                   effects: CodexAppHostRestartEffects) throws {
+        let evidence = try Coordinator.verifyCodexRestartHost(effects:effects,old:old,new:new)
+        let work = try coordinator.queue.sync {
+            try checkOwnerOnQueue(staged:nil)
+            let work = try coordinator.prepareNativeClosure(baseline,processState:evidence.process.rawValue,
+                registryState:"not_applicable",registryDigest:nil,basis:.codexAppHostRestart,replacementDomain:executionDomain)
+            // Rollback after this boundary must keep the earlier generation fenced.
+            baseline = work.enrollment
+            return work
+        }
+        let outcome = coordinator.applyNativeClosure(work)
+        let released = try coordinator.queue.sync {try coordinator.finishNativeClosure(work,outcome:outcome)}
+        guard released else {
+            throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier Codex app host must stop and return for pickup before reconnecting.")
+        }
     }
 
     private var ownerAllowed: Bool {
@@ -173,6 +193,8 @@ final class NativeBootstrapContinuation: Error, @unchecked Sendable {
                 resumption: NativeSessionResumption(projectID: project, sessionID: baseline.sessionID, provider: baseline.provider,
                     oldInstallation: baseline.installation + "/" + baseline.generation, oldExecutionDomain: oldExecutionDomain,
                     newInstallation: resumed.installation + "/" + resumed.generation, newExecutionDomain: executionDomain))
+            coordinator.beginStagingEnrollment(baseline.installation)
+            stagingEnrollment = true
             try ConnectionCommit.perform(saveCredential: { try coordinator.credentials.write(baseline.installation, token) },
                 saveEnrollment: { coordinator.enrollments[baseline.installation] = resumed; try coordinator.saveEnrollments() },
                 registerSession: {}, rollback: { try restore(staged, includingUnstaged: true) })
@@ -241,6 +263,10 @@ final class NativeBootstrapContinuation: Error, @unchecked Sendable {
     private func finish(_ result: Result<Coordinator.BootstrapResult, Error>) {
         coordinator.requireCommandQueue()
         guard let completion else { return }
+        if stagingEnrollment {
+            coordinator.finishStagingEnrollment(baseline.installation)
+            stagingEnrollment = false
+        }
         self.completion = nil; phase = .finished
         completion(result)
     }

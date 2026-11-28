@@ -81,6 +81,43 @@ final class WorkHealthPreparationTests: XCTestCase {
         XCTAssertNotNil(saved["work_health"],"The background pass must actually commit after unrelated traffic")
     }
 
+    func testBackupAdmissionCanCloseDuringHealthPreparationAndDefersApplication() throws {
+        let fixture = try StorageFixture(fast:true),project = try fixture.project(),task = try fixture.task(project)
+        let router = fixture.router!,entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
+        try router.dbQueue.writeWithoutTransaction {db in
+            try router.withValidatedDomainTransaction(db) {
+                var active = task
+                active["status_id"] = try XCTUnwrap(router.records(db,type:"status",project:project["id"] as? String).first {$0["category"] as? String == "active"}?["id"])
+                try router.save(db,active,type:"task");return .commit
+            }
+        }
+        func persistedHealth() throws -> String? {
+            try router.dbQueue.read { db in
+                try String.fetchOne(db,sql:"SELECT json_extract(data,'$.work_health') FROM records WHERE id=? AND type='task'",arguments:[task["id"] as! String])
+            }
+        }
+        let before = try persistedHealth()
+        let done = expectation(description:"paused health returns while capture holds admission")
+        let result = LockedTestState<JSON?>(nil)
+        router.workHealthPreparationProbe = {
+            entered.signal()
+            guard release.wait(timeout:.now()+10) == .success else {throw CoreError("TEST_TIMEOUT","Health preparation was not released.")}
+        }
+        defer {release.signal();router.workHealthPreparationProbe = nil}
+        DispatchQueue.global().async {
+            defer {done.fulfill()}
+            do {let reply = try router.runWorkHealthChecks();result.withLock {$0 = reply}} catch {XCTFail("Health: \(error)")}
+        }
+        XCTAssertEqual(entered.wait(timeout:.now()+5),.success)
+        try router.backupWrites.beginCapture()
+        defer {router.backupWrites.endCapture(router:router);router.backupWrites.endBackup(router:router)}
+        release.signal()
+        wait(for:[done],timeout:10)
+        XCTAssertEqual(result.snapshot?["deferred"] as? Bool,true)
+        XCTAssertEqual(result.snapshot?["changed"] as? Int,0)
+        XCTAssertEqual(try persistedHealth(),before)
+    }
+
     func testChangedGroupMembershipUsesExactUnicodeAndLegacyShapes() throws {
         let f = try StorageFixture(fast:true),project = try f.project(),router = f.router!
         let group = try XCTUnwrap(f.call("triage_create",["project_id":project["id"]!,"name":"Exact membership"])["data"] as? JSON)
@@ -297,14 +334,15 @@ extension EvidenceAuthorityTests {
         XCTAssertTrue((health["deliveries"] as? [JSON] ?? []).isEmpty,"A prepared target must not deliver to a revoked session")
     }
 
-    func testWorkHealthPreparationFailureRemovesFenceAndAllowsNextPass() throws {
+    func testWorkHealthPreparationFailureDisablesFenceAndAllowsNextPass() throws {
         let p = try project(),t = try ready(p),w = try native(p,"health-preparation-retry",domain:"health-preparation-retry")
         _ = try claim(p,t,caller:w)
         router.workHealthPreparationProbe = {throw CoreError("TEST_PREPARATION_FAILURE","Owned failure")}
         defer {router.workHealthPreparationProbe = nil}
         XCTAssertThrowsError(try router.runWorkHealthChecks())
         try router.dbQueue.read {db in
-            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE 'work_health_changes_%'"),0)
+            let state = CommandRouter.workHealthChangeJournal.name + "_state"
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT active FROM \(state)"),0)
         }
         router.workHealthPreparationProbe = nil
         XCTAssertEqual(try router.runWorkHealthChecks()["inspected"] as? Int,1)

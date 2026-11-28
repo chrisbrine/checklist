@@ -60,32 +60,62 @@ toward `external_bindings_changed_since_inspection`.
 
 The stopped slot's owner can reuse the create inspection at start. Create saves
 the database and WAL's device, inode, size, timestamps and SHA-256, including
-whether the WAL was absent. The proof also records checked local directories
-and the alias, binding and Trash checks that depend on the current filesystem.
-It lives in a private file and `slot.json` records its digest. Start checks the
-active owner marker, confirms no slot job or process exists, revalidates those
-filesystem checks and matches the database and WAL fingerprints. Start checks
-the file and local directory stamps again just before launchd registration and
-before the first service health call. A change discards reuse and triggers a
-full inspection. If the database, WAL or journal changes again during or after
-that inspection, start refuses. Older proofs, starts from another session and
-copies with a retained rollback journal also run the full inspection.
-`slot.json` records `start_path_inspection` as `reused` or `full` after a
-successful start.
+whether the WAL was absent. Start checks the owner, the stopped state, the files
+and the currently observed aliases, bindings, Trash paths and local directories.
+Older or unusable create proofs take the full-inspection path. A fresh scan must
+produce complete startup observations.
+
+The harness checks those observations before registering a lazy launchd job and
+again before its first service health call. A change on the reuse path or a
+receipt refusal at first access triggers one full scan. If the job was already
+registered, the harness withdraws it before issuing a fresh configuration.
+A change after the full scan refuses activation.
+
+The launch configuration pins the SHA-256 of a private receipt. The receipt
+contains the database, WAL and SQLite companion identities and hashes, plus a
+digest of the path observations. The service checks the receipt and original
+data directory before preparation. It verifies the file hashes and paths under
+its startup locks before opening SQLite. The first read-only connection checks
+the paths and file stamps again. The writer checks the database, WAL and
+rollback journal stamps. Both connections verify that SQLite opened the named
+database. The service exits with a plain error when a checked fact differs.
+
+The service checks the data directory timestamps before preparation. Under the
+startup locks, it checks the directory's identity, private mode and entries.
+The entry check excludes the three startup lock files. The activation probe
+leaves an already-private slot directory untouched.
+For opaque, root-unbound Trash history, the receipt carries the observed
+ancestry and permission denial. macOS can allow a directory metadata lookup
+while refusing the open that resolves its canonical name.
+An existing test store requires a receipt. A new empty store checks that its
+database and SQLite companions are absent. The live service bypasses this
+protocol. The locks coordinate Checklist writers. Independent filesystem writers
+can still change paths after a check.
+
+A seeded launch requires a stage with the service verifier. To refresh an
+inactive registered job or a receipt from a previous process, stop the slot
+and start it again. `slot.json` reports `start_path_inspection` as `reused`
+or `full` after a successful start.
 
 The 21 Nov 2026 live-backup check took 2 h 35 min at load 500–850. The source,
 destination and start inspections took 2,647 s, 2,693 s and 3,815 s. On 22 Nov
 the old inspector scanned the 2.88 GB slot 3 database in 2,589 s at one-minute
-load 670 to 616. The new inspector scanned it in 266 s at load 650 to 693.
-Both counted 3,054,388 managed relative paths and 14,962 external binding
-occurrences. Revalidating the filesystem proof took 44 s. Hashing the
-database took 5.5 s per read
-(one-minute load 693–708 during the latter measurements). Adding the one scan,
-proof revalidation and two hash reads to the earlier three minutes of copy,
-verification, launch and check work gives an estimated 8 min 22 s for a
-current-schema seed. The new measurements used the stopped database read-only
-with SQLite's immutable mode. An exact-stage slot run measures the full
-create, start and check sequence.
+load 670 to 616. The optimized inspector scanned it in 266 s at load 650 to
+693. Both counted 3,054,388 managed relative paths and 14,962 external binding
+occurrences. Revalidating the proof took 44 s. Each database hash took 5.5 s.
+These measurements used the stopped database in read-only immutable mode.
+
+On 22 Nov 2026, harness `93f6d7c` took 290 s to create, 51 s to start and 9 s
+to check slot 1 with the signed stage `6d2eb904db1260a0`. The 350 s run
+included 204.09 s for destination inspection, 22.21 s for startup preflight
+and 25.05 s from launch to health. One-minute load was 381 after create and
+392 to 394 during startup. This run preceded the service-side inspection
+receipt.
+
+On 27 Nov 2026, the live-backup create for build 421 on slot 3 timed out
+after 900.753 s during its single destination scan. The one-minute host load
+went from 255.68 to 323.52 and reached 541.30 during that scan. The run
+exceeded the ten-minute budget. Start and check remained unmeasured.
 
 The shared Python helpers are `paths_overlap(a, b) -> bool` and `checklist_root_overlap(path, exclude=()) -> str | None`. Root lookup checks `live`, each `slot-N` data root and folder in numerical order, then `test-base`, returning the first non-excluded label. Slot admission excludes its own label and `test-base`; a live or another-slot overlap refuses. Swift uses the same path rule: existing equal/ancestor paths are identified by `(st_dev, st_ino)`; remaining comparisons use the deepest existing ancestor's canonical on-disk spelling (`F_GETPATH` on macOS), with symlinks resolved even for missing tails. Components are NFD-normalized and case-folded, treating every volume as case-insensitive to fail closed. Comparisons never use string prefixes. The shared vectors in `Tests/Fixtures/path-overlap-vectors.json` cover filesystem aliases and missing paths in both languages.
 

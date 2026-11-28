@@ -42,6 +42,26 @@ struct StorageSettingsSummary {
                 Row(label:"Logical file lengths",value:bytes(usage["logical_bytes"])),
                 Row(label:"Allocated file blocks",value:bytes(usage["allocated_file_bytes"]))]
     }
+    static func backupAttentionTitle(_ attention: [String: Any]) -> String {
+        switch attention["reason"] as? String {
+        case "snapshot_free_space": return "Backup needs more free space"
+        case "snapshot_deadline": return "Backup ran out of time"
+        default: return "Backup reached a storage limit"
+        }
+    }
+    static func automaticBackup(_ raw: Any?) -> [Row] {
+        guard let attempt = raw as? [String: Any], let state = attempt["state"] as? String else {
+            return [Row(label: "Last attempt", value: "None recorded")]
+        }
+        let states = ["starting": "Starting", "queued": "Queued", "running": "Running", "complete": "Verified", "failed": "Failed", "unknown": "Outcome unknown"]
+        var rows = [Row(label: "Last attempt", value: states[state] ?? "Outcome unknown")]
+        if let attempted = attempt["attempted_at"] as? String { rows.append(Row(label: "Attempted", value: attempted)) }
+        if state == "failed" {
+            if let step = attempt["next_step"] as? String { rows.append(Row(label: "Next step", value: step)) }
+            if let retry = attempt["retry_not_before"] as? String { rows.append(Row(label: "Retry no earlier than", value: retry)) }
+        }
+        return rows
+    }
     static func retained(_ raw: Any?) -> [Row] {
         let info = raw as? [String:Any] ?? [:]
         return [Row(label:"Measured copies",value:(info["observed_copy_count"] as? NSNumber)?.stringValue ?? "0"),

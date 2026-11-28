@@ -1,0 +1,14 @@
+{
+  "command_id": "00000000-0000-0000-0000-000000000018",
+  "command_outcome": "accepted",
+  "data": {
+    "operation_id": "00000000-0000-0000-0000-000000000019",
+    "command_id": "00000000-0000-0000-0000-000000000018",
+    "method": "work_checkpoint",
+    "project_id": "00000000-0000-0000-0000-000000000001",
+    "state": "queued",
+    "status_method": "operation_get",
+    "created_at": "2026-10-01T12:00:00Z",
+    "updated_at": "2026-10-01T12:00:00Z"
+  }
+}

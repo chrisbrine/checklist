@@ -34,6 +34,8 @@ final class NativeLifecycleMonitor {
     var observationScheduled = false
     var observationStarted = false
     var observationDirty = false
+    var observationWaitingForClosure = false
+    let closureQueue = DispatchQueue(label: "org.checklist.native-closure", qos: .userInitiated, autoreleaseFrequency: .workItem)
     var pendingObservations: [Enrollment] = []
     var observationOffset = 0
     var connectionRequests: [(@Sendable () -> Void)?] = []
@@ -53,12 +55,12 @@ extension Coordinator {
     /// one enrollment; foreground requests can run before the next turn.
     func observeNativeConversationLifecycles() {
         requireCommandQueue()
-        guard !nativeLifecycle.resumptionInFlight, !nativeLifecycle.deferredWriteScheduled else { return }
-        guard router.writeAdmissionStatus["locked"] as? Bool != true else { return }
         if nativeLifecycle.observationScheduled {
             if nativeLifecycle.observationStarted { nativeLifecycle.observationDirty = true }
             return
         }
+        guard !nativeLifecycle.resumptionInFlight, !nativeLifecycle.deferredWriteScheduled else { return }
+        guard router.writeAdmissionStatus["locked"] as? Bool != true else { return }
         nativeLifecycle.observationScheduled = true
         queue.async { [self] in
             nativeLifecycle.pendingObservations = Array(enrollments.values)
@@ -81,7 +83,8 @@ extension Coordinator {
         if nativeLifecycle.observationOffset < nativeLifecycle.pendingObservations.count {
             let enrollment = nativeLifecycle.pendingObservations[nativeLifecycle.observationOffset]
             nativeLifecycle.observationOffset += 1
-            queue.activity("native_lifecycle_observation") { observeNativeConversationLifecycle(enrollment) }
+            queue.activity("native_lifecycle_observation") { observeNativeConversationLifecycle(enrollment, deferClosure: true) }
+            if nativeLifecycle.observationWaitingForClosure { return }
         }
         if nativeLifecycle.observationOffset < nativeLifecycle.pendingObservations.count {
             queue.async { [self] in observeNextNativeConversationLifecycle() }
@@ -102,7 +105,7 @@ extension Coordinator {
 
     /// A reconnect can arrive before its background observation turn. Resolve
     /// only that exact earlier registration before applying the existing guards.
-    func observeNativeConversationLifecycle(_ enrollment: Enrollment) {
+    func observeNativeConversationLifecycle(_ enrollment: Enrollment, deferClosure: Bool = false) {
         requireCommandQueue()
         guard !nativeLifecycle.resumptionInFlight else { return }
         guard router.writeAdmissionStatus["locked"] as? Bool != true else { return }
@@ -127,15 +130,40 @@ extension Coordinator {
         let observation = nativeLifecycle.inspect(registration)
         guard observation.provesClosure else { return }
         do {
-            _ = try queue.activity("native_closure_reconciliation") {
-                try reconcileNativeClosure(enrollment, processState: observation.process.rawValue,
-                    registryState: observation.registry.rawValue, registryDigest: observation.registryDigest)
+            try queue.activity("native_closure_reconciliation") {
+                if deferClosure {
+                    let work = try prepareNativeClosure(enrollment, processState: observation.process.rawValue,
+                        registryState: observation.registry.rawValue, registryDigest: observation.registryDigest)
+                    startObservedNativeClosure(work)
+                } else {
+                    _ = try reconcileNativeClosure(enrollment, processState: observation.process.rawValue,
+                        registryState: observation.registry.rawValue, registryDigest: observation.registryDigest)
+                }
             }
         } catch {
-            let detail = error.localizedDescription
-            if nativeLifecycle.failures[key] != detail {
-                nativeLifecycle.failures[key] = detail
-                fputs("Verified native closure is fenced; claim release needs reconciliation: \(detail)\n", stderr)
+            recordNativeClosureFailure(error,key:key)
+        }
+    }
+
+    private func recordNativeClosureFailure(_ error: Error, key: String) {
+        let detail = error.localizedDescription
+        if nativeLifecycle.failures[key] != detail {
+            nativeLifecycle.failures[key] = detail
+            fputs("Verified native closure is fenced; claim release needs reconciliation: \(detail)\n", stderr)
+        }
+    }
+
+    private func startObservedNativeClosure(_ work: NativeClosureWork) {
+        requireCommandQueue()
+        nativeLifecycle.resumptionInFlight = true
+        nativeLifecycle.observationWaitingForClosure = true
+        nativeLifecycle.closureQueue.async { [self] in
+            let outcome = applyNativeClosure(work)
+            queue.async { [self] in
+                finishNativeBootstrapWork {
+                    do { _ = try finishNativeClosure(work,outcome:outcome) }
+                    catch { recordNativeClosureFailure(error,key:work.key) }
+                }
             }
         }
     }
@@ -257,9 +285,31 @@ extension Coordinator {
     }
 
     private func finishNativeLifecycleWrites() {
-        observeNativeConversationLifecycles()
+        if nativeLifecycle.observationWaitingForClosure {
+            nativeLifecycle.observationWaitingForClosure = false
+            // Resume the existing sweep. A pending closure can require a later
+            // command or registry event; this completion does not mark it dirty.
+            queue.async { [self] in observeNextNativeConversationLifecycle() }
+        } else { observeNativeConversationLifecycles() }
         dispatchNative()
         if nativeLifecycle.connectionRequestScheduled { continueNativeConnectionRequests() }
+    }
+
+    struct NativeClosureWork: Sendable {
+        let enrollment: Enrollment
+        let domain: String
+        let processState: String
+        let registryState: String
+        let registryDigest: String?
+        let basis: NativeClosureBasis
+        let replacementDomain: String?
+
+        var key: String { enrollment.installation + "/" + enrollment.generation }
+    }
+
+    struct NativeClosureOutcome: Sendable {
+        let release: Result<Bool,Error>
+        let changed: Bool
     }
 
     /// One service-owned fence/release path for registry closure and the owner's
@@ -268,23 +318,39 @@ extension Coordinator {
     func reconcileNativeClosure(_ enrollment: Enrollment, processState: String, registryState: String,
                                 registryDigest: String?, basis: NativeClosureBasis = .processAndRegistry,
                                 replacementDomain: String? = nil) throws -> Bool {
-        requireCommandQueue()
-        return try router.withNativeLifecycleCommitNotification({
-            try reconcileNativeClosureOnQueue(enrollment, processState: processState, registryState: registryState,
-                registryDigest: registryDigest, basis: basis, replacementDomain: replacementDomain)
-        }, onCommit: { changed() })
+        let work = try prepareNativeClosure(enrollment,processState:processState,registryState:registryState,
+            registryDigest:registryDigest,basis:basis,replacementDomain:replacementDomain)
+        return try finishNativeClosure(work,outcome:applyNativeClosure(work))
     }
 
-    private func reconcileNativeClosureOnQueue(_ enrollment: Enrollment, processState: String, registryState: String,
-                                              registryDigest: String?, basis: NativeClosureBasis,
-                                              replacementDomain: String?) throws -> Bool {
-        let key = enrollment.installation + "/" + enrollment.generation
+    /// Fence the exact enrollment before its Core claim and delivery settlement.
+    /// No worker owns or consults the coordinator's mutable enrollment map.
+    func prepareNativeClosure(_ enrollment: Enrollment, processState: String, registryState: String,
+                              registryDigest: String?, basis: NativeClosureBasis = .processAndRegistry,
+                              replacementDomain: String? = nil) throws -> NativeClosureWork {
+        requireCommandQueue()
         guard var current = enrollments[enrollment.installation], current.generation == enrollment.generation,
-              current.nativeExecutionDomain == enrollment.nativeExecutionDomain else {
+              let domain = enrollment.nativeExecutionDomain, current.nativeExecutionDomain == domain else {
             throw CoreError("RECIPIENT_CHANGED", "The native enrollment changed before closure.")
         }
         current.revoked = true; enrollments[enrollment.installation] = current
         try saveEnrollments()
+        return .init(enrollment:current,domain:domain,processState:processState,registryState:registryState,
+            registryDigest:registryDigest,basis:basis,replacementDomain:replacementDomain)
+    }
+
+    func applyNativeClosure(_ work: NativeClosureWork) -> NativeClosureOutcome {
+        var committed = false
+        let release = Result {
+            try ServiceHoldWatchdog.withWorkLabel("native_closure_reconciliation") {
+                try router.withNativeLifecycleCommitNotification({try applyNativeClosureProjects(work)}, onCommit: {committed = true})
+            }
+        }
+        return .init(release:release,changed:committed)
+    }
+
+    private func applyNativeClosureProjects(_ work: NativeClosureWork) throws -> Bool {
+        let enrollment = work.enrollment
         var pending = false
         for project in enrollment.projectIDs {
             let caller = Caller(role: "owner", installation: "native-lifecycle", projectIDs: [])
@@ -293,17 +359,30 @@ extension Coordinator {
                 throw CoreError("RECIPIENT_CHANGED", "The exact native session authorization is unavailable.")
             }
             let proof = VerifiedNativeClosure(projectID: project, sessionID: enrollment.sessionID,
-                installation: key, executionDomain: enrollment.nativeExecutionDomain!, provider: enrollment.provider,
-                authorizationGeneration: generation, processState: processState, registryState: registryState,
-                registryDigest: registryDigest, basis: basis, replacementExecutionDomain: replacementDomain)
+                installation: work.key, executionDomain: work.domain, provider: enrollment.provider,
+                authorizationGeneration: generation, processState: work.processState, registryState: work.registryState,
+                registryDigest: work.registryDigest, basis: work.basis, replacementExecutionDomain: work.replacementDomain)
             guard let result = try router.withImmediateWriteAccess({ try router.reconcileVerifiedNativeClosure(proof, caller: caller) }) else {
                 throw CoreError("NATIVE_CLOSURE_PENDING", "Closure must finish after the current storage operation before this thread can reconnect.")
             }
             if !(result["pending_attempt_ids"] as? [String] ?? []).isEmpty { pending = true }
         }
-        nativeLifecycle.failures.removeValue(forKey: key)
-        if !pending { nativeLifecycle.reconciled.insert(key); nativeLifecycle.watches.removeValue(forKey: key) }
         return !pending
     }
 
+    func finishNativeClosure(_ work: NativeClosureWork, outcome: NativeClosureOutcome) throws -> Bool {
+        requireCommandQueue()
+        defer {if outcome.changed {changed()}}
+        let released = try outcome.release.get()
+        guard let current = enrollments[work.enrollment.installation], current.generation == work.enrollment.generation,
+              current.nativeExecutionDomain == work.domain else {
+            throw CoreError("RECIPIENT_CHANGED", "The native enrollment changed during closure settlement.")
+        }
+        nativeLifecycle.failures.removeValue(forKey: work.key)
+        if released {
+            nativeLifecycle.reconciled.insert(work.key)
+            nativeLifecycle.watches.removeValue(forKey: work.key)
+        }
+        return released
+    }
 }

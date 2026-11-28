@@ -271,6 +271,7 @@ extension CommandRouter {
         guard UUID(uuidString:command) != nil else { throw CoreError("INVALID_INPUT","command_id must be a UUID.") }
         let digest = hash(Data(("export_project" + (try jsonString(p))).utf8))
         var captured: JSON = [:], replay: JSON?, pid = "", holds: [String] = []
+        let deadline = Self.projectExportDeadline()
         try withValidatedDomainTransaction(db) {
             pid = try self.scope(db,p,c)
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
@@ -280,8 +281,9 @@ extension CommandRouter {
                 if Self.isPrunedResult(replay ?? [:]) { throw Self.expiredCommandError(command) }
                 return .commit
             }
-            captured = try self.projectExportRecords(db,pid:pid)
+            captured = try self.projectExportRecords(db,pid:pid,deadline:deadline)
             for attachment in captured["attachment"] as? [JSON] ?? [] where attachment["mode"] as? String == "managed" && attachment["availability"] as? String == "available" {
+                try deadline.check()
                 let id = uuid();holds.append(id)
                 try self.save(db,["id":id,"project_id":pid,"kind":"reader","purpose":"project_export","attachment_id":(try StoredRecord(attachment, family: "Attachments").requiredValue("id")),
                     "sha256":(try StoredRecord(attachment,
@@ -385,19 +387,55 @@ extension CommandRouter {
     }
     static let projectExportTypes = ["import_record","import_receipt","policy_revision","task","relation","task_alias","status","tag","message","conversation","delivery","request","group","attachment","review","review_request","finding","finding_resolution","manifest","attempt","session","task_session","source_capture","source_execution","batch","batch_claim","batch_disposition","triage_membership_interval","triage_membership_exit","project_context_revision","direction_disposition","checkpoint","policy_proposal","taxonomy_revision","storage_job","storage_hold"] + MediaRecordRegistry.families.sorted()
 
-    func projectExportRecords(_ db: Database,pid: String) throws -> JSON {
-        // Validate ALL project envelopes before applying the portable projection. An
-        // unknown required family must fail, rather than vanish behind an allowlist.
-        let envelopes = try MediaRecordRegistry.envelopes(db,project:pid)
-        try MediaRecordRegistry.validate(envelopes)
+    private static func projectExportDeadline() -> CleanupObservationDeadline {
+        .init(seconds: CleanupObservationDeadline.writerSeconds,
+              failure: CoreError("EXPORT_PREPARATION_TIMED_OUT","The project export metadata exceeded the writer time budget. Originals are retained."))
+    }
+
+    func projectExportRecords(_ db: Database,pid: String,deadline: CleanupObservationDeadline? = nil) throws -> JSON {
+        let deadline = deadline ?? Self.projectExportDeadline()
+        return try deadline.observing(db) { try projectExportRecordsWithinBudget(db,pid:pid,check:deadline.check) }
+    }
+
+    private func projectExportRecordsWithinBudget(_ db: Database,pid: String,check: () throws -> Void) throws -> JSON {
+        let byteLimit = 128 * 1_048_576
+        var bytes = 0
+        func requireInput(_ size: Int) throws {
+            try check()
+            guard size <= byteLimit - bytes - 128 else {
+                throw CoreError("EXPORT_CAPACITY_EXCEEDED","Project export metadata exceeded the 128 MiB working budget. Originals are retained.")
+            }
+        }
+        func charge(_ size: Int) throws {
+            try requireInput(size)
+            bytes += size + 128
+        }
+        // An unknown required family must fail before projection. Check only
+        // named dependencies on the same SQLite observation and export view.
+        try MediaRecordRegistry.visitEnvelopes(db,project:pid,check:check) {row in
+            try autoreleasepool {
+                try charge(row["snapshot_envelope_bytes"])
+                try MediaRecordRegistry.validateSnapshotEnvelope(GRDBRecordEnvelopeAdapter.decode(row),db:db,exportProject:pid,check:check,requireInput:requireInput)
+            }
+        }
+        // A session anchored in another project can appear in this projection
+        // when its exact grant names this project. It is outside the scan above.
+        let pidBytes = Data(pid.utf8)
+        let extraSessions = try Int.fetchCursor(db, sql: """
+            SELECT length(CAST(data AS BLOB)) FROM records WHERE type='session'
+            AND (project_id IS NULL OR project_id<>CAST(? AS TEXT)) AND
+            """ + " " + Self.sessionProjectCandidate, arguments: [pidBytes, pidBytes, pidBytes])
+        while let bytes = try extraSessions.next() {try charge(bytes)}
         var exported: JSON = ["format":"checklist-project","schema_version":1,"exported_at":now(),"project":try record(db,pid,type:"project")]
         for type in Self.projectExportTypes {
+            try check()
             var values = try records(db,type:type,project:pid)
             if type == "storage_hold" { values = values.filter { $0["kind"] as? String == "media_reference" } }
             if type == "storage_job" {
                 values = values.filter { $0["kind"] as? String == "media_attachment_owner" || $0["kind"] as? String == "attachment_import" && $0["attachment_owner_id"] is String }
             }
             for i in values.indices {
+                try check()
                 if type == "attachment",values[i]["mode"] as? String == "managed",values[i]["availability"] as? String == "available" {
                     guard let path = values[i]["path"] as? String,
                           let sha = values[i]["sha256"] as? String,sha.utf8.count == 64,
@@ -416,10 +454,13 @@ extension CommandRouter {
         for type in Self.projectExportTypes {
             for value in exported[type] as? [JSON] ?? [] { if let id = value["id"] as? String { included.insert(Data(id.utf8)) } }
         }
-        for envelope in envelopes where MediaRecordRegistry.families.contains(envelope.type) {
-            for reference in envelope.object["record_references"] as? [JSON] ?? [] {
-                guard let id = reference["id"] as? String,included.contains(Data(id.utf8)) else {
-                    throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A required media dependency is excluded from portable project export.")
+        for type in MediaRecordRegistry.families {
+            for value in exported[type] as? [JSON] ?? [] {
+                for reference in value["record_references"] as? [JSON] ?? [] {
+                    try check()
+                    guard let id = reference["id"] as? String,included.contains(Data(id.utf8)) else {
+                        throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A required media dependency is excluded from portable project export.")
+                    }
                 }
             }
         }
@@ -427,8 +468,26 @@ extension CommandRouter {
         exported["media_capture"] = ["format":1,"staging_bytes_included":false,"ownership":"committed_only",
             "uncommitted_import_job_ids":jobs.filter { $0["kind"] as? String == "attachment_import" && $0["state"] as? String != "committed" }.compactMap { $0["id"] as? String }]
         let profileIDs = Set((exported["session"] as? [JSON] ?? []).compactMap {$0["profile_id"] as? String})
-        exported["profiles"] = try records(db,type:"profile").filter {profileIDs.contains($0["id"] as? String ?? "")}
-        exported["events"] = try Row.fetchAll(db,sql:"SELECT id,entity_id,actor,kind,occurred_at,data FROM events WHERE project_id=? ORDER BY seq",arguments:[pid]).map { row -> JSON in ["id":row["id"] as String,"entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])] }
+        var profiles: [JSON] = []
+        if !profileIDs.isEmpty {
+            let cursor = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength + " FROM records WHERE type='profile' ORDER BY rowid")
+            while let row = try cursor.next() {
+                try check()
+                let id = String(decoding: row["_envelope_id_bytes"] as Data, as: UTF8.self)
+                guard profileIDs.contains(id) else {continue}
+                try charge(row["snapshot_envelope_bytes"])
+                profiles.append(try GRDBRecordEnvelopeAdapter.decode(row).object)
+            }
+        }
+        exported["profiles"] = profiles
+        var events: [JSON] = []
+        let query = "SELECT id,entity_id,actor,kind,occurred_at,data, " + StorageSnapshotWorkingBytes.envelopeLength + " FROM events WHERE project_id=? ORDER BY seq"
+        let cursor = try Row.fetchCursor(db,sql:query,arguments:[pid])
+        while let row = try cursor.next() {
+            try charge(row["snapshot_envelope_bytes"])
+            events.append(["id":row["id"] as String,"entity_id":row["entity_id"] as String? ?? "","actor":row["actor"] as String,"kind":row["kind"] as String,"occurred_at":row["occurred_at"] as String,"data":jsonObject(row["data"])])
+        }
+        exported["events"] = events
         return PortableProjectExport.project(exported)
     }
     func writeProjectExport(_ captured: JSON,directory: URL) throws {

@@ -12,6 +12,17 @@ public enum ChecklistPaths {
         ChecklistInstance.executableURL.deletingLastPathComponent().appendingPathComponent("ChecklistService")
     }
     public static func prepare() throws {
+        try prepare(root: root, forTestSlot: ChecklistInstance.current.slot != nil)
+    }
+    static func prepare(root: URL, forTestSlot: Bool) throws {
+        // Reapplying 0700 changes ctime, even on a private directory. A slot
+        // client's first health request must preserve its inspection receipt.
+        if forTestSlot {
+            var entry = stat()
+            if lstat(root.path, &entry) == 0, entry.st_uid == getuid(), entry.st_mode == S_IFDIR | 0o700 {
+                return
+            }
+        }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
     }

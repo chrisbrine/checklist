@@ -1,6 +1,28 @@
 import Foundation
 import GRDB
 
+/// One resumption transaction observes the same prior generation across many
+/// notices. Reuse exact closure lookups even when there is no matching closure.
+final class NativeClosureDeliveryReads {
+    private struct Key: Hashable {
+        let project: Data
+        let session: Data
+        let generation: Data
+    }
+    private var observations: [Key: JSON?] = [:]
+
+    func lookup(_ delivery: JSON, _ load: () throws -> JSON?) rethrows -> JSON? {
+        guard !["acknowledged","addressed"].contains(delivery["state"] as? String ?? ""),
+              let project = delivery["project_id"] as? String, let session = delivery["recipient_session_id"] as? String,
+              let generation = delivery["recipient_authorization_generation"] as? String else { return try load() }
+        let key = Key(project:Data(project.utf8),session:Data(session.utf8),generation:Data(generation.utf8))
+        if let previous = observations[key] {return previous}
+        let observed = try load()
+        if observations.count < 256 {observations[key] = .some(observed)}
+        return observed
+    }
+}
+
 extension CommandRouter {
     /// Service-internal notification boundary. Observe committed event progress
     /// with pooled reads; no sequence is exposed to a caller or stored in a receipt.
@@ -52,6 +74,7 @@ extension CommandRouter {
     func redeliverNativeClosureNotices(_ db: Database, session: JSON, closure: JSON) throws {
         let pid = try StoredRecord(closure, family: "native_closure").string("project_id")
         let sid = try StoredRecord(session, family: "session").string("id")
+        let closureReads = NativeClosureDeliveryReads()
         for old in try nativeClosureNotices(db, closure: closure) {
             guard let message = try nativeClosureNoticeMessage(db, delivery: old, project: pid),
                   !Self.resumptionSkipsNote(message) else { continue }
@@ -59,7 +82,7 @@ extension CommandRouter {
                 "session_id": sid, "recipient_role": "resumed_conversation",
                 "label": "Notice from this conversation's earlier process; its original delivery remains fenced."
             ]], nativeClosureLineage: .init(oldDeliveryID: try StoredRecord(old, family: "delivery").string("id"),
-                closureID: try StoredRecord(closure, family: "native_closure").string("id")))
+                closureID: try StoredRecord(closure, family: "native_closure").string("id")), nativeClosureReads:closureReads)
         }
     }
 

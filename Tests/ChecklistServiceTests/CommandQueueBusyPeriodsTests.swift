@@ -1,11 +1,12 @@
 import XCTest
 import Foundation
+import ChecklistCore
 @testable import ChecklistService
 
 final class CommandQueueBusyPeriodsTests: XCTestCase {
     private func root() throws -> URL {
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Caches/ChecklistQualification/r12-N/queue-log-" + UUID().uuidString)
+            .appendingPathComponent("Library/Caches/ChecklistQualification/r13-P512/queue-log-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
     }
@@ -52,6 +53,33 @@ final class CommandQueueBusyPeriodsTests: XCTestCase {
         XCTAssertEqual(saved.count, 64)
         XCTAssertEqual(saved.first?.work, "work-7")
         XCTAssertEqual(saved.last?.work, "after-restart")
+    }
+
+    func testWatchdogRecordsConcurrentActiveAndCompletedHolds() throws {
+        let root = try root(); defer { retire(root) }
+        let log = CommandQueueBusyPeriods(url: root.appendingPathComponent("busy.json"))
+        let watchdog = ServiceHoldWatchdog()
+        let active = DispatchSemaphore(value: 0)
+        watchdog.observe { hold in
+            log.record(hold)
+            if hold.active { active.signal() }
+        }
+        let writer = watchdog.begin(resource: "writer", work: "routine_prune_command_results")
+        let gate = watchdog.begin(resource: "archive_storage_gate", work: "archive_cleanup")
+        XCTAssertEqual(active.wait(timeout: .now() + 6), .success)
+        XCTAssertEqual(active.wait(timeout: .now() + 6), .success)
+        let snapshot = try XCTUnwrap(watchdog.status["active"] as? [[String: Any]])
+        XCTAssertEqual(Set(snapshot.compactMap { $0["work"] as? String }), ["routine_prune_command_results", "archive_cleanup"])
+        watchdog.end(writer)
+        watchdog.end(gate)
+        XCTAssertEqual((watchdog.status["active"] as? [[String: Any]])?.count, 0)
+        XCTAssertEqual((watchdog.status["recent"] as? [[String: Any]])?.count, 2)
+        log.flush()
+        let entries = try JSONDecoder().decode([CommandQueueBusyPeriods.Period].self, from: Data(contentsOf: log.url))
+        XCTAssertEqual(entries.filter { $0.active == true }.count, 2)
+        XCTAssertEqual(entries.filter { $0.active == false }.count, 2)
+        XCTAssertEqual(Set(entries.compactMap(\.resource)), ["writer", "archive_storage_gate"])
+        XCTAssertTrue(entries.allSatisfy { $0.duration_ms > 1000 })
     }
 
     func testWrappingCancelledDeadlineAndThrowingSyncPreservesDispatchResults() throws {

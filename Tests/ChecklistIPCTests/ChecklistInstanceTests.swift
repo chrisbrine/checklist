@@ -1,8 +1,24 @@
+import Darwin
 import XCTest
 @testable import ChecklistIPC
 
 final class ChecklistInstanceTests: XCTestCase {
     let home = URL(fileURLWithPath:"/Users/instance-fixture")
+
+    func testPreparingPrivateTestSlotPreservesDirectoryStamp() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try ChecklistPaths.prepare(root: root, forTestSlot: true)
+        var before = stat(), after = stat()
+        XCTAssertEqual(lstat(root.path, &before), 0)
+        try ChecklistPaths.prepare(root: root, forTestSlot: true)
+        XCTAssertEqual(lstat(root.path, &after), 0)
+        XCTAssertEqual(after.st_mode, S_IFDIR | 0o700)
+        XCTAssertEqual(after.st_ctimespec.tv_sec, before.st_ctimespec.tv_sec)
+        XCTAssertEqual(after.st_ctimespec.tv_nsec, before.st_ctimespec.tv_nsec)
+        XCTAssertEqual(after.st_mtimespec.tv_sec, before.st_mtimespec.tv_sec)
+        XCTAssertEqual(after.st_mtimespec.tv_nsec, before.st_mtimespec.tv_nsec)
+    }
+
     func testSharedPathOverlapVectors() throws {
         struct Link: Decodable { let path: String; let target: String }
         struct Vector: Decodable {
@@ -209,7 +225,7 @@ final class ChecklistInstanceTests: XCTestCase {
             return (process.terminationStatus,output)
         }
         // Compile the production current/exit handler and its error type, with no IPC calls.
-        let compiled = try run(URL(fileURLWithPath:"/usr/bin/xcrun"),["swiftc","-swift-version","5",
+        let compiled = try run(URL(fileURLWithPath:"/usr/bin/xcrun"),["swiftc","-swift-version","5","-package-name","Checklist",
             repository.appendingPathComponent("Sources/ChecklistIPC/Protocol.swift").path,
             repository.appendingPathComponent("Sources/ChecklistIPC/ChecklistInstance.swift").path,main.path,
             "-o",helper.path])

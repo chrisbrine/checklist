@@ -10,9 +10,9 @@ final class StoragePhaseTiming {
         "inventory_started", "inventory_finished", "copying_objects", "objects_finished",
         "directories_synchronized", "manifest_written", "verify_started", "verify_manifest_loaded",
         "verify_database_hashed", "verify_inventory_finished", "verify_objects_finished", "verify_finished",
-        "before_publish", "published_before_parent_flush", "reconcile_before_parent_flush",
+        "before_publish", "published_before_parent_flush", "publication_fence_checked", "reconcile_before_parent_flush",
         "receipt_prepare_begin", "receipt_manifest_loaded", "receipt_index_prepared", "receipt_usage_measured",
-        "receipt_prepare_end", "retention_begin", "retention_end", "restore_objects_started",
+        "receipt_prepare_end", "receipt_committed", "restore_objects_started",
         "restore_objects_finished", "restore_fencing_started", "restore_fencing_finished",
         "restore_before_publish", "restore_published_before_flush", "restore_usage_started", "restore_usage_finished",
         "graph_selection", "reference_and_history_scan", "byte_cleanup", "fence_observation", "journal_encoding"

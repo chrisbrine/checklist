@@ -207,6 +207,22 @@ Reply delivery runs from `reply_ready_uptime_s` to the client's reply callback,
 including the small timing-trailer encoding. Callback-to-waiter time is separate.
 Do not add nested execution or route durations to the enclosing service interval.
 
+CL-522 reproduced the host limit on a 10-core Mac with 32 client threads
+repeatedly launching the CLI for attachment operations. On build 406, an
+unenrolled `service status` probe at 21:28:07 UTC on 27 November 2026 took
+5.113 s at load 292.86 / 275.75 / 184.69. The launcher recorded 3.845 s before
+the CLI's first timing stamp. A fresh process can therefore miss a one-second
+deadline before contacting Checklist. Measure the full wall time and keep the
+pre-main, IPC delivery and service queue intervals visible in the result.
+
+With the coordinator changes, the longest authenticated probe in the repeated
+32-client workload took 4.757 s at load 453.90 / 403.63 / 361.11. It spent 1.909 s
+before the first CLI stamp and 547 ms in the service across bootstrap and the
+status request. Round links waited 0.819 ms at p95 on their worker queue,
+190 ms at the object gate and 5.9 ms in the SQLite writer queue. Those
+measurements describe this workload. Later calls depend on the backlog and
+host load.
+
 `script/measure_cli_latency.py` starts at least 50 fresh CLI processes and saves
 complete replies, timing lines, process lifetimes and host load outside the source
 checkout. It never starts a backup or changes a ticket. Its `calls` mode can

@@ -143,11 +143,16 @@ extension CommandRouter {
     @discardableResult
     public func startDoneEvidenceBackupIfDue(at time: Date = Date()) -> Bool {
         do {
+            func readDeadline() throws -> Date? {
+                let lease = try storageAdmission.acquire()
+                defer { lease.finish() }
+                return try readOnMaintenanceConnection { db in
+                    if let hold = try self.doneEvidenceBackupHold(db),hold > time {return nil}
+                    return try self.doneEvidenceBackupDeadline(db)
+                }
+            }
             guard try !StorageSnapshotRetention.isActive(root:root),
-                  let deadline = try readForPreparation({db -> Date? in
-                      if let hold = try self.doneEvidenceBackupHold(db),hold > time {return nil}
-                      return try self.doneEvidenceBackupDeadline(db)
-                  }),deadline <= time else {return false}
+                  let deadline = try readDeadline(),deadline <= time else {return false}
             let command = uuid(),attempted = ISO8601DateFormatter().string(from:time)
             var status: JSON = ["command_id":command,"attempted_at":attempted,"state":"starting"]
             try dbQueue.write {db in
@@ -176,21 +181,39 @@ extension CommandRouter {
         }
     }
 
-    /// Runs in the backup receipt transaction, before the new generation exists.
-    /// Tickets held for this backup need not wait for their next daily sweep. A
-    /// wake failure leaves them to that sweep and never fails a finished backup.
-    func wakeDoneEvidenceForBackup(_ db: Database) {
-        do {try wakeHeldDoneEvidence(db)} catch {fputs("Done evidence wake deferred to the daily sweep.\n",stderr)}
-    }
-    private func wakeHeldDoneEvidence(_ db: Database) throws {
+    /// Observe the previous generation and its waiting jobs on one reader
+    /// snapshot, before publishing the new backup receipt.
+    func prepareDoneEvidenceBackupWake(_ db: Database) throws -> [String: [String]] {
         let rows = try Row.fetchAll(db,sql:"SELECT DISTINCT project_id,json_extract(data,'$.task_id') AS task_id FROM records WHERE " + Self.waitingDoneEvidenceSQL,arguments:[try latestCompleteBackupTime(db)])
+        var tasks: [String: [String]] = [:]
+        for row in rows {
+            guard let project: String = row["project_id"], !project.isEmpty, let task: String = row["task_id"] else { continue }
+            tasks[project, default: []].append(task)
+        }
+        return tasks
+    }
+
+    /// A wake only requests a new cleanup evaluation. The evaluator checks the
+    /// current ticket, file and backup before it can remove data. An unavailable
+    /// writer leaves the work to the daily sweep.
+    func wakeDoneEvidenceForBackup(_ tasks: [String: [String]]) {
         let clock = Date()
-        for (project,group) in Dictionary(grouping:rows,by:{$0["project_id"] as String? ?? ""}) where !project.isEmpty {
-            var retries = try ticketCleanupRetryEntries(db,project:project)
-            for row in group {if let task: String = row["task_id"] {retries[task] = TicketCleanupRetry(at:clock)}}
-            try saveTicketCleanupRetries(db,project:project,entries:retries)
-            let previous = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + project]) ?? "0") ?? 0
-            try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + project,String(min(previous,clock.timeIntervalSince1970))])
+        for (project, ids) in tasks {
+            do {
+                let applied = try withMaintenanceWriter(label: "backup_done_evidence_wake") { db, deadline in
+                    try deadline.transaction(db) {
+                        var retries = try self.ticketCleanupRetryEntries(db,project:project)
+                        for task in ids { retries[task] = TicketCleanupRetry(at:clock) }
+                        try deadline.check()
+                        try self.saveTicketCleanupRetries(db,project:project,entries:retries)
+                        let key = "ticket-cleanup-next:" + project
+                        let previous = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) ?? "0") ?? 0
+                        try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:[key,String(min(previous,clock.timeIntervalSince1970))])
+                        return true
+                    }
+                }
+                if applied == nil { fputs("Done evidence wake deferred to the daily sweep.\n",stderr) }
+            } catch { fputs("Done evidence wake deferred to the daily sweep.\n",stderr) }
         }
     }
 }

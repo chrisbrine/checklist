@@ -149,7 +149,7 @@ final class CommandOperationBackupLifecycleTests: XCTestCase {
         let accepted = try data(f.call("backup_create",input,command:command)),id = accepted["operation_id"] as! String
         var failedAfterReceipt = false
         router.commandOperations.backupExecutionProbe = {phase in
-            if phase == "retention_end" {failedAfterReceipt = true;throw StorageSnapshotFailure.canceled}
+            if phase == "receipt_committed" {failedAfterReceipt = true;throw StorageSnapshotFailure.canceled}
         }
         lane.finish();router.commandOperations.backupExecutionProbe = nil
         XCTAssertTrue(failedAfterReceipt)

@@ -8,10 +8,11 @@ extension CommandRouter {
     /// Capture/holds are composed internally; public activation still needs the complete
     /// owner UI/rendering/query/rework slice and its native qualification.
     func executeMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool = false,workerChannel: Bool = false,
-                             expectedAuthorizationGeneration: String? = nil) throws -> JSON {
+                             expectedAuthorizationGeneration: String? = nil,
+                             observeStoragePhase: ((String,TimeInterval) -> Void)? = nil) throws -> JSON {
         do {
             return try executeValidatedMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:nativeOwnerProjection,
-                workerChannel:workerChannel,expectedAuthorizationGeneration:expectedAuthorizationGeneration)
+                workerChannel:workerChannel,expectedAuthorizationGeneration:expectedAuthorizationGeneration,observeStoragePhase:observeStoragePhase)
         } catch let error as MediaSchemaError {
             // Portable schema helpers have no transport error codes. Translate at
             // the command boundary, including resource and canonical preparation.
@@ -69,7 +70,8 @@ extension CommandRouter {
         ]
 
     private func executeValidatedMediaCommand(method: String,params p: JSON,caller c: Caller,nativeOwnerProjection: Bool,workerChannel: Bool,
-                                              expectedAuthorizationGeneration: String?) throws -> JSON {
+                                              expectedAuthorizationGeneration: String?,
+                                              observeStoragePhase: ((String,TimeInterval) -> Void)?) throws -> JSON {
         let reads = CommandMethods.mediaInternalReads
         guard let fields = Self.mediaCommandFields[method],Set(p.keys).isSubset(of:fields.union(["command_id",
             "project_id"])) else { throw CoreError("INVALID_INPUT","Unknown internal media command or fields.") }
@@ -102,16 +104,31 @@ extension CommandRouter {
         if ["media_rework_create","media_round_send_result"].contains(method) {
             return try mediaTicketCommand(method:method,params:p,caller:c,command:command,digest:digest,workerChannel:workerChannel)
         }
+        func phaseStart() -> TimeInterval? {observeStoragePhase.map { _ in ProcessInfo.processInfo.systemUptime }}
+        func recordPhase(_ phase: String,since start: TimeInterval?) {
+            if let start {observeStoragePhase?(phase,ProcessInfo.processInfo.systemUptime-start)}
+        }
+        let preparing = phaseStart()
         var resources = try prepareMediaResources(method:method,params:p,caller:c,workerChannel:workerChannel)
         resources.nativeOwnerProjection = nativeOwnerProjection
         let prepared = try prepareMediaCommand(method:method,params:p,caller:c,resources:resources)
+        recordPhase("media_preparation_ms",since:preparing)
         defer { try? prepared?.observer.close() }
         if let prepared,resources.previewPurgeEpoch != nil {try mediaIntakePreviewPreparationProbe?(prepared)}
+        let waiting = phaseStart()
         return try ArchiveStorageGate.withExclusive(root:root) { _ in
-            try dbQueue.writeWithoutTransaction { db in
+            recordPhase("object_gate_wait_ms",since:waiting)
+            let writerQueued = phaseStart()
+            return try dbQueue.writeWithoutTransaction { db in
+                recordPhase("storage_writer_queue_ms",since:writerQueued)
+                let transactionStarted = phaseStart()
+                defer {recordPhase("domain_transaction_ms",since:transactionStarted)}
                 var result: JSON = [:]
                 try self.withValidatedDomainTransaction(db) {
                     let pid = try self.mediaAccess(db,p,c,write:true)
+                    if method == "media_round_link_task",let expectedAuthorizationGeneration {
+                        _ = try self.backupWriteAuthorization(db,params:p,caller:c,expectedGeneration:expectedAuthorizationGeneration)
+                    }
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:c)
                     if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[c.principal,command]) {
                         guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID has a different intent.") }

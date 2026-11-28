@@ -245,10 +245,19 @@ extension CommandRouter {
         let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid)
         guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")}
         try revision(p,task);try requirePurgeSafe(db,task:task)
-        let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
-        guard try text(p,"preview_digest") == plan.digest else {throw Self.ticketPurgeStalePreview}
-        let commands = try ticketPurgeExpiringCommands(db,task:task,plan:plan)
-        return .init(plan:plan,expiredCommands:commands,reader:reader,version:version)
+        return try Self.ticketPurgeReadDeadline().observing(db) {
+            let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+            guard try text(p,"preview_digest") == plan.digest else {throw Self.ticketPurgeStalePreview}
+            let commands = try ticketPurgeExpiringCommands(db,task:task,plan:plan)
+            return .init(plan:plan,expiredCommands:commands,reader:reader,version:version)
+        }
+    }
+
+    private static func ticketPurgeReadDeadline() -> CleanupObservationDeadline {
+        let seconds = CleanupObservationDeadline.preparedSeconds
+        return .init(seconds:seconds,failure:CoreError("CLEANUP_INVENTORY_LIMIT",
+            "Permanent ticket removal could not complete its reference proof within the time budget. No content was removed.",
+            details:["limit":"observation_seconds","maximum":seconds]))
     }
 
     private static var ticketPurgeStalePreview: CoreError {
@@ -258,7 +267,9 @@ extension CommandRouter {
     func taskPurgePreview(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
         try owner(c);let pid = try scope(db,p,c),task = try self.task(db,p,pid)
         try revision(p,task);try requirePurgeSafe(db,task:task)
-        let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        let plan = try Self.ticketPurgeReadDeadline().observing(db) {
+            try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        }
         return ["preview_id":plan.digest,"digest":plan.digest,"impact":plan.impact,"can_purge":true,"blockers":[],
             "removes":"Permanently removes this ticket's private content and exclusively owned notes, work, requests, reviews and file records. Earlier history rows keep their place with their content cleared. Earlier cached command results are expired.",
             "preserves":"A minimal Purged ticket reference, incoming relations, shared records and other tickets remain. Exclusively owned managed originals, previews and captured-source bytes are queued for verified deletion after commit. Shared and reader-held bytes remain; live-only bytes wait for a completed backup. External originals and workspace files are never deleted. This is not secure erasure.",

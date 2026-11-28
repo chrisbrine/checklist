@@ -1,6 +1,7 @@
 import ChecklistTestSupport
 import XCTest
 import GRDB
+import Darwin
 @testable import ChecklistCore
 
 /// 21 Nov 2026 outage: the 30-day command-result prune read every storage job again for each
@@ -34,14 +35,15 @@ extension CoreTests {
     }
 
     func testCommandResultPruneMatchesTheCorrelatedForm() throws {
-        let principals = ["p1", "p2", "42", "P1"]
-        let ids = ["a", "b", "123", "A", "c"]
+        let principals = ["p1", "p2", "42", "P1", "[1,2]"]
+        let ids = ["a", "b", "123", "A", "c", "{\"x\":1}", "[3,4]"]
         let results = ["{\"data\":{\"x\":1}}", "{\"data\":{\"policy\":{}}}", "{\"_connection_registration\":{}}", "{", CommandRouter.prunedResult, "{\"data\":{\"policy\":null}}", "[]", "\"text\""]
         let jobShapes = [
             "{\"parent_command_id\":\"a\",\"parent_principal\":\"p1\"}", "{\"parent_command_id\":123,\"parent_principal\":\"p2\"}",
             "{\"parent_command_id\":\"123\",\"parent_principal\":42}", "{\"parent_command_id\":\"b\"}", "{\"parent_principal\":\"p1\"}",
             "{\"parent_command_id\":null,\"parent_principal\":\"p2\"}", "{\"parent_command_id\":{\"x\":1},\"parent_principal\":\"p1\"}",
-            "{\"parent_command_id\":\"A\",\"parent_principal\":\"p1\"}", "{}", "[]",
+            "{\"parent_command_id\":\"A\",\"parent_principal\":\"p1\"}",
+            "{\"parent_command_id\":[3,4],\"parent_principal\":[1,2]}", "{}", "[]",
         ]
         var random = PruneLCG(state: 0x5EED_2111)
         var compared = 0, withInvalidJob = 0
@@ -56,6 +58,22 @@ extension CoreTests {
         }
         XCTAssertGreaterThan(compared, 500)
         XCTAssertEqual(withInvalidJob, 5)
+    }
+
+    func testPruneParentKeysUseStoredTextForJSONObjectsAndArrays() throws {
+        try router.dbQueue.write { db in
+            try replacePruneFixture(db, commands: [
+                ("p1", "{\"x\":1}", "{\"data\":{}}"),
+                ("[1,2]", "[3,4]", "{\"data\":{}}"),
+                ("p1", "unprotected", "{\"data\":{}}")
+            ], jobs: [
+                "{\"parent_command_id\":{\"x\":1},\"parent_principal\":\"p1\"}",
+                "{\"parent_command_id\":[3,4],\"parent_principal\":[1,2]}"
+            ])
+        }
+        let reference = try prunable(Self.correlatedCommandResultsSQL)
+        XCTAssertEqual(reference.count, 1)
+        XCTAssertEqual(try prunable(CommandRouter.prunableCommandResultsSQL), reference)
     }
 
     func testCommandResultPruneReadsStorageJobsOncePerStatement() throws {
@@ -79,30 +97,116 @@ extension CoreTests {
 
     func testPruneStepStopsAtTheTimeLimitAndKeepsNoChange() throws {
         try oldCommandFixture(commands: 3_000, jobs: 3_000)
-        let stopped = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0, stepBudget: 0) }
+        let stopped = try router.pruneRoutineRecords(stepBudget: 0)
         XCTAssertEqual(stopped.commandResults, 0)
         XCTAssertGreaterThan(stopped.budgetStops, 0)
         XCTAssertEqual(try router.dbQueue.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM commands WHERE result=?", arguments: [CommandRouter.prunedResult]) }, 0, "a stopped step rolls back")
         XCTAssertFalse(try router.dbQueue.writeWithoutTransaction { $0.isInsideTransaction })
         let marks = try router.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") } ?? ""
         XCTAssertEqual((try JSONSerialization.jsonObject(with: Data(marks.utf8)) as? [[Double]])?.count, 2, "the retention mark is kept when the prune step stops")
-        let done = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0, stepBudget: 60) }
+        let done = try router.pruneRoutineRecords(stepBudget: 60)
         XCTAssertEqual(done.commandResults, CommandRouter.pruneBatch)
         XCTAssertEqual(done.budgetStops, 0)
     }
 
-    /// Live-store shape of 21 Nov 2026: 23,637 storage jobs. Prints both forms' times; the
-    /// correlated form is timed on 5 candidates only, because 500 took minutes.
+    func testRoutinePruneRetriesAPlanWithANewProtectedParent() throws {
+        try oldCommandFixture(commands: 12, jobs: 3)
+        let stopped = try router.pruneRoutineRecords(beforeCommandApply: {
+            try self.router.dbQueue.write { db in
+                try db.execute(sql: """
+                    INSERT INTO records(id,project_id,type,revision,data) VALUES
+                    ('late-job','project','storage_job',1,'{"parent_command_id":"command-0","parent_principal":"principal-0"}')
+                    """)
+            }
+        })
+        XCTAssertEqual(stopped.commandResults, 0)
+        XCTAssertEqual(stopped.budgetStops, 1)
+        XCTAssertEqual(try router.pruneRoutineRecords().commandResults, 11)
+        XCTAssertNotEqual(try router.dbQueue.read {
+            try String.fetchOne($0, sql: "SELECT result FROM commands WHERE command_id='command-0'")
+        }, CommandRouter.prunedResult)
+    }
+
+    func testRoutinePruneKeepsAnAgedPlanWhenARecentJobChanges() throws {
+        try oldCommandFixture(commands: 12, jobs: 3)
+        let turn = try router.pruneRoutineRecords(beforeCommandApply: {
+            try self.router.dbQueue.write { db in
+                try db.execute(sql: """
+                    INSERT INTO commands(principal,command_id,digest,result) VALUES ('principal-0','recent','digest','{}');
+                    INSERT INTO records(id,project_id,type,revision,data) VALUES
+                    ('recent-job','project','storage_job',1,'{"parent_command_id":"recent","parent_principal":"principal-0"}');
+                    UPDATE commands SET result='{"data":{}}' WHERE command_id='recent';
+                    """)
+            }
+        })
+        XCTAssertEqual(turn.commandResults, 12)
+        XCTAssertEqual(turn.budgetStops, 0)
+        XCTAssertEqual(try router.dbQueue.read {
+            try String.fetchOne($0, sql: "SELECT result FROM commands WHERE command_id='recent'")
+        }, "{\"data\":{}}")
+    }
+
+    func testOrdinaryCommandLeavesPruneBacklogToMaintenance() throws {
+        let p = try project()
+        let input = try fixtureTaskInput(router, method: "task_create", input: [
+            "project_id": p["id"]!, "title": "Ordinary write", "command_id": UUID().uuidString
+        ])
+        try oldCommandFixture(commands: 12, jobs: 3)
+        _ = try router.handle(method: "task_create", params: input, caller: owner)
+        XCTAssertEqual(try router.dbQueue.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM commands WHERE result=?", arguments: [CommandRouter.prunedResult])
+        }, 0)
+        XCTAssertEqual(try router.pruneRoutineRecords().commandResults, 12)
+    }
+
+    func testMaintenanceWriterDoesNotWaitAtSQLiteBeginImmediate() throws {
+        let external = try DatabaseQueue(path: directory.appendingPathComponent("checklist.sqlite").path)
+        try external.writeWithoutTransaction { db in
+            try db.inTransaction(.immediate) {
+                let start = ProcessInfo.processInfo.systemUptime
+                let result = try router.withMaintenanceWriter(label: "fixture_begin_immediate") { db, deadline in
+                    try deadline.transaction(db) {
+                        XCTFail("a busy maintenance step must not begin a transaction")
+                        return true
+                    }
+                }
+                XCTAssertNil(result)
+                let wall = ProcessInfo.processInfo.systemUptime - start
+                XCTAssertLessThan(wall, 1)
+                print("PRUNE-BEGIN wall_ms=\(wall * 1000)")
+                return .rollback
+            }
+        }
+        XCTAssertEqual(try router.dbQueue.read { try Int.fetchOne($0, sql: "PRAGMA busy_timeout") }, 5_000)
+    }
+
+    /// Live-store shape of 21 Nov 2026. Compare both 500-row passes on the
+    /// same shape, with the reference result selected before either writes.
     func testCommandResultPruneAtLiveStorageJobCount() throws {
-        try oldCommandFixture(commands: 2_000, jobs: 23_637)
-        let started = Date()
-        let counts = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0, stepBudget: 60) }
-        let linear = Date().timeIntervalSince(started)
+        try oldCommandFixture(commands: 63_261, jobs: 23_637)
+        func cpuSeconds() -> Double {
+            var usage = rusage()
+            getrusage(RUSAGE_SELF, &usage)
+            return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+                Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        }
+        func measured(_ name: String, from started: Date, cpu: Double) {
+            var load = [Double](repeating: 0, count: 3)
+            _ = getloadavg(&load, 3)
+            print("PRUNE-TIMING \(name) utc=\(ISO8601DateFormatter().string(from: started)) load=\(load) wall_s=\(Date().timeIntervalSince(started)) cpu_s=\(cpuSeconds() - cpu)")
+        }
+        let oldStarted = Date(), oldCPU = cpuSeconds()
+        let baseline = try router.dbQueue.read {
+            try Int64.fetchAll($0, sql: Self.correlatedCommandResultsSQL + " LIMIT 500", arguments: [Int64.max, CommandRouter.prunedResult])
+        }
+        measured("correlated_control_500", from: oldStarted, cpu: oldCPU)
+        XCTAssertEqual(baseline.count, 500)
+        let started = Date(), cpu = cpuSeconds()
+        let counts = try router.pruneRoutineRecords(stepBudget: 60)
+        measured("current_pass_500", from: started, cpu: cpu)
         XCTAssertEqual(counts.commandResults, CommandRouter.pruneBatch)
-        let oldStarted = Date()
-        let five = try router.dbQueue.read { try Int64.fetchAll($0, sql: Self.correlatedCommandResultsSQL + " LIMIT 5", arguments: [Int64.max, CommandRouter.prunedResult]) }
-        let correlatedFive = Date().timeIntervalSince(oldStarted)
-        XCTAssertEqual(five.count, 5)
-        print("PRUNE-TIMING linear_pass_500=\(String(format: "%.3f", linear))s correlated_5=\(String(format: "%.3f", correlatedFive))s correlated_500_estimate=\(String(format: "%.1f", correlatedFive * 100))s")
+        XCTAssertEqual(try router.dbQueue.read {
+            try Int64.fetchAll($0, sql: "SELECT rowid FROM commands WHERE result=? ORDER BY rowid", arguments: [CommandRouter.prunedResult])
+        }, baseline)
     }
 }

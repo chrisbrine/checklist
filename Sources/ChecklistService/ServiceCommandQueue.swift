@@ -1,15 +1,22 @@
 import Foundation
 import Dispatch
+import Darwin
+import ChecklistCore
+import ChecklistIPC
 
 /// Every entry to the coordinator queue records its actual occupied interval.
 /// File IO runs on a separate lane, so diagnostics cannot extend that interval.
 final class ServiceCommandQueue: @unchecked Sendable {
     let dispatchQueue = DispatchQueue(label: "org.checklist.commands", autoreleaseFrequency: .workItem)
     let busyPeriods: CommandQueueBusyPeriods
+    private let watchdog: ServiceHoldWatchdog?
     private var activities: [String: Double] = [:]
     var didCompletePeriod: ((String, Double, [String: Double]) -> Void)?
 
-    init(logURL: URL) { busyPeriods = CommandQueueBusyPeriods(url: logURL) }
+    init(logURL: URL, serviceBusyPeriods: CommandQueueBusyPeriods? = nil) {
+        busyPeriods = serviceBusyPeriods ?? CommandQueueBusyPeriods(url: logURL)
+        watchdog = serviceBusyPeriods == nil ? nil : .shared
+    }
 
     func async(source: String = #fileID, line: Int = #line, function: String = #function,
                execute work: @escaping @Sendable () -> Void) {
@@ -38,10 +45,13 @@ final class ServiceCommandQueue: @unchecked Sendable {
     func perform<T>(work: String, _ body: () throws -> T) rethrows -> T {
         dispatchPrecondition(condition: .onQueue(dispatchQueue))
         let start = ProcessInfo.processInfo.systemUptime, date = Date()
+        let hold = watchdog?.begin(resource: "command_queue", work: work)
         activities = [:]
         defer {
             let duration = ProcessInfo.processInfo.systemUptime - start
-            if duration > 1 {
+            if let watchdog {
+                watchdog.end(hold, activities: activities)
+            } else if duration > 1 {
                 busyPeriods.record(startedAt: date, durationMS: duration * 1000, work: work, activities: activities)
             }
             didCompletePeriod?(work, duration * 1000, activities)
@@ -66,6 +76,8 @@ final class CommandQueueBusyPeriods: @unchecked Sendable {
         let duration_ms: Double
         let work: String
         let activities_ms: [String: Double]
+        let resource: String?
+        let active: Bool?
     }
     let url: URL
     private let lane = DispatchQueue(label: "org.checklist.command-queue-diagnostics", qos: .utility, autoreleaseFrequency: .workItem)
@@ -85,12 +97,32 @@ final class CommandQueueBusyPeriods: @unchecked Sendable {
         }
     }
 
-    func record(startedAt: Date, durationMS: Double, work: String, activities: [String: Double]) {
+    func record(_ hold: ServiceHoldWatchdog.Hold) {
+        record(startedAt: hold.startedAt, durationMS: hold.durationMS, work: hold.work,
+               activities: hold.activities, resource: hold.resource, active: hold.active)
+    }
+
+    func recordMaximum(_ hold: ServiceHoldWatchdog.Hold) {
+        lane.async {
+            var averages = [Double](repeating: 0, count: 3)
+            let sampleCount = getloadavg(&averages, 3)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            CallTimingLog.write([
+                "scope": "service_hold_maximum", "resource": hold.resource, "work": hold.work,
+                "duration_ms": hold.durationMS, "started_at": formatter.string(from: hold.startedAt),
+                "observed_at": formatter.string(from: Date()), "loadavg": Array(averages.prefix(max(0, Int(sampleCount))))
+            ])
+        }
+    }
+
+    func record(startedAt: Date, durationMS: Double, work: String, activities: [String: Double],
+                resource: String? = nil, active: Bool? = nil) {
         lane.async { [self] in
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             periods.append(Period(started_at: formatter.string(from: startedAt), duration_ms: durationMS,
-                                  work: work, activities_ms: activities))
+                                  work: work, activities_ms: activities, resource: resource, active: active))
             periods = Array(periods.suffix(64))
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,

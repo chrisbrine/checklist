@@ -206,7 +206,7 @@ extension CommandRouter {
             let checkpoint = try recordDirectionCheckpoint(
                 db, params: p, attempt: a, progress: progress, caller: c)
             a["checkpoint_id"] = checkpoint["id"]
-            a["context"] = try compactTaskContext(db, task: t, caller: c)
+            a["context"] = try withTaskRecordSelection(db,tasks:[t]) {try compactTaskContext(db,task:t,caller:c)}
             a["direction_cursor"] = (a["context"] as? JSON)?["direction_cursor"]
             a.removeValue(forKey: "token_hash")
             return a

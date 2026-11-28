@@ -132,6 +132,40 @@ extension TicketRetirementTests {
         XCTAssertFalse(try read(project,trashed)["purged"] as? Bool ?? false)
     }
 
+    func testPurgeScrubsLateReceiptAboveFormerCommandCorpusLimit() throws {
+        let (project,task) = try fixture()
+        let trashed = try trash(project,task)
+        let preview = try call("task_purge_preview",params(project,trashed))
+        let principal = "cl514-command-corpus",late = uuid(),taskID = try XCTUnwrap(task["id"] as? String)
+        let unrelated = #"{"data":{"text":"Other ticket"}} "#
+        try router.dbQueue.write {db in
+            try db.execute(sql:"""
+                WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100001)
+                INSERT INTO commands(principal,command_id,digest,result)
+                SELECT ?,printf('unrelated-%06d',i),'fixture',? FROM n
+                """,arguments:[principal,unrelated])
+            try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES(?,?,'late-digest',json_object('task_id',?,'body','Private result'))",
+                arguments:[principal,late,taskID])
+        }
+        var input = params(project,trashed)
+        input["preview_digest"] = preview["digest"]
+        input["command_id"] = uuid()
+        var writerSeconds: TimeInterval?
+        let start = ProcessInfo.processInfo.systemUptime
+        let result = try router.handle(method:"task_purge",params:input,caller:owner,observeOperationWriterWait:nil,observeStoragePhase:{phase,seconds in
+            if phase == "domain_transaction_ms" {writerSeconds = seconds}
+        })
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        print("CL514_PURGE unrelated_commands=100001 elapsed_seconds=\(elapsed) writer_transaction_seconds=\(try XCTUnwrap(writerSeconds))")
+        XCTAssertEqual(((result["data"] as? JSON)?["task"] as? JSON)?["purged"] as? Bool,true)
+        try router.dbQueue.read {db in
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE principal=? AND result=?",arguments:[principal,unrelated]),100001)
+            let scrubbed = try XCTUnwrap(try Row.fetchOne(db,sql:"SELECT result,digest FROM commands WHERE principal=? AND command_id=?",arguments:[principal,late]))
+            XCTAssertTrue(CommandRouter.isPrunedResult(jsonObject(scrubbed["result"] as String)))
+            XCTAssertEqual(scrubbed["digest"] as String,"late-digest")
+        }
+    }
+
     func testPurgeRollbackRestoresNotesEventsAndCachedReceipts() throws {
         let (p,t) = try fixture(),tid = t["id"] as! String
         _ = try note(p,t,["body":"Must survive rollback"])

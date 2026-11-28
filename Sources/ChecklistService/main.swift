@@ -86,7 +86,17 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     // Bound request envelopes, reply serialization and afterCommand bridge
     // temporaries even when the service thread's outer pool is long-lived.
     let queue: ServiceCommandQueue
-    var enrollments: [String: Enrollment] = [:]
+    var enrollments: [String: Enrollment] = [:] {
+        didSet { publishReadEnrollments() }
+    }
+    private let readEnrollmentLock = NSLock()
+    private var readEnrollments: [String: Enrollment] = [:]
+    private var stagedReadEnrollments: [String: Enrollment] = [:]
+    private var stagedEnrollmentKeys = Set<String>()
+    let requestReadQueue = DispatchQueue(label:"org.checklist.request-reads",qos:.userInitiated,attributes:.concurrent,autoreleaseFrequency:.workItem)
+    let changeSubscriptions = ServiceChangeSubscriptions()
+    private let nativeReadWakeLock = NSLock()
+    private var nativeReadWakeQueued = false
     var waiters: [UUID: () -> Void] = [:]
     var backupDeferredCalls: [UUID: () -> Void] = [:]
     var nativeListener: NativeReplyListener?
@@ -95,17 +105,22 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var storageWake: DispatchWorkItem?
     var storageWakePlan = StorageMaintenanceWakePlan()
     let storageQueue = DispatchQueue(label:"org.checklist.storage-maintenance",qos:.utility)
+    let routinePruneQueue = DispatchQueue(label:"org.checklist.record-prune",qos:.utility,autoreleaseFrequency:.workItem)
+    private var routinePruneBatch = 500 // Confined to routinePruneQueue.
     let workHealthQueue = DispatchQueue(label:"org.checklist.work-health",qos:.utility,autoreleaseFrequency:.workItem)
     let commandOperationQueue = DispatchQueue(label:"org.checklist.command-operations",qos:.userInitiated,attributes:.concurrent)
     // These requests can wait for a storage writer before replying. Keep each
     // admission order while leaving the coordinator free to authenticate reads.
     let ticketCaptureQueue = DispatchQueue(label:"org.checklist.ticket-capture",qos:.userInitiated)
     let epicCreationQueue = DispatchQueue(label:"org.checklist.epic-creation",qos:.userInitiated)
+    let workAuthorityOperationAdmissionQueue = DispatchQueue(label:"org.checklist.work-authority-admission",qos:.userInitiated)
+    let mediaRoundLinkQueue = DispatchQueue(label:"org.checklist.media-round-link",qos:.userInitiated)
     let mediaRoundDeletionAdmissionQueue = DispatchQueue(label:"org.checklist.media-round-deletion-admission",qos:.userInitiated)
     let mediaRoundDeletionQueue = DispatchQueue(label:"org.checklist.media-round-deletions",qos:.utility,attributes:.concurrent,autoreleaseFrequency:.workItem)
     var storageRunning = false
     var storageWakePlanning = false
     var storageWakeReplan = false
+    private var storageWakeNeedsHeldRecheck = false
     var attemptedDeliveries = Set<String>()
     lazy var codexRoute = CodexQueueRouteState(markerFile:enrollmentFile.deletingLastPathComponent().appendingPathComponent("codex-queue-route.json"),effects:enforcesQueueIsolation && nativeRelayPolicy.enabled ? .live : .unavailable)
     var nativeInFlight: [String: NativeInFlight] = [:]
@@ -113,7 +128,12 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     var workHealthFailures = 0
     var workHealthRunning = false
     var workHealthRecheck = false
-    var timingDiagnosticsEnabled = CallTimingLog.enabled
+    private let timingDiagnosticsLock = NSLock()
+    private var timingDiagnostics = CallTimingLog.enabled
+    var timingDiagnosticsEnabled: Bool {
+        get {timingDiagnosticsLock.withLock {timingDiagnostics}}
+        set {timingDiagnosticsLock.withLock {timingDiagnostics = newValue}}
+    }
     let enrollmentFile: URL
     let expectedOwnerPath: String
     let expectedOwnerHash: Data?
@@ -122,9 +142,10 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     /// A coordinator keeps credentials beside its enrollments. A temporary test root therefore
     /// reaches neither the live credential folder nor Keychain.
     let credentials: InstallationCredentialStore
-    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true, credentials: InstallationCredentialStore? = nil, instance: ChecklistInstance = .current, environment: [String:String] = ProcessInfo.processInfo.environment) {
+    init(router: CommandRouter, enrollmentFile: URL = ChecklistPaths.root.appendingPathComponent("connections.json"), startBackgroundWork: Bool = true, credentials: InstallationCredentialStore? = nil, instance: ChecklistInstance = .current, environment: [String:String] = ProcessInfo.processInfo.environment, serviceBusyPeriods: CommandQueueBusyPeriods? = nil) {
         self.router = router
-        self.queue = ServiceCommandQueue(logURL: startBackgroundWork ? CommandQueueBusyPeriods.logURL(slot: instance.slot) : enrollmentFile.deletingLastPathComponent().appendingPathComponent("command-queue-busy.json"))
+        let logURL = startBackgroundWork ? CommandQueueBusyPeriods.logURL(slot: instance.slot) : enrollmentFile.deletingLastPathComponent().appendingPathComponent("command-queue-busy.json")
+        self.queue = ServiceCommandQueue(logURL: logURL, serviceBusyPeriods: serviceBusyPeriods)
         self.nativeRelayPolicy = SlotNativeRelayPolicy(instance:instance,storeRoot:enrollmentFile.deletingLastPathComponent(),incarnation:router.storeIncarnation,environment:environment)
         self.credentials = credentials ?? .production(root: enrollmentFile.deletingLastPathComponent())
         self.enforcesQueueIsolation = startBackgroundWork
@@ -146,7 +167,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             self.queue.async { [self] in
                 changed()
                 if enforcesQueueIsolation {
-                    dispatchNative();armStorageWake()
+                    dispatchNative();armStorageWake(recheckHeld:true)
                     if workHealthWake == nil && workHealthFailures < 2 {runWorkHealth()}
                 }
             }
@@ -161,15 +182,41 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                     for resume in deferred {resume()}
                 }
                 if enforcesQueueIsolation,self.router.writeAdmissionStatus["locked"] as? Bool != true {
-                    observeNativeConversationLifecycles();dispatchNative();armStorageWake()
+                    observeNativeConversationLifecycles();dispatchNative();armStorageWake(recheckHeld:true)
                     if workHealthWake == nil && workHealthFailures < 2 {runWorkHealth()}
                 }
             }
         }
         if let data = try? Data(contentsOf: enrollmentFile), let records = try? JSONDecoder().decode([String: Enrollment].self, from: data) { enrollments = records }
+        // Stored enrollments are available to the read lane before accepting a peer.
+        publishReadEnrollments()
         listener.delegate = self
         if startBackgroundWork {
-            queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake();self?.runWorkHealth() }
+            queue.async { [weak self] in self?.observeNativeConversationLifecycles();self?.armStorageWake(recheckHeld:true);self?.runWorkHealth() }
+            scheduleRoutinePrune(after: 0.05)
+        }
+    }
+
+    private func scheduleRoutinePrune(after delay: TimeInterval) {
+        routinePruneQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let started = ProcessInfo.processInfo.systemUptime
+            let startDate = Date()
+            do {
+                let turn = try router.runRoutinePruneTurn(batchLimit: &routinePruneBatch)
+                if CallTimingLog.enabled || turn.counts.values.contains(where: { $0 > 0 }) {
+                    var load = [Double](repeating: 0, count: 3)
+                    let observed = getloadavg(&load, 3)
+                    CallTimingLog.write(["scope": "routine_prune", "counts": turn.counts,
+                                         "started_at": ISO8601DateFormatter().string(from: startDate),
+                                         "loadavg": Array(load.prefix(max(0, Int(observed)))),
+                                         "start_uptime_s": started, "duration_ms": (ProcessInfo.processInfo.systemUptime - started) * 1000])
+                }
+                scheduleRoutinePrune(after: turn.nextDelay)
+            } catch {
+                fputs("Routine record pruning deferred; retained records were preserved.\n", stderr)
+                scheduleRoutinePrune(after: 60)
+            }
         }
     }
     /// Production mutable state belongs to queue. Synchronous fixtures disable
@@ -183,7 +230,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     /// Storage can hold a page for seconds, so it never owns request admission.
     private enum WorkHealthOutcome: Sendable {
         case deferred
-        case completed(enabled: Bool,changed: Int,hasMore: Bool)
+        case completed(enabled: Bool,changed: Int,hasMore: Bool,yielded: Bool)
         case failed(String)
     }
     func runWorkHealth(check: (@Sendable () throws -> [String:Any])? = nil) {
@@ -197,8 +244,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             let started = ProcessInfo.processInfo.systemUptime
             let outcome: WorkHealthOutcome
             do {
-                if let result = try router.withImmediateWriteAccess({if let check {return try check()};return try router.runWorkHealthChecks()}) {
-                    outcome = .completed(enabled:result["enabled"] as? Bool == true,changed:result["changed"] as? Int ?? 0,hasMore:result["has_more"] as? Bool == true)
+                let result: [String: Any]?
+                if let check { result = try router.withImmediateWriteAccess(check) }
+                else { result = try router.runWorkHealthChecks() }
+                if let result {
+                    outcome = .completed(enabled:result["enabled"] as? Bool == true,changed:result["changed"] as? Int ?? 0,hasMore:result["has_more"] as? Bool == true,yielded:result["deferred"] as? Bool == true)
                 } else {outcome = .deferred}
             } catch {outcome = .failed(error.localizedDescription)}
             if recordTiming {CallTimingLog.write(["scope":"work_health_maintenance","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
@@ -220,11 +270,11 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             // Its existing unlock observer resumes us. Preserve an unlock that
             // arrived while this worker was still returning its deferred result.
             if recheck,router.writeAdmissionStatus["locked"] as? Bool != true,workHealthFailures < 2 {schedule(after:0.1)}
-        case .completed(let enabled,let changedCount,let hasMore):
+        case .completed(let enabled,let changedCount,let hasMore,let yielded):
             workHealthFailures = 0
             if changedCount > 0 {changed()}
             guard !workHealthRunning else {return}
-            if enabled {schedule(after:hasMore ? 0.1 : 30)}
+            if enabled || yielded {schedule(after:hasMore && !yielded ? 0.1 : 30)}
             else if recheck,router.writeAdmissionStatus["locked"] as? Bool != true {schedule(after:0.1)}
         case .failed(let message):
             workHealthFailures += 1
@@ -236,11 +286,15 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
 
     /// One-shot durable cleanup deadline. Held work waits for a relevant
     /// command or an actual lease deadline; this is not a model/pickup loop.
-    func armStorageWake(loadDeadline: (@Sendable () throws -> Date?)? = nil, diagnostics: Bool = false) {
+    func armStorageWake(loadDeadline: (@Sendable () throws -> Date?)? = nil, diagnostics: Bool = false,
+                        recheckHeld: Bool = false) {
         requireCommandQueue()
+        storageWakeNeedsHeldRecheck = storageWakeNeedsHeldRecheck || recheckHeld
         guard !storageRunning else {return}
         if storageWakePlanning {storageWakeReplan = true;return}
         storageWakePlanning = true
+        let held = storageWakeNeedsHeldRecheck
+        storageWakeNeedsHeldRecheck = false
         let recordTiming = diagnostics || timingDiagnosticsEnabled
         // Deadline discovery parses retained job metadata. It is a pure read,
         // not request admission work. One in-flight read and one dirty bit bound
@@ -250,7 +304,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             let next: Date?
             do {
                 if let loadDeadline {next = try loadDeadline()}
-                else {next = try router.nextArchiveCleanupDeadline()}
+                else {next = try router.nextArchiveCleanupDeadline(recheckHeld:held)}
             } catch {next = Date().addingTimeInterval(60)}
             if recordTiming {CallTimingLog.write(["scope":"storage_wake_plan","start_uptime_s":started,"duration_ms":(ProcessInfo.processInfo.systemUptime-started)*1000])}
             queue.async { [self] in
@@ -258,7 +312,10 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
                 let replan = storageWakeReplan;storageWakeReplan = false
                 // A previously armed timer may have fired during discovery.
                 // That maintenance turn owns the next fresh scheduling read.
-                guard !storageRunning else {return}
+                guard !storageRunning else {
+                    storageWakeNeedsHeldRecheck = storageWakeNeedsHeldRecheck || held
+                    return
+                }
                 installStorageWake(next)
                 if replan {armStorageWake(loadDeadline:loadDeadline,diagnostics:diagnostics)}
             }
@@ -297,13 +354,43 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         try data.write(to: enrollmentFile, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: enrollmentFile.path)
     }
-    func owner(_ connection: NSXPCConnection) -> Bool {
+    func beginStagingEnrollment(_ installation: String) {
+        requireCommandQueue()
+        precondition(stagedEnrollmentKeys.insert(installation).inserted)
+    }
+    func finishStagingEnrollment(_ installation: String) {
+        requireCommandQueue()
+        precondition(stagedEnrollmentKeys.remove(installation) != nil)
+        publishReadEnrollments()
+    }
+    private func publishReadEnrollments() {
+        var next = enrollments
+        var staged: [String: Enrollment] = [:]
+        // A staged replacement must keep the previous enrollment usable.
+        // An independently committed revocation still fences it in Core.
+        if !stagedEnrollmentKeys.isEmpty {
+            let prior = enrollmentSnapshot().committed
+            for key in stagedEnrollmentKeys {
+                staged[key] = next[key]
+                next[key] = prior[key]
+            }
+        }
+        readEnrollmentLock.withLock {
+            readEnrollments = next
+            stagedReadEnrollments = staged
+        }
+    }
+    func enrollmentSnapshot() -> (committed: [String:Enrollment], staged: [String:Enrollment]) {
+        readEnrollmentLock.withLock {(readEnrollments, stagedReadEnrollments)}
+    }
+    func owner(_ connection: NSXPCConnection) -> Bool { owner(peerPID:connection.processIdentifier) }
+    func owner(peerPID: pid_t) -> Bool {
         var buffer = [CChar](repeating: 0, count: 4096)
-        guard proc_pidpath(connection.processIdentifier, &buffer, UInt32(buffer.count)) > 0 else { return false }
+        guard proc_pidpath(peerPID, &buffer, UInt32(buffer.count)) > 0 else { return false }
         let path = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         guard URL(fileURLWithPath:path).resolvingSymlinksInPath().path == expectedOwnerPath, path.hasSuffix(ChecklistInstance.current.ownerPathSuffix) else { return false }
         var guest: SecCode?
-        let attrs = [kSecGuestAttributePid as String: NSNumber(value: connection.processIdentifier)] as CFDictionary
+        let attrs = [kSecGuestAttributePid as String: NSNumber(value:peerPID)] as CFDictionary
         guard SecCodeCopyGuestWithAttributes(nil, attrs, [], &guest) == errSecSuccess, let guest else { return false }
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(ChecklistInstance.current.ownerRequirement as CFString, [], &requirement) == errSecSuccess else { return false }
@@ -318,12 +405,17 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
     func caller(_ request: [String: Any], connection: NSXPCConnection, timing: ServiceCallTiming? = nil,
                 observeSessionGeneration: ((String) -> Void)? = nil) throws -> Caller {
         requireCommandQueue()
+        let installation = request["installation"] as? String ?? "default"
+        return try verifiedCaller(request,peerPID:connection.processIdentifier,installation:installation,
+            enrollment:enrollments[installation],timing:timing,observeSessionGeneration:observeSessionGeneration)
+    }
+    func verifiedCaller(_ request: [String: Any], peerPID: pid_t, installation: String, enrollment: Enrollment?,
+                        timing: ServiceCallTiming?, readsOnly: Bool = false, observeSessionGeneration: ((String) -> Void)?) throws -> Caller {
         if request["owner_channel"] as? Bool == true {
-            guard owner(connection) else { throw ChecklistError("OWNER_CHANNEL_REQUIRED", "Only the signed native Checklist app can author human actions.") }
+            guard owner(peerPID:peerPID) else { throw ChecklistError("OWNER_CHANNEL_REQUIRED", "Only the signed native Checklist app can author human actions.") }
             return Caller(role: "owner", installation: "native-app", projectIDs: [], sessionID: nil, workspace: nil)
         }
-        let installation = request["installation"] as? String ?? "default"
-        guard let enrollment = enrollments[installation], let credential = request["credential"] as? String,
+        guard let enrollment, let credential = request["credential"] as? String,
               constantEqual(SHA256.hash(data: Data(credential.utf8)).map { String(format:"%02x", $0) }.joined(), enrollment.tokenDigest) else {
             if request["method"] as? String == "service_info" {
                 return Caller(role: "worker", installation: installation, projectIDs: [], sessionID: nil, workspace: nil)
@@ -335,7 +427,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             throw ChecklistError("ADAPTER_UNAVAILABLE", "This provider plugin is disabled, incompatible or unqualified. Existing grants and pending messages are retained for recovery.")
         }
         var callerWorkspace=enrollment.workspace
-        if enrollment.automatic == true { callerWorkspace = try ServiceCallTiming.measure(timing,"route_native_identity_ms") { try verifyAutomatic(enrollment, request:request, connection:connection) } }
+        if enrollment.automatic == true { callerWorkspace = try ServiceCallTiming.measure(timing,"route_native_identity_ms") { try verifyAutomatic(enrollment,request:request,peerPID:peerPID,readsOnly:readsOnly) } }
         else if let bound = enrollment.workspace {
             guard let supplied = request["workspace"] as? String,
                   URL(fileURLWithPath: supplied).resolvingSymlinksInPath().standardizedFileURL.path == bound else {
@@ -344,7 +436,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         }
         guard let pid = enrollment.projectIDs.first else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This connection has no registered project.") }
         let generation = try requireCommittedRegistration(enrollment, project: pid,
-            caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []), timing:timing)
+            caller: Caller(role: "owner", installation: "connection-consistency", projectIDs: []), timing:timing,readsOnly:readsOnly)
         observeSessionGeneration?(generation)
         return Caller(role: enrollment.role, installation: enrollment.installation + "/" + enrollment.generation, projectIDs: enrollment.projectIDs, sessionID: enrollment.sessionID, workspace: enrollment.assistantRelay == true ? nil:callerWorkspace, assistantGrants:enrollment.assistantGrants ?? [:],executionDomain:enrollment.nativeExecutionDomain)
     }
@@ -412,10 +504,7 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
         var sessionGeneration: String?
         let caller = try caller(request, connection: connection, timing:timing, observeSessionGeneration:{sessionGeneration = $0})
         if method == "connection_list" {
-            guard caller.role == "owner" else { throw ChecklistError("FORBIDDEN", "Connection setup is owner-only.") }
-            return .done(["data": ["connections": enrollments.values.sorted { $0.name < $1.name }.map { e -> [String:Any] in
-                ["installation":e.installation,"name":e.name,"provider":e.provider,"role":e.role,"project_ids":e.projectIDs,"session_id":e.sessionID,"workspace":e.workspace ?? "","profile_id":e.profileID ?? "","generation":e.generation,"native_endpoint":e.nativeEndpoint ?? "","native_push":e.nativeEndpoint != nil && e.revoked != true && ProviderPluginRegistry.bundled.plugin(e.provider, requiring: .nativePeer) != nil,"assistant_grants":e.assistantGrants ?? [:],"automatic":e.automatic ?? false,"revoked":e.revoked ?? false,"identity_verification":e.identityVerification ?? "owner_enrolled"]
-            }]])
+            return .done(try connectionList(caller))
         }
         if method == "task_handoff_prepare" { return .done(try prepareHandoff(params, caller:caller)) }
         if method == "connection_pair" {
@@ -431,6 +520,8 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             if role == "worker", workspace == nil { throw ChecklistError("WORKSPACE_REQUIRED", "Workers need an explicit actual workspace.") }
             let originalIntent = params
             var priorEnrollment: Enrollment?, priorCredential: String?, snapshotTaken = false
+            beginStagingEnrollment(installation)
+            defer {finishStagingEnrollment(installation)}
             return .done(try router.commitConnectionRegistration(intent: originalIntent, caller: caller, preparePersistence: { operation in
                 priorEnrollment = enrollments[installation]
                 priorCredential = try credentials.read(installation)
@@ -496,10 +587,27 @@ final class Coordinator: NSObject, NSXPCListenerDelegate, @unchecked Sendable {
             try saveEnrollments(); credentials.remove(installation)
             return .done(["data":["disconnected":true], "command_id":commandID])
         }
-        let expectedGeneration = ["task_create","epic_create","media_round_delete"].contains(method) ? sessionGeneration : nil
+        let expectedGeneration = ["task_create","epic_create","media_round_link_task","media_round_delete"].contains(method) ? sessionGeneration : nil
         return .router(method:method,params:params,caller:caller,expectedGeneration:expectedGeneration)
     }
-    func changed() { requireCommandQueue(); for callback in Array(waiters.values) { callback() } }
+    func changed() {
+        requireCommandQueue()
+        changeSubscriptions.changed()
+        for callback in Array(waiters.values) { callback() }
+    }
+    func observeNativeAfterRead() {
+        guard enforcesQueueIsolation else {return}
+        let shouldWake = nativeReadWakeLock.withLock {
+            guard !nativeReadWakeQueued else {return false}
+            nativeReadWakeQueued = true
+            return true
+        }
+        guard shouldWake else {return}
+        queue.async { [self] in
+            observeNativeConversationLifecycles()
+            nativeReadWakeLock.withLock {nativeReadWakeQueued = false}
+        }
+    }
     /// A worker can report deferral after the unlock notification was delivered.
     /// Register or resume using current admission in this same queue turn.
     func afterBackupWriteAdmission(_ resume: @escaping @Sendable () -> Void) {
@@ -754,15 +862,15 @@ private final class ServiceReply: @unchecked Sendable {
     }
 }
 
-// Invariant: this retains an XPC connection across a deferred wait but only exposes it on the coordinator's serial queue.
-private final class DeferredConnection: @unchecked Sendable {
-    private let connection: NSXPCConnection
-    private let queue: DispatchQueue
-    init(_ connection: NSXPCConnection, queue: DispatchQueue) { self.connection = connection; self.queue = queue }
-    func valueOnQueue() -> NSXPCConnection { dispatchPrecondition(condition:.onQueue(queue)); return connection }
+/// The decoded Foundation envelope is immutable. The request lanes do not
+/// share the connection itself; independent verification uses its peer PID.
+private struct IndependentRequest: @unchecked Sendable {
+    let object: [String: Any]
+    let method: String
+    let peerPID: pid_t
 }
 
-// Invariant: connection is initialized before publication and its weak storage is read only on coordinator.queue; all other Peer state is immutable.
+// Invariant: connection is initialized before publication and never assigned afterward.
 final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     let coordinator: Coordinator
     private weak var connection: NSXPCConnection?
@@ -777,18 +885,74 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
         // Drain caller-thread JSON/serialization and hook temporaries for each
         // request, including off-queue reads and deferred change replies.
         let received = ProcessInfo.processInfo.systemUptime
-        coordinator.queue.async { [self] in
-            let isBootstrap = autoreleasepool {
-                ((try? JSONSerialization.jsonObject(with: request)) as? [String: Any])?["method"] as? String == "connection_bootstrap"
+        let read = autoreleasepool { () -> IndependentRequest? in
+            guard let connection, let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any],
+                  let method = object["method"] as? String,
+                  CommandReply.readMethods.contains(method) || method == "connection_bootstrap" else {return nil}
+            return IndependentRequest(object:object,method:method,peerPID:connection.processIdentifier)
+        }
+        if let read {
+            coordinator.requestReadQueue.async { [self] in
+                executeRead(read,rawRequest:request,received:received,reply:reply)
             }
-            // Reuse only fully checked committed authority on this turn. Any
-            // branch needing a write rejoins the existing native FIFO below.
-            executeOnQueue(request, received: received, reply: reply, currentConnectionOnly: isBootstrap)
+        } else {
+            coordinator.queue.async { [self] in executeOnQueue(request,received:received,reply:reply) }
         }
     }
 
-    private func executeOnQueue(_ request: Data, received: TimeInterval, reply: @escaping @Sendable (Data) -> Void,
-                                currentConnectionOnly: Bool = false) {
+    private func executeRead(_ request: IndependentRequest,rawRequest: Data,received: TimeInterval,
+                             reply: @escaping @Sendable (Data) -> Void) {
+        let timing = request.object["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received,admission:admission) : nil
+        timing?.queued(since:received,phase:"worker_queue_wait_ms")
+        if let timing {
+            coordinator.timingDiagnosticsEnabled = true
+            CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":request.method,
+                "received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime])
+        }
+        if request.method == "changes_wait" {
+            let initialAdmission = coordinator.router.writeAdmissionStatus
+            let generation = initialAdmission["generation"] as? String
+            let revision = initialAdmission["revision"] as? UInt64
+            coordinator.changeSubscriptions.add(on:coordinator.requestReadQueue) { [self] expired in
+                do {
+                    let result = try coordinator.readRequest(request.object,method:request.method,peerPID:request.peerPID,timing:timing)
+                    let payload = result["data"] as? [String:Any] ?? result
+                    let current = coordinator.router.writeAdmissionStatus
+                    guard expired || payload["changed"] as? Bool == true
+                        || (current["generation"] as? String) != generation || (current["revision"] as? UInt64) != revision else {return false}
+                    reply(Self.responseBytes(result,timing:timing))
+                    coordinator.observeNativeAfterRead()
+                } catch {reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing))}
+                return true
+            }
+            return
+        }
+        var result: [String:Any]
+        do {
+            result = try coordinator.readRequest(request.object,method:request.method,peerPID:request.peerPID,timing:timing)
+        } catch is NativeBootstrapRequiresWrite {
+            coordinator.queue.async { [self] in
+                coordinator.enqueueNativeConnectionRequest { [self] in
+                    executeOnQueue(rawRequest,received:received,reply:reply)
+                }
+            }
+            return
+        } catch {result = ["error":Self.publicError(error)]}
+        if result["write_admission"] == nil {result["write_admission"] = coordinator.router.writeAdmissionStatus}
+        reply(Self.responseBytes(result,timing:timing))
+        if result["error"] == nil, request.method != "connection_bootstrap",
+           request.object["credential"] != nil || request.object["owner_channel"] as? Bool == true {
+            coordinator.observeNativeAfterRead()
+        }
+        if Self.writerDependentReads.contains(request.method), result["command_outcome"] as? String != "accepted" {
+            let succeeded = result["error"] == nil && result["command_outcome"] as? String != "queued"
+            coordinator.queue.async { [self] in
+                afterCommand(succeeded:succeeded,timed:timing,method:request.method)
+            }
+        }
+    }
+
+    private func executeOnQueue(_ request: Data, received: TimeInterval, reply: @escaping @Sendable (Data) -> Void) {
         coordinator.requireCommandQueue()
         let dequeued = ProcessInfo.processInfo.systemUptime
         autoreleasepool {
@@ -804,55 +968,14 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received, admission:admission) : nil
             timing?.queued(since: received, until: dequeued)
             if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }
-            if let object, object["method"] as? String == "changes_wait", let connection {
-                let id = UUID()
-                let admission = coordinator.router.writeAdmissionStatus
-                let heldConnection = DeferredConnection(connection,queue:coordinator.queue.dispatchQueue)
-                let finish: () -> Void = { [self] in autoreleasepool {
-                    do {
-                        let result = try coordinator.execute(object,connection:connection,timing:timing)
-                        let payload = result["data"] as? [String:Any] ?? result
-                        let current = coordinator.router.writeAdmissionStatus
-                        let admissionChanged = current["generation"] as? String != admission["generation"] as? String || current["revision"] as? UInt64 != admission["revision"] as? UInt64
-                        if payload["changed"] as? Bool == true || admissionChanged {
-                            coordinator.waiters.removeValue(forKey:id)
-                            reply(Self.responseBytes(result,timing:timing))
-                        }
-                    } catch {
-                        coordinator.waiters.removeValue(forKey:id)
-                        reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing))
-                    }
-                }}
-                coordinator.waiters[id] = finish
-                finish()
-                coordinator.queue.asyncAfter(deadline:.now()+8) { [self] in autoreleasepool {
-                    guard coordinator.waiters.removeValue(forKey:id) != nil else { return }
-                    do {
-                        guard let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any] else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
-                        let result=try coordinator.execute(object,connection:heldConnection.valueOnQueue(),timing:timing);reply(Self.responseBytes(result,timing:timing))
-                    }
-                    catch { reply(Self.responseBytes(["error":Self.publicError(error)],timing:timing)) }
-                }}
-                return
-            }
             let routed: Coordinator.Routed
             do {
                 guard let connection, let object else { throw ChecklistError("INVALID_INPUT","Invalid command envelope.") }
-                let result: Coordinator.Routed? = try ServiceCallTiming.measure(timing, "bootstrap_verification_ms") {
-                    let attempt = { [self] in
-                        try coordinator.withDeferredNativeResumption {
-                            try coordinator.route(object, connection: connection, timing: timing, currentConnectionOnly: currentConnectionOnly)
-                        }
+                routed = try ServiceCallTiming.measure(timing, "bootstrap_verification_ms") {
+                    try coordinator.withDeferredNativeResumption {
+                        try coordinator.route(object,connection:connection,timing:timing)
                     }
-                    if currentConnectionOnly {
-                        return try coordinator.attemptCurrentNativeBootstrap(attempt, retry: { [self] in
-                            executeOnQueue(request, received: received, reply: reply)
-                        })
-                    }
-                    return try attempt()
                 }
-                guard let result else { return }
-                routed = result
             } catch let continuation as NativeBootstrapContinuation {
                 let started = ProcessInfo.processInfo.systemUptime
                 coordinator.startNativeBootstrapContinuation(continuation) { [self] outcome in
@@ -878,6 +1001,8 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                 switch method {
                 case "task_create": worker = coordinator.ticketCaptureQueue
                 case "epic_create": worker = coordinator.epicCreationQueue
+                case "work_checkpoint", "work_child_accept": worker = coordinator.workAuthorityOperationAdmissionQueue
+                case "media_round_link_task": worker = coordinator.mediaRoundLinkQueue
                 case "media_round_delete": worker = coordinator.mediaRoundDeletionAdmissionQueue
                 default:
                     guard CommandRouter.runsOutsideSerialQueue(method) || coordinator.nativeLifecycle.resumptionInFlight else {
@@ -910,7 +1035,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                         }
                     } catch {
                         var refusal: [String:Any] = ["error":Self.publicError(error)]
-                        if ["task_create","epic_create","media_round_delete"].contains(method) {
+                        if ["task_create","epic_create","media_round_link_task","media_round_delete"].contains(method) {
                             refusal["write_admission"] = router.writeAdmissionStatus
                         }
                         result = refusal
@@ -931,6 +1056,10 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     static func requiresAfterCommand(_ method:String) -> Bool {
         !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list","cleanup_job_list","cleanup_job_get"].contains(method)
     }
+    private static let writerDependentReads: Set<String> = [
+        "attachment_read","attachment_cleanup_preview","media_original_read",
+        "media_example_read_lease","media_example_read_release","operation_get","command_status"
+    ]
     /// On the serial queue.
     func finish(_ result:[String:Any],timing:ServiceCallTiming? = nil,runHooks:Bool = true,method:String = "",reply:(Data)->Void) {
         coordinator.requireCommandQueue()
@@ -960,7 +1089,9 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
             }
             phase("change_waiters_ms") { coordinator.changed() }
             phase("native_dispatch_ms") { coordinator.dispatchNative() }
-            phase("storage_wake_ms") { coordinator.armStorageWake(diagnostics:timed != nil) }
+            phase("storage_wake_ms") {
+                coordinator.armStorageWake(diagnostics:timed != nil, recheckHeld:!CommandReply.readMethods.contains(method))
+            }
             phase("work_health_ms") {
                 if coordinator.workHealthWake == nil && coordinator.workHealthFailures < 2 { coordinator.runWorkHealth() }
             }
@@ -994,9 +1125,24 @@ do {
     fputs("ChecklistService: descriptor soft limit retained: \(error).\n",stderr)
 }
 
+// A refusal exits before storage startup or its recovery listener.
+func refuseSlotInspection(_ error: Error) -> Never {
+    let message = (error as? SlotStartupInspection.Refusal)?.errorDescription ?? "Cannot verify the slot inspection receipt."
+    let digest = ProcessInfo.processInfo.environment[SlotStartupInspection.environmentKey] ?? "missing"
+    fputs("ChecklistService: SLOT_INSPECTION_REFUSED \(digest): \(message)\n", stderr)
+    exit(78)
+}
+
+let slotInspection: SlotStartupInspection?
+do {
+    slotInspection = try SlotStartupInspection.load(instance: .current, environment: ProcessInfo.processInfo.environment)
+} catch { refuseSlotInspection(error) }
+
 // A bounded installer operation on the selected root; it neither bootstraps a
 // native session nor starts a second service or changes the source schema.
 if CommandLine.arguments.dropFirst().first == "--prepare-upgrade" {
+    do { try slotInspection?.verifyBeforeOpeningStore() }
+    catch { refuseSlotInspection(error) }
     do {
         let result = try StorageUpgradePreparation.prepare(root:ChecklistPaths.root)
         print(String(decoding:try JSONSerialization.data(withJSONObject:result,options:.sortedKeys),as:UTF8.self))
@@ -1016,7 +1162,13 @@ do {
     // A development source binding belongs to this installed build, never another installation.
     let infoURL = ChecklistPaths.serviceExecutable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/build-info.json")
     if let bytes=try? Data(contentsOf:infoURL), let info=try? JSONSerialization.jsonObject(with:bytes) as? [String:Any], let source=info["source_root"] as? String { setenv("CHECKLIST_PROJECT_ROOT",source,1) }
-    let router = try CommandRouter(root: ChecklistPaths.root,serviceLease:storageLease,cliCommand:ChecklistInstance.current.cliCommand)
+    let busyPeriods = CommandQueueBusyPeriods(url: CommandQueueBusyPeriods.logURL(slot: ChecklistInstance.current.slot))
+    let observeMaximum: (@Sendable (ServiceHoldWatchdog.Hold) -> Void)? = if ChecklistInstance.current.slot != nil {
+        { busyPeriods.recordMaximum($0) }
+    } else { nil }
+    ServiceHoldWatchdog.shared.observe({ busyPeriods.record($0) }, maximum: observeMaximum)
+    let router = try CommandRouter(root: ChecklistPaths.root, serviceLease: storageLease,
+                                   cliCommand: ChecklistInstance.current.cliCommand, openingCheck: slotInspection?.openingCheck)
     if ChecklistInstance.current.slot == nil, let source=ProcessInfo.processInfo.environment["CHECKLIST_PROJECT_ROOT"], FileManager.default.fileExists(atPath:source) {
         let bootstrap=Caller(role:"owner",installation:"installation-bootstrap",projectIDs:[])
         let current=try router.handle(method:"project_list",params:[:],caller:bootstrap)
@@ -1025,7 +1177,7 @@ do {
             _ = try router.handle(method:"project_create",params:["name":"Checklist","key_prefix":"CL","root_path":source,"icon":"checklist","command_id":"c5e31e8c-a9e8-4108-b3bd-14d4acff9245"],caller:bootstrap)
         }
     }
-    let coordinator = Coordinator(router:router)
+    let coordinator = Coordinator(router:router,serviceBusyPeriods:busyPeriods)
     coordinator.startNativeReplies()
     // A top-level value, so it lasts for the process lifetime.
     let nativeReplyStop = coordinator.queue.sync { coordinator.nativeListener }.map { NativeReplyStopHandler(listener:$0) }
@@ -1033,6 +1185,8 @@ do {
     signal(SIGPIPE,SIG_IGN)
     print("ChecklistService ready (local XPC)")
     withExtendedLifetime(nativeReplyStop) { RunLoop.current.run() }
+} catch let refusal as StoreOpeningCheck.Refusal {
+    refuseSlotInspection(refusal.cause)
 } catch {
     let recovery = StorageRecoveryServer(error:error)
     fputs("ChecklistService: storage recovery required; original data retained.\n",stderr)

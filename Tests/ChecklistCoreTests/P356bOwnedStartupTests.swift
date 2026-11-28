@@ -290,8 +290,11 @@ final class P356bOwnedStartupTests: XCTestCase {
         do {
             let reply = try router.handle(method:"backup_create",params:["command_id":command,"path":destination.path,"reason":"P356b explicitly owned copied-store qualification " + label],caller:fixtureOwner)
             phase["backup_create_reply"] = reply;phase["backup_create_seconds"] = ProcessInfo.processInfo.systemUptime-began
-            if confirmRetention {XCTAssertEqual((reply["backup_retention"] as? JSON)?["status"] as? String,"complete","Automatic retention must actually complete; backup success alone is insufficient.")}
             log.emit(["event":"backup_create_complete","phase":label,"seconds":phase["backup_create_seconds"]!,"reply":reply])
+            if confirmRetention {
+                let retention = router.applyAutomaticBackupRetention()
+                XCTAssertEqual(retention["status"] as? String,"complete","The scheduled retention turn must complete after the backup reply.")
+            }
             let finalSettings = try router.handle(method:"backup_retention_get",params:[:],caller:fixtureOwner)
             phase["retention_after_backup"] = finalSettings
             let finalKeys = try router.readForPreparation {try String.fetchAll($0,sql:"SELECT key FROM metadata WHERE key GLOB 'backup-generation:*' ORDER BY key")}

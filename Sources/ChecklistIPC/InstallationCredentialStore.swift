@@ -91,6 +91,12 @@ public struct InstallationCredentialStore: Sendable {
         return value
     }
 
+    /// Observe only the current instance file without migrating or writing it.
+    public func readCurrent(_ installation: String) throws -> String? {
+        guard let current = try load(installation), current.state == .credential else {return nil}
+        return current.value
+    }
+
     public func write(_ installation: String, _ value: String) throws {
         _ = try save(record(installation, .credential, value), replacing: true)
     }

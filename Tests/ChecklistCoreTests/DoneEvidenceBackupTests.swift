@@ -269,6 +269,36 @@ extension TicketLifecycleCleanupTests {
         XCTAssertEqual(try serviceBackupCount(),0)
     }
 
+    func testCL514AutomaticCapacityRefusalAppearsInOwnerStatusAndClearsAfterVerification() throws {
+        try confirmRetention()
+        let (project, _, _) = try waitingFile()
+        let due = try XCTUnwrap(try deadline())
+        router.commandOperations.backupExecutionProbe = { phase in
+            if phase == "copying_objects" { throw StorageSnapshotFailure.limit }
+        }
+        defer {router.commandOperations.backupExecutionProbe = nil}
+        XCTAssertFalse(router.startDoneEvidenceBackupIfDue(at: due.addingTimeInterval(1)))
+        let status = try call("storage_status", [:])
+        let automatic = try XCTUnwrap(status["automatic_backup"] as? JSON)
+        let item = try XCTUnwrap(status["backup_capacity_attention"] as? JSON)
+        XCTAssertEqual(automatic["error_code"] as? String, "BACKUP_CAPACITY_EXCEEDED")
+        XCTAssertEqual(automatic["state"] as? String, "failed")
+        XCTAssertEqual(automatic["command_id"] as? String, item["command_id"] as? String)
+        XCTAssertEqual(item["reason"] as? String, "snapshot_capacity")
+        XCTAssertNotNil(automatic["retry_not_before"] as? String)
+        let ownerInfo = try call("service_info", [:])
+        XCTAssertEqual((ownerInfo["backup_capacity_attention"] as? JSON)?["command_id"] as? String, item["command_id"] as? String)
+        let worker = Caller(role: "worker", installation: "fixture-worker", projectIDs: [project["id"] as! String])
+        let workerInfo = try router.dbQueue.read {try self.router.dispatch($0, method: "service_info", p: [:], c: worker)}
+        XCTAssertNil(workerInfo["backup_capacity_attention"])
+
+        router.commandOperations.backupExecutionProbe = nil
+        let recovered = try call("backup_create", ["path": directory.appendingPathComponent("cl514-recovered").path])
+        XCTAssertEqual(recovered["status"] as? String, "complete")
+        XCTAssertTrue(try call("storage_status", [:])["backup_capacity_attention"] is NSNull)
+        XCTAssertTrue(try call("service_info", [:])["backup_capacity_attention"] is NSNull)
+    }
+
     func testCL394AsynchronousBackupFailureIsVisibleInMaintenance() throws {
         try confirmRetention()
         let (project,_,_) = try waitingFile()

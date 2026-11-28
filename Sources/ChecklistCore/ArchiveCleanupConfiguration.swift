@@ -33,12 +33,18 @@ extension CommandRouter {
         guard !attachments.isEmpty else { return [] }
         // CL-344: a command's writer reuses the scan it prepared on a read snapshot
         // after a cheap fence; other callers keep the scan in their own observation.
-        let graph = try currentGraph ?? preparedArchiveCleanupRows(db,task:task,attachments:attachments) ?? archiveCleanupRelevantReferenceRows(db,attachments:attachments)
-        let index = try currentIndex ?? ArchiveCleanupReferenceIndex(graph)
+        let index: ArchiveCleanupReferenceIndex
+        if let currentIndex {index = currentIndex}
+        else if let currentGraph {index = try ArchiveCleanupReferenceIndex(currentGraph)}
+        else if let prepared = try preparedArchiveCleanupIndex(db,task:task,attachments:attachments) {index = prepared}
+        else {
+            let seconds = db.configuration.readonly ? CleanupObservationDeadline.preparedSeconds : CleanupObservationDeadline.writerSeconds
+            index = try archiveCleanupRelevantReferenceGraph(db,attachments:attachments,budget:.init(seconds:seconds)).index
+        }
         return try attachments.map { a in
             let mode: ArchiveAttachmentFact.Mode = a["mode"] as? String == "managed" ? .managed : .externalReference
             let availability: ArchiveAttachmentFact.Availability = a["availability"] as? String == "available" ? .available : (a["availability"] as? String == "original_cleaned" ? .originalCleaned : .missing)
-            let holds = try completeArchiveCleanupHolds(db,attachment:a,task:task,considerArchiving:considerArchiving,currentGraph:graph,currentIndex:index)
+            let holds = try completeArchiveCleanupHolds(db,attachment:a,task:task,considerArchiving:considerArchiving,currentIndex:index)
             return try .init(
                 id: (try StoredRecord(a, family: "a").string("id")), logicalOriginalBytes: ArchiveCleanupJob.integer(a["size"]), mode: mode, availability: availability,
                 protectionReasons: Set(holds.map { ArchiveProtectionReason(rawValue: $0.rawValue) ?? .otherAuthoritativeHold }))

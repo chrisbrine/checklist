@@ -6,6 +6,42 @@ import Darwin
 @testable import ChecklistCore
 
 final class StorageBackupConcurrencyTests: XCTestCase {
+    func testStatusUsesCommittedSnapshotWhileQueueAdmissionIsOccupied() throws {
+        let fixture = try StorageFixture()
+        let router = try XCTUnwrap(fixture.router)
+        let queue = router.backupWrites
+        let caller = fixture.owner
+        try queue.beginCapture()
+        defer { queue.endBackup(router: router) }
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            defer { finished.signal() }
+            do {
+                _ = try queue.admit(method:"task_create",params:["command_id":UUID().uuidString],
+                                    caller:caller,admission:router.storageAdmission) {
+                    entered.signal()
+                    _ = release.wait(timeout:.now() + 10)
+                    throw CoreError("FIXTURE_REFUSAL", "No intent should be published.")
+                }
+                XCTFail("Expected the fixture to refuse the intent")
+            } catch {
+                XCTAssertEqual((error as? CoreError)?.code, "FIXTURE_REFUSAL")
+            }
+        }
+        XCTAssertEqual(entered.wait(timeout:.now() + 10), .success)
+        let observed = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            XCTAssertEqual(queue.status()["locked"] as? Bool, true)
+            XCTAssertEqual(queue.status()["queued"] as? Bool, false)
+            observed.signal()
+        }
+        let responsive = observed.wait(timeout:.now() + 2)
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout:.now() + 10), .success)
+        XCTAssertEqual(responsive, .success)
+    }
+
     func testInventoryRunsAfterWriterAndObjectGateReleaseWithRetentionStillActive() throws {
         let f = try StorageFixture(),p = try f.project(),t = try f.task(p),router = f.router!
         let source = f.workspace.appendingPathComponent("inventory.bin"),bytes = Data(repeating:9,count:4096)
@@ -15,6 +51,10 @@ final class StorageBackupConcurrencyTests: XCTestCase {
         var budget = StorageSnapshotBudget.production(),events: [String] = []
         budget.observe = {event in
             events.append(event)
+            if event == "backup_step" || event == "backup_done" {
+                XCTAssertTrue(try StorageSnapshotRetention.isActive(root:f.root))
+                XCTAssertEqual(try ArchiveStorageGate.withMaintenanceAccess(root:f.root,work:"backup_copy_test") { _, _ in true }, true)
+            }
             guard event == "inventory_started" else {return}
             XCTAssertTrue(events.contains("writer_lease_released"))
             XCTAssertTrue(events.contains("capture_released"))

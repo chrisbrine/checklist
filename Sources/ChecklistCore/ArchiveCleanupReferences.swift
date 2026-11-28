@@ -9,17 +9,22 @@ struct ArchiveCleanupReferenceIndex {
     let reverse: [Data: [Int]]
     static let bookkeeping: Set<String> = ["cleanup_job","cleanup_preview","event","checkpoint","policy_revision","taxonomy_revision","project_context_revision","finding_resolution","triage_membership_interval","triage_membership_exit"]
 
-    init(_ graph: [JSON]) throws {
+    init(_ graph: [JSON],check: () throws -> Void = {},charge: (Int) throws -> Void = {_ in}) throws {
         self.graph = graph
         let bookkeeping = Self.bookkeeping
         var reverse: [Data:[Int]] = [:],edgeCount = 0
         func indexStrings(_ value: Any,row: Int,depth: Int = 0) throws {
-            guard depth <= 64,edgeCount < 2_000_000 else { throw CoreError("REFERENCE_GRAPH_LIMIT", "The current reference graph exceeds the cleanup safety bound; originals retained.") }
-            if let s = value as? String { reverse[Data(s.utf8),default:[]].append(row);edgeCount += 1 }
+            guard depth <= 64,edgeCount < ArchiveCleanupObservationBudget.edgeLimit else {throw CoreError("REFERENCE_GRAPH_LIMIT","The current reference graph exceeds the cleanup safety bound; originals retained.")}
+            if let s = value as? String {
+                let token = Data(s.utf8)
+                try charge(token.count + 64)
+                reverse[token,default:[]].append(row);edgeCount += 1
+            }
             else if let a = value as? [Any] { for v in a { try indexStrings(v,row:row,depth:depth+1) } }
             else if let o = value as? JSON { for v in o.values { try indexStrings(v,row:row,depth:depth+1) } }
         }
         for (index,value) in graph.enumerated() {
+            try check()
             let type = value["record_type"] as? String ?? ""
             if bookkeeping.contains(type) { continue }
             if type == "storage_job",["attachment_import","archive_cleanup_delete","archive_cleanup_cursor","ticket_object_delete"].contains(value["kind"] as? String ?? "") { continue }
@@ -30,19 +35,6 @@ struct ArchiveCleanupReferenceIndex {
 }
 
 extension CommandRouter {
-    /// Reuse only within one current SQL observation; never across commands or
-    /// the durable-intent/final-unlink transaction boundary.
-    func archiveCleanupReferenceRows(_ db: Database) throws -> [JSON] {
-        var graph: [JSON] = []
-        let cursor = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records ORDER BY rowid")
-        while let row = try cursor.next() {
-            guard graph.count < 250_000 else { throw CoreError("REFERENCE_GRAPH_LIMIT", "The current reference graph exceeds the cleanup safety bound; originals are retained.") }
-            let decoded = try GRDBRecordEnvelopeAdapter.decode(row)
-            var value = decoded.object; value["record_type"] = decoded.type
-            graph.append(value)
-        }
-        return graph
-    }
     /// Enumerate the actual persisted reference graph, including foreign-project
     /// links to the same physical object. Only bounded reason codes leave here.
     /// Unknown/corrupt rows throw; absence of knowledge never authorizes unlink.
@@ -56,7 +48,13 @@ extension CommandRouter {
         if task["active_attempt_id"] != nil { holds.insert(.activeWork) }
         if task["active_verification_request_id"] != nil { holds.insert(.activeVerification) }
         if !considerArchiving && !bool(task,"archived") { holds.insert(.sharedLiveReference) }
-        let referenceIndex = try currentIndex ?? ArchiveCleanupReferenceIndex(currentGraph ?? archiveCleanupReferenceRows(db))
+        let referenceIndex: ArchiveCleanupReferenceIndex
+        if let currentIndex {referenceIndex = currentIndex}
+        else if let currentGraph {referenceIndex = try ArchiveCleanupReferenceIndex(currentGraph)}
+        else {
+            let seconds = db.configuration.readonly ? CleanupObservationDeadline.preparedSeconds : CleanupObservationDeadline.writerSeconds
+            referenceIndex = try archiveCleanupRelevantReferenceGraph(db,attachments:[a],budget:.init(seconds:seconds)).index
+        }
         let graph = referenceIndex.graph
         let tasks = graph.filter { $0["record_type"] as? String == "task" }
         func taskIsLive(_ id: Any?) -> Bool {

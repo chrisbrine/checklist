@@ -1361,12 +1361,8 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertFalse((receipt["intent_digest"] as? String ?? "").isEmpty)
         try MediaAgentTypeChangeTests().setAgentRuleChanges(f,"owner_only")
         let current = Date()
-        _ = try f.router.dbQueue.writeWithoutTransaction {db in
-            try f.router.pruneRoutineRecords(db,now:current.addingTimeInterval(7_200))
-        }
-        let pruned = try f.router.dbQueue.writeWithoutTransaction {db in
-            try f.router.pruneRoutineRecords(db,now:current.addingTimeInterval(33 * 86_400))
-        }
+        try f.router.pruneRoutineRecords(now:current.addingTimeInterval(7_200))
+        let pruned = try f.router.pruneRoutineRecords(now:current.addingTimeInterval(33 * 86_400))
         XCTAssertGreaterThan(pruned.commandResults,0,"The future retention pass must actually prune ordinary outcomes")
         let ordinaryResult = try f.router.dbQueue.read {db in
             try XCTUnwrap(String.fetchOne(db,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[f.owner.principal,ordinaryCommand]))

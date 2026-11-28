@@ -177,11 +177,7 @@ extension HumanAnswerNoticeTests {
     func testAMalformedDeliveryRowOfAnyRecipientStopsNoWorker() throws {
         let f = try fixture()
         _ = try sendNote(f,body:"good note")
-        try router.dbQueue.write { db in
-            for (id,data) in [("malformed-delivery","{not json"),("array-delivery","[1]")] {
-                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,'delivery',1,?)",arguments:[id,f.project["id"] as! String,data])
-            }
-        }
+        try insertUnroutableDeliveries(project: f.project["id"] as! String)
         let items = try pickup(f.requester)["items"] as! [JSON]
         XCTAssertEqual(items.map { $0["body"] as? String },["good note"])
         let metadata = try XCTUnwrap(pendingNotes(try envelope("service_info",[:],f.requester)))
@@ -355,11 +351,7 @@ extension HumanAnswerNoticeTests {
 
     func testAMalformedDeliveryOfAnyRecipientHidesNoHumanAnswer() throws {
         let f = try fixture(),r = try request(f);_ = try answer(f,r)
-        try router.dbQueue.write { db in
-            for (id,data) in [("malformed-delivery","{not json"),("array-delivery","[1]")] {
-                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,'delivery',1,?)",arguments:[id,f.project["id"] as! String,data])
-            }
-        }
+        try insertUnroutableDeliveries(project: f.project["id"] as! String)
         let output = try envelope("service_info",[:],f.requester)
         XCTAssertEqual(notice(output)?["status"] as? String,"pending_pickup");XCTAssertEqual((notice(output)?["items"] as? [JSON])?.count,1)
         XCTAssertNil(notice(try envelope("service_info",[:],f.other)),"Another worker has no answer and no unavailable notice.")
@@ -374,9 +366,16 @@ extension HumanAnswerNoticeTests {
 
     func testOneMalformedDeliveryCostsOnlyItsRowInTheInbox() throws {
         let f = try fixture()
-        let old = try sendNote(f,body:"older note"),bad = try sendNote(f,body:"lost note"),new = try sendNote(f,body:"newer note")
-        _ = (old,new)
-        try router.dbQueue.write { try $0.execute(sql:"UPDATE records SET data='{not json' WHERE type='delivery' AND json_extract(data,'$.message_id')=?",arguments:[bad["id"] as! String]) }
+        _ = try sendNote(f,body:"older note")
+        let bad = try sendNote(f,body:"lost note")
+        _ = try sendNote(f,body:"newer note")
+        let badID = try XCTUnwrap((bad["deliveries"] as? [JSON])?.first?["id"] as? String)
+        try router.dbQueue.write { db in
+            // Leave the indexed fields and recipient intact so the inbox selects
+            // this row and the envelope decoder rejects its missing identity.
+            try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.id') WHERE type='delivery' AND id=?",arguments:[badID])
+            XCTAssertEqual(db.changesCount,1)
+        }
         let inbox = try call("session_inbox",["project_id":f.project["id"]!],f.requester)
         XCTAssertEqual(inbox["skipped_malformed"] as? Int,1)
         XCTAssertEqual(Set((inbox["messages"] as! [JSON]).map { $0["body"] as? String }),["older note","newer note"])
@@ -387,5 +386,15 @@ extension HumanAnswerNoticeTests {
         _ = try sendNote(f,body:"for the requester")
         XCTAssertEqual(try call("session_inbox",["project_id":f.project["id"]!],f.other)["skipped_malformed"] as? Int,0)
         XCTAssertEqual(try call("session_inbox",["project_id":f.project["id"]!],f.requester)["skipped_malformed"] as? Int,0)
+    }
+
+    private func insertUnroutableDeliveries(project: String) throws {
+        // Schema 6 indexes delivery JSON. Both forms are valid JSON but
+        // neither describes a delivery or names a recipient.
+        try router.dbQueue.write { db in
+            for (id,data) in [("empty-delivery","{}"),("array-delivery","[1]")] {
+                try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,'delivery',1,?)",arguments:[id,project,data])
+            }
+        }
     }
 }

@@ -58,13 +58,19 @@ enum StorageSnapshotAuthority {
     }
 
     // Closed current authority catalog, not a permission grant from a path.
-    static var knownTypes: Set<String> { Set(EnvelopeFamily.catalog.keys) }
+    static let knownTypes = Set(EnvelopeFamily.catalog.keys)
 
     static func inventory(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil, retainedExists: (String) throws -> Bool) throws -> StorageSnapshotInventory {
         var objects: [String: StorageSnapshotObject] = [:]
+        var attributions: [String: Set<String>] = [:]
         var unavailable: [StorageSnapshotAbsence] = [], external: [String] = []
         let relocation = try ManagedPathRelocation.snapshotPlan(db, root: root, budget: budget, objectRoot: objectRoot)
-        var recordCount = 0
+        var working = StorageSnapshotWorkingBytes(budget)
+        try working.retain(relocation.workingBytes)
+        func recordAbsence(_ authority: String, _ reason: String) throws {
+            try working.retain(96 + authority.utf8.count + reason.utf8.count)
+            unavailable.append(.init(authority: authority, reason: reason))
+        }
         let databaseBytes = budget.measurement.metadataBytes
         var declaredObjectBytes: Int64 = 0
         func text(_ record: [String: Any], _ key: String) throws -> String {
@@ -77,7 +83,7 @@ enum StorageSnapshotAuthority {
         }
         // Done cleanup keeps canonical evidence. Its durable exact outcomes explain
         // unavailable bytes without modifying immutable manifests or capture lists.
-        let cleanedRows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
+        let cleanedRows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength + " FROM records WHERE type='storage_job' AND json_extract(data,'$.cause')='done_evidence'")
         struct CleanedObject: Hashable {
             let sha: String?
             let size: Int64?
@@ -86,16 +92,20 @@ enum StorageSnapshotAuthority {
         // A receipt can repeat the same removed descriptor across many historical
         // passes. Retain only the exact matching fields, once per path/descriptor.
         // Full canonical envelopes are checked again by the streaming pass below.
-        var cleaned: [String:Set<CleanedObject>] = [:],cleanedCount = 0
+        var cleaned: [String:Set<CleanedObject>] = [:]
         while let row = try cleanedRows.next() {
             try autoreleasepool {
                 try budget.check()
+                try working.requireEnvelope(row)
                 let receipt = try GRDBRecordEnvelopeAdapter.decode(row).object
-                guard cleanedCount < budget.maximumRecords else { throw StorageSnapshotFailure.limit }
-                cleanedCount += 1
                 try CommandRouter.visitTicketObjectDeletionObjects(db,receipt:receipt) {object in
+                    try budget.check()
                     if ["removed","already_missing"].contains(object["state"] as? String ?? ""),let path = object["relative_path"] as? String {
-                        cleaned[path,default:[]].insert(.init(sha:object["sha256"] as? String,size:(object["size"] as? NSNumber)?.int64Value,kind:object["kind"] as? String))
+                        let descriptor = CleanedObject(sha:object["sha256"] as? String,size:(object["size"] as? NSNumber)?.int64Value,kind:object["kind"] as? String)
+                        if cleaned[path]?.contains(descriptor) != true {
+                            try working.retain(160 + path.utf8.count + (descriptor.sha?.utf8.count ?? 0) + (descriptor.kind?.utf8.count ?? 0))
+                            cleaned[path,default:[]].insert(descriptor)
+                        }
                     }
                 }
             }
@@ -106,18 +116,25 @@ enum StorageSnapshotAuthority {
                 (value.expectedSize == nil || object.size == value.expectedSize) &&
                 object.kind == value.kind
             }) == true, try !retainedExists(value.relativePath) {
-                for authority in value.authorities {unavailable.append(.init(authority:authority,reason:"evidence_cleaned"))}
+                for authority in value.authorities {try recordAbsence(authority, "evidence_cleaned")}
                 return
+            }
+            for authority in value.authorities where attributions[value.relativePath]?.contains(authority) != true {
+                try working.retain(64 + authority.utf8.count)
+                attributions[value.relativePath, default: []].insert(authority)
             }
             if var prior = objects[value.relativePath] {
                 guard prior.kind == value.kind,
                       prior.expectedSHA256 == nil || value.expectedSHA256 == nil || prior.expectedSHA256 == value.expectedSHA256,
                       prior.expectedSize == nil || value.expectedSize == nil || prior.expectedSize == value.expectedSize,
                       prior.executable == value.executable,prior.linkTarget == value.linkTarget else { throw StorageSnapshotFailure.unsupportedAuthority }
-                prior = .init(relativePath:prior.relativePath,kind:prior.kind,expectedSHA256:prior.expectedSHA256 ?? value.expectedSHA256,expectedSize:prior.expectedSize ?? value.expectedSize,executable:prior.executable,linkTarget:prior.linkTarget,authorities:prior.authorities)
-                prior.authorities = Array(Set(prior.authorities + value.authorities)).sorted(); objects[value.relativePath] = prior
+                prior = .init(relativePath:prior.relativePath,kind:prior.kind,expectedSHA256:prior.expectedSHA256 ?? value.expectedSHA256,expectedSize:prior.expectedSize ?? value.expectedSize,executable:prior.executable,linkTarget:prior.linkTarget,authorities:[])
+                objects[value.relativePath] = prior
             } else {
-                objects[value.relativePath] = value
+                try working.retain(256 + value.relativePath.utf8.count + (value.linkTarget?.utf8.count ?? 0) + (value.expectedSHA256?.utf8.count ?? 0))
+                var descriptor = value
+                descriptor.authorities = []
+                objects[value.relativePath] = descriptor
                 let sum = declaredObjectBytes.addingReportingOverflow(value.expectedSize ?? Int64(value.linkTarget?.utf8.count ?? 0))
                 guard !sum.overflow else { throw StorageSnapshotFailure.limit }
                 declaredObjectBytes = sum.partialValue
@@ -132,7 +149,7 @@ enum StorageSnapshotAuthority {
         func regular(path: String, family: String, sha: String?, size: Int64?, executable: Bool = false, authority: String) throws {
             if let size, size < 0 { throw StorageSnapshotFailure.unsupportedAuthority }
             let decision = try relocation.decision(path, family: family, root: root)
-            guard let relative = decision.relative else { unavailable.append(.init(authority: authority, reason: "outside_store_root")); return }
+            guard let relative = decision.relative else { try recordAbsence(authority, "outside_store_root"); return }
             try add(StorageSnapshotObject(relativePath: relative, kind: "file", expectedSHA256: sha,
                 expectedSize: size, executable: executable, linkTarget: nil, authorities: [authority]))
             if let size, size > budget.maximumObjectBytes { throw budget.capacityFailure("snapshot_object_bytes") }
@@ -144,20 +161,22 @@ enum StorageSnapshotAuthority {
             let pathParts = try StorageObjectFiles.parts(path, absolute: path.hasPrefix("/"))
             guard let familyIndex = pathParts.lastIndex(of: "source-captures") else { throw StorageSnapshotFailure.unsupportedAuthority }
             let family = decision.relative ?? pathParts[familyIndex...].joined(separator: "/")
-            if decision.relative == nil { unavailable.append(.init(authority: attribution, reason: "outside_store_root")) }
+            if decision.relative == nil { try recordAbsence(attribution, "outside_store_root") }
             let legacy = "source-captures/" + project + "/" + id + "/source"
             let current = "source-captures/project-" + hash(Data(project.utf8)) + "/" + id + "/source"
             guard family.utf8.elementsEqual(legacy.utf8) || family.utf8.elementsEqual(current.utf8),
                   let files = value["files"] as? [[String: Any]] else { throw StorageSnapshotFailure.unsupportedAuthority }
             var entries: [String: [String: Any]] = [:]
             for file in files {
+                try budget.check()
                 let name = try text(file, "path"); _ = try StorageObjectFiles.parts(name)
                 guard entries[name] == nil else { throw StorageSnapshotFailure.unsupportedAuthority }; entries[name] = file
             }
             var captured: [StorageSnapshotObject] = []
             for (name, file) in entries {
+                try budget.check()
                 let kind = try text(file, "kind"), authority = attribution + ":" + id + ":" + name
-                if kind == "deleted" { unavailable.append(.init(authority: authority, reason: "captured_deleted")); continue }
+                if kind == "deleted" { try recordAbsence(authority, "captured_deleted"); continue }
                 let sha = try digest(file["sha256"]), source = family + "/" + name
                 if kind == "file" {
                     guard let size = (file["size"] as? NSNumber)?.int64Value, size >= 0 else { throw StorageSnapshotFailure.unsupportedAuthority }
@@ -178,13 +197,13 @@ enum StorageSnapshotAuthority {
                 if let size = object.expectedSize, size > budget.maximumObjectBytes { throw budget.capacityFailure("snapshot_object_bytes") }
             }
         }
-        let rows = try Row.fetchCursor(db, sql: "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records ORDER BY id")
+        let rows = try Row.fetchCursor(db, sql: "SELECT " + CommandRouter.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength + " FROM records ORDER BY id")
         while let row = try rows.next() {
             try autoreleasepool {
-                try budget.check(); recordCount += 1
-                guard recordCount <= budget.maximumRecords else { throw StorageSnapshotFailure.limit }
+                try budget.check()
+                try working.requireEnvelope(row)
                 let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
-                try MediaRecordRegistry.validateSnapshotEnvelope(envelope,db:db)
+                try MediaRecordRegistry.validateSnapshotEnvelope(envelope,db:db,check:budget.check,requireInput:working.requireInput)
                 let id = envelope.id, type = envelope.type, value = envelope.object
                 guard knownTypes.contains(type) else { throw StorageSnapshotFailure.unsupportedAuthority }
                 // Keep the relocation plan's original field validation in this
@@ -196,7 +215,7 @@ enum StorageSnapshotAuthority {
                 switch type {
                 case "attachment":
                     let mode = try text(value, "mode")
-                    if mode == "external_reference" { external.append(authority); return }
+                    if mode == "external_reference" { try working.retain(64 + authority.utf8.count); external.append(authority); return }
                     guard mode == "managed" else { throw StorageSnapshotFailure.unsupportedAuthority }
                     _ = try text(value, "project_id")
                     let availability = try text(value, "availability")
@@ -205,7 +224,7 @@ enum StorageSnapshotAuthority {
                         try regular(path: try text(value, "path"), family: "objects",
                             sha: try digest(value["sha256"]), size: size, authority: authority + ":original")
                     } else if ["original_cleaned", "original_missing", "unavailable", "damaged"].contains(availability) {
-                        unavailable.append(.init(authority: authority, reason: availability))
+                        try recordAbsence(authority, availability)
                     } else { throw StorageSnapshotFailure.unsupportedAuthority }
                     if value["preview_path"] != nil {
                         let preview = try text(value, "preview_path")
@@ -233,13 +252,13 @@ enum StorageSnapshotAuthority {
                                 guard parts.count >= 2,parts[0] == "source-build-cache",parts[1].range(of:"^[0-9a-f]{64}$",options:.regularExpression) != nil else {throw StorageSnapshotFailure.unsupportedAuthority}
                                 // Rebuildable cache is not required backup payload.
                                 // Preserve its durable ownership/outcome metadata.
-                                unavailable.append(.init(authority:authority + ":" + path,reason:"rebuildable_source_build_cache"));return
+                                try recordAbsence(authority + ":" + path, "rebuildable_source_build_cache");return
                             }
                             guard let path = entry["relative_path"] as? String,let sha = entry["sha256"] as? String,let size = (entry["size"] as? NSNumber)?.int64Value else {return}
                             guard path.hasPrefix("objects/") || path.hasPrefix("source-captures/"),size >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
                             if try retainedExists(path) {
                                 try add(.init(relativePath:path,kind:try text(entry,"kind"),expectedSHA256:try digest(sha),expectedSize:entry["kind"] as? String == "symlink" ? nil : size,executable:entry["executable"] as? Bool == true,linkTarget:entry["link_target"] as? String,authorities:[authority + ":pending_deletion"]))
-                            } else {unavailable.append(.init(authority:authority + ":" + path,reason:"deletion_object_absent"))}
+                            } else {try recordAbsence(authority + ":" + path, "deletion_object_absent")}
                         }
                         break
                     }
@@ -257,6 +276,7 @@ enum StorageSnapshotAuthority {
                         if !captured, let raw = value["objects"] {
                             guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
                             for object in entries {
+                                try budget.check()
                                 let final = try text(object,"final")
                                 guard final.hasPrefix("objects/") else { throw StorageSnapshotFailure.unsupportedAuthority }
                                 _ = try StorageObjectFiles.parts(final)
@@ -265,7 +285,7 @@ enum StorageSnapshotAuthority {
                                     try regular(path:root.appendingPathComponent(final).path,family:"objects",sha:try digest(object["sha256"]),size:size.int64Value,authority:authority + ":uncommitted_recovery:" + (object["representation"] as? String ?? ""))
                                 }
                             }
-                            unavailable.append(.init(authority:authority,reason:"uncommitted_media_capture_staging_excluded"))
+                            try recordAbsence(authority, "uncommitted_media_capture_staging_excluded")
                         }
                         break
                     }
@@ -275,6 +295,7 @@ enum StorageSnapshotAuthority {
                         if let raw = value["objects"] {
                             guard let entries = raw as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
                             for object in entries {
+                                try budget.check()
                                 let sha = try digest(object["sha256"])
                                 guard let size = object["size"] as? NSNumber else { throw StorageSnapshotFailure.unsupportedAuthority }
                                 for field in ["stage", "final"] {
@@ -285,7 +306,7 @@ enum StorageSnapshotAuthority {
                                         try regular(path: root.appendingPathComponent(path).path, family: field == "stage" ? "staging" : "objects", sha: sha, size: size.int64Value, authority: authority + ":" + field + ":" + (object["representation"] as? String ?? ""))
                                     } else {
                                         guard !(state == "finalized" && field == "final" && object["representation"] as? String == "original") else { throw StorageSnapshotFailure.incomplete }
-                                        unavailable.append(.init(authority:authority + ":" + field + ":" + (object["representation"] as? String ?? ""), reason:"pending_not_materialized"))
+                                        try recordAbsence(authority + ":" + field + ":" + (object["representation"] as? String ?? ""), "pending_not_materialized")
                                     }
                                 }
                             }
@@ -309,21 +330,28 @@ enum StorageSnapshotAuthority {
                         _ = try text(value, "project_id")
                         try regular(path: output, family: "source-executions",
                             sha: try digest(value["output_sha256"]), size: nil, authority: authority + ":output")
-                    } else { unavailable.append(.init(authority: authority, reason: "output_not_recorded")) }
+                    } else { try recordAbsence(authority, "output_not_recorded") }
                 default: break
                 }
             }
         }
         // Schema5 summaryless legacy receipts keep their exact historical list
         // as a managed immutable catalog. It is history, never backup-copy authority.
-        let catalogs = try Row.fetchCursor(db,sql:"SELECT key,value AS catalog FROM metadata WHERE key GLOB 'backup-historical-catalog:*'")
+        let catalogs = try Row.fetchCursor(db,sql:"SELECT key,value AS catalog,length(CAST(value AS BLOB)) AS snapshot_envelope_bytes FROM metadata WHERE key GLOB 'backup-historical-catalog:*'")
         while let row = try catalogs.next() {
+            try budget.check()
+            try working.requireEnvelope(row)
             let catalog = jsonObject(row["catalog"] as String)
             guard let path = catalog["path"] as? String,path.hasPrefix("objects/backup-catalogs/"),let sha = catalog["sha256"] as? String,
                   let size = catalog["size"] as? NSNumber,size.int64Value >= 0 else {throw StorageSnapshotFailure.unsupportedAuthority}
             try regular(path:path,family:"objects",sha:try digest(sha),size:size.int64Value,authority:"metadata:" + (row["key"] as String) + ":historical_catalog")
         }
-        let ordered = objects.values.sorted { $0.relativePath < $1.relativePath }
+        let ordered = try objects.values.map { descriptor in
+            try budget.check()
+            var descriptor = descriptor
+            descriptor.authorities = attributions[descriptor.relativePath, default: []].sorted()
+            return descriptor
+        }.sorted { $0.relativePath < $1.relativePath }
         try validateCapturedLinks(ordered)
         return .init(objects: ordered,
             unavailable: unavailable.sorted { $0.authority < $1.authority }, externalReferences: external.sorted())

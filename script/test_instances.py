@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Manage four disposable Checklist test slots. Never build or alter the live store."""
 import argparse
+import base64
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack, closing
@@ -1118,12 +1119,19 @@ def require_local_paths(database, destination, immutable=True, source_root=None,
 
 
 SEED_PATH_PROOF = 'seed-path-proof.json'
+SLOT_START_RECEIPT = 'slot-start-inspection.json'
+SLOT_START_DIGEST = 'CHECKLIST_SLOT_INSPECTION_SHA256'
+SLOT_START_SOURCE = 'Sources/ChecklistService/SlotStartupInspection.swift'
+SQLITE_COMPANIONS = ('-wal', '-journal', '-shm')
+SLOT_STORAGE_LOCKS = {'service.lock', 'checklist.bootstrap.lock', '.archive-storage.lock'}
 MAX_SEED_PROOF_BYTES = 16 * 1024 * 1024
 
 
-def seed_store_files(database, *, hash_bytes=False, allow_journal=False):
+def seed_store_files(database, *, hash_bytes=False, allow_journal=False, include_shm=False):
     """Fingerprint the exact named database and WAL without following a leaf link."""
     suffixes = ('', '-wal', '-journal') if allow_journal else ('', '-wal')
+    if include_shm:
+        suffixes += ('-shm',)
     if not allow_journal:
         journal = database.with_name(database.name + '-journal')
         try: journal.lstat()
@@ -1150,7 +1158,8 @@ def seed_store_files(database, *, hash_bytes=False, allow_journal=False):
                 if file_stamp(os.fstat(descriptor)) != stamp or file_stamp(path.lstat()) != stamp:
                     raise ValueError('Seed database or WAL changed while hashing.')
         files[suffix] = entry
-    if hash_bytes and seed_store_files(database, allow_journal=allow_journal) != seed_file_stamps(files):
+    if hash_bytes and seed_store_files(database, allow_journal=allow_journal,
+                                       include_shm=include_shm) != seed_file_stamps(files):
         raise ValueError('Seed database or WAL changed while hashing.')
     return files
 
@@ -1214,14 +1223,14 @@ def record_seed_path_proof(p, metadata, proof, session):
 
 def seed_directories_match(root, directories):
     try:
-        return all(list(file_stamp((root / name).lstat())) == stamp for name, stamp in directories.items())
+        return all(file_stamp((root / name).lstat()) == tuple(stamp) for name, stamp in directories.items())
     except (FileNotFoundError, NotADirectoryError):
         return False
 
 
 def revalidate_seed_paths(root, proof):
     mapping = ManagedPathMapping()
-    if any(list(mapping.components(path)) != parts for path, parts in proof['aliases'].items()):
+    if any(mapping.components(path) != tuple(parts) for path, parts in proof['aliases'].items()):
         return False
     bindings = ExternalBindingOverlapCache()
     for value in proof['bindings']:
@@ -1234,6 +1243,111 @@ def revalidate_seed_paths(root, proof):
             return False
     contained(root, root)
     return seed_directories_match(root, proof['directories'])
+
+
+def seed_named_stamp(path, *, directory=False):
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return ['missing']
+    except PermissionError:
+        return ['denied']
+    if directory:
+        return list(map(str, file_stamp(info)))
+    identity = [str(info.st_dev), str(info.st_ino), str(info.st_mode)]
+    return identity + [str(info.st_ctime_ns)] if stat.S_ISLNK(info.st_mode) else identity
+
+
+def seed_canonical_stamp(path, *, permit_denied=False):
+    try:
+        anchor, tail, (device, inode) = _canonical_path(path)
+    except PermissionError:
+        if permit_denied:
+            return ['denied']
+        raise
+    return [str(anchor), str(device), str(inode), *tail]
+
+
+def seed_root_entries(root):
+    with os.scandir(root) as entries:
+        return sorted(entry.name for entry in entries if entry.name not in SLOT_STORAGE_LOCKS)
+
+
+class SeedStartupPaths:
+    """Facts shared by the final Python handoff and the native slot service."""
+
+    def __init__(self, root, proof):
+        self.root = root
+        self.root_entries = seed_root_entries(root)
+        self.directories = {root / name: list(map(str, stamp)) for name, stamp in proof['directories'].items()}
+        canonical = set(map(Path, [*proof['aliases'], *proof['bindings']]))
+        visible_trash = {Path(value).parent for value, _, opaque in proof['trash'] if not opaque}
+        if proof['bindings'] or visible_trash:
+            canonical.update({LIVE, DEFAULT_LIVE, BASE})
+            for number in range(1, 5):
+                slot = paths(number)
+                canonical.update({slot['data'], slot['folder']})
+        self.canonical = {path: seed_canonical_stamp(path) for path in canonical | visible_trash}
+        names = {root, *root.parents, *(root / name for name in self.root_entries)}
+        for path, (anchor, *_rest) in self.canonical.items():
+            physical = Path(anchor)
+            names.update({path, *path.parents, physical, *physical.parents})
+        self.named = {path: seed_named_stamp(path) for path in names}
+        for value, _, opaque in proof['trash']:
+            path = Path(value)
+            for name in reversed([path, *path.parents]):
+                if name not in self.named:
+                    self.named[name] = seed_named_stamp(name)
+                if self.named[name] == ['denied']:
+                    break
+            else:
+                if opaque:
+                    # macOS can allow lstat while denying the directory open
+                    # needed for canonical spelling. Keep that denial as well.
+                    stamp = seed_canonical_stamp(path.parent, permit_denied=True)
+                    if stamp != ['denied']:
+                        raise ValueError('Cannot bind an opaque Trash observation to startup.')
+                    self.canonical[path.parent] = stamp
+
+    def matches(self):
+        return (seed_root_entries(self.root) == self.root_entries
+                and all(seed_named_stamp(path, directory=True) == stamp for path, stamp in self.directories.items())
+                and all(seed_canonical_stamp(path, permit_denied=stamp == ['denied']) == stamp
+                        for path, stamp in self.canonical.items())
+                and all(seed_named_stamp(path) == stamp for path, stamp in self.named.items()))
+
+    def encoded(self):
+        def entries(values):
+            return [{'path': str(path), 'expected': stamp} for path, stamp in sorted(values.items(), key=lambda item: str(item[0]))]
+        return json.dumps({'named': entries(self.named), 'canonical': entries(self.canonical),
+                           'directories': entries(self.directories), 'root_entries': self.root_entries},
+                          separators=(',', ':')).encode()
+
+
+def inspect_startup_paths(root, proof):
+    observed = SeedStartupPaths(root, proof)
+    if not revalidate_seed_paths(root, proof) or not observed.matches():
+        raise ValueError('Slot path observations changed during startup validation.')
+    return observed
+
+
+def slot_start_receipt(p, files, observed):
+    observations = observed.encoded()
+    receipt = {'format': 1, 'slot': int(p['folder'].name.removeprefix('slot-')), 'nonce': uuid.uuid4().hex,
+               'files': [{'name': 'checklist.sqlite' + suffix, 'stamp': None if entry is None else list(map(str, entry['stamp'])),
+                          'sha256': None if entry is None else entry['sha256']} for suffix, entry in files.items()],
+               'observations': base64.b64encode(observations).decode(),
+               'observations_sha256': hashlib.sha256(observations).hexdigest()}
+    raw = json.dumps(receipt, separators=(',', ':')).encode()
+    if len(raw) > MAX_SEED_PROOF_BYTES:
+        raise ValueError('Slot startup inspection receipt exceeds its capacity.')
+    target = contained(p['folder'] / SLOT_START_RECEIPT, p['folder'])
+    temporary = contained(target.with_name(target.name + '-' + uuid.uuid4().hex), p['folder'])
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(raw)
+    temporary.replace(target)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def reusable_seed_inspection(p, metadata, summary_source_root):
@@ -1263,16 +1377,16 @@ def reusable_seed_inspection(p, metadata, summary_source_root):
         stamps = seed_file_stamps(proof['files'])
         if seed_store_files(database) != stamps:
             return None
-        if seed_store_files(database, hash_bytes=True) != proof['files']:
+        files = seed_store_files(database, hash_bytes=True, allow_journal=True, include_shm=True)
+        if files['-journal'] is not None or any(files[suffix] != entry for suffix, entry in proof['files'].items()):
             return None
-        if not revalidate_seed_paths(root, proof) or seed_store_files(database) != stamps:
+        observed = inspect_startup_paths(root, proof)
+        if seed_store_files(database, allow_journal=True, include_shm=True) != seed_file_stamps(files):
             return None
         stopped(p)
     except (OSError, RuntimeError, TypeError, KeyError, ValueError, subprocess.SubprocessError):
         return None
-    # Carry the same observations through launch preparation. A successful
-    # proof also establishes that no rollback journal was present.
-    return stamps | {'-journal': None}, proof['directories']
+    return files, observed
 
 
 def snapshot_objects(manifest):
@@ -2001,7 +2115,27 @@ def start_deadline_seconds():
     return value
 
 
-def service_status(p, *, bound=None):
+class SlotInspectionRefused(ValueError):
+    """The service rejected this launch's pinned inspection before opening storage."""
+
+
+def slot_inspection_refusal(p, receipt_digest):
+    if receipt_digest is None:
+        return
+    log = contained(p['folder'] / 'logs/service.stderr.log', p['folder'])
+    try:
+        with log.open('rb') as stream:
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - 32_768))
+            lines = stream.read(32_769).decode(errors='replace').splitlines()
+    except FileNotFoundError:
+        return
+    prefix = f'ChecklistService: SLOT_INSPECTION_REFUSED {receipt_digest}: '
+    for line in reversed(lines):
+        if line.startswith(prefix):
+            raise SlotInspectionRefused('Test-slot service refused storage startup: ' + line.removeprefix(prefix))
+
+
+def service_status(p, *, bound=None, receipt_digest=None):
     """Wait for health while the slot's protected snapshot/migration keeps running."""
     bound = start_deadline_seconds() if bound is None else bound
     number = p['folder'].name.removeprefix('slot-')
@@ -2018,10 +2152,13 @@ def service_status(p, *, bound=None):
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0: expired()
+        slot_inspection_refusal(p, receipt_digest)
         try: result = run(command, timeout=min(30, remaining), check=False)
         except subprocess.TimeoutExpired as error:
+            slot_inspection_refusal(p, receipt_digest)
             last_status = f'no reply within {error.timeout:g} seconds'
         else:
+            slot_inspection_refusal(p, receipt_digest)
             last_status = describe_status(result)
             try: payload = json.loads(result.stdout)
             except (ValueError, TypeError):
@@ -2060,105 +2197,157 @@ def start(arguments, p):
     timing.start('preflight')
     bound = start_deadline_seconds()  # Reject invalid configuration before bootstrap.
     metadata = load(p)
-    # Only this persisted opt-in controls the launch. Never inherit a relay opt-in
-    # from the caller or launchd environment, including for older slot metadata.
+    # Only the persisted opt-in controls the launch.
     configured_relays = metadata.get('allow_synthetic_relays') is True
     requested_relays = getattr(arguments, 'allow_synthetic_relays', None)
     allow_synthetic_relays = configured_relays if requested_relays is None else requested_relays is True
-    if metadata['seed']['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused', 'restaging']:
-        raise ValueError('Slot creation did not complete: ' + metadata['seed'].get('reason', 'incomplete seed'))
-    manifest = bundle_check(p, metadata)
     seed = metadata['seed']
-    handoff_stamps = inspection_mode = None
-    handoff_directories = {}
+    if seed['kind'] not in ['empty', 'backup', 'slot', 'restored'] or metadata['mode'] in ['incomplete', 'refused', 'restaging']:
+        raise ValueError('Slot creation did not complete: ' + seed.get('reason', 'incomplete seed'))
+    manifest = bundle_check(p, metadata)
     metadata.pop('start_path_inspection', None)
 
     def checked_database():
         database = contained(p['data'] / 'checklist.sqlite', p['folder'])
-        for suffix in ('-wal', '-shm', '-journal'):
+        for suffix in SQLITE_COMPANIONS:
             contained(database.with_name(database.name + suffix), p['folder'])
         return database
 
-    def scan_seed(database):
+    def scan_seed(database, proof=None):
         inspection = require_local_paths(database, p['data'], immutable=False, source_root=seed.get('source_root'),
-                                         summary_source_root=summary_source_root, summary_source_paths=seed.get('source_summary_paths', {}))
+                                         summary_source_root=summary_source_root,
+                                         summary_source_paths=seed.get('source_summary_paths', {}), proof=proof)
         require_receipt_path_support(stage, manifest, inspection)
 
-    def validate_seed_handoff():
-        nonlocal handoff_stamps, handoff_directories, inspection_mode
-        if handoff_stamps is None:
-            return
+    def full_startup_inspection():
         database = checked_database()
-        observed = seed_store_files(database, allow_journal=True)
-        if observed == handoff_stamps and not registered and seed_directories_match(p['data'], handoff_directories):
-            return
-        if inspection_mode == 'full':
-            raise ValueError('Seed database, WAL or journal changed after startup path inspection.')
-        resume_phase = timing.current
-        timing.start('seed_path_reinspection')
-        scan_seed(database)
-        timing.start(resume_phase)
-        if seed_store_files(checked_database(), allow_journal=True) != observed:
+        before = seed_store_files(database, allow_journal=True)
+        proof = {}
+        scan_seed(database, proof)
+        if not proof:
+            raise ValueError('Cannot bind all inspected slot paths to startup.')
+        files = seed_store_files(database, hash_bytes=True, allow_journal=True, include_shm=True)
+        after = seed_file_stamps(files)
+        if any(after[suffix] != entry for suffix, entry in before.items()):
             raise ValueError('Seed database, WAL or journal changed during startup path inspection.')
-        inspection_mode = 'full'
-        handoff_stamps = observed
-        handoff_directories = {}
+        observed = inspect_startup_paths(p['data'], proof)
+        return files, observed
 
-    if seed['kind'] != 'empty':
+    def handoff_matches():
+        try:
+            database = checked_database()
+            if receipt is None:
+                return all(not os.path.lexists(database.with_name(database.name + suffix))
+                           for suffix in ('', *SQLITE_COMPANIONS))
+            files, observed = receipt
+            return (observed.matches()
+                    and seed_store_files(database, allow_journal=True, include_shm=True) == seed_file_stamps(files))
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def save_launch_mode():
+        metadata['first_start_pending'] = False
+        metadata['allow_synthetic_relays'] = allow_synthetic_relays
+        metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'
+        save(p, metadata)
+
+    def withdraw_job():
+        run(['launchctl', 'bootout', f'gui/{os.getuid()}/{p["label"]}'])
+        metadata.update(mode='stopped', allow_synthetic_relays=configured_relays, first_start_pending=first_start)
+        save(p, metadata)
+
+    # Reject aliased launch files and unsupported managed paths before
+    # asking launchd about this slot.
+    logs = contained(p['folder'] / 'logs', p['folder'])
+    plist = contained(p['folder'] / 'service.plist', p['folder'])
+    stdout = contained(logs / 'service.stdout.log', p['folder'])
+    stderr = contained(logs / 'service.stderr.log', p['folder'])
+    needs_inspection = seed['kind'] != 'empty' or checked_database().exists()
+    if needs_inspection:
         stage = Path(metadata['stage_path'])
         require_managed_path_support(stage, manifest)
+    state = launch_state(p)
+    registered = state['registered']
+    if registered and allow_synthetic_relays != configured_relays:
+        raise ValueError('Stop this slot before changing --allow-synthetic-relays; the registered service keeps its current relay policy.')
+    if registered and not state.get('pid', True):
+        raise ValueError('Stop the inactive slot before starting it with a fresh inspection receipt.')
+
+    inspection_mode = receipt = None
+    if needs_inspection:
+        database = checked_database()
         # Recorded paths only; a restored seed made before CL-276 r1 has no live_snapshot field.
         source_summaries = (seed['kind'] == 'backup' and seed.get('live_snapshot')) or (
             seed['kind'] == 'restored' and seed.get('source_manifest') is not None
             and is_live_snapshot(Path(seed['source_manifest']).parent, seed.get('source_root')))
         summary_source_root = seed.get('source_root') if source_summaries else None
         timing.start('seed_path_preflight')
-        database = checked_database()
-        reusable = reusable_seed_inspection(p, metadata, summary_source_root)
-        if reusable is None:
+        inspection_mode = 'full'
+        if registered:
             scan_seed(database)
-            inspection_mode = 'full'
         else:
-            handoff_stamps, handoff_directories = reusable
-            require_receipt_path_support(stage, manifest, seed['path_inspection'])
-            inspection_mode = 'reused'
-    logs = contained(p['folder'] / 'logs', p['folder']); logs.mkdir(mode=0o700, exist_ok=True)
-    plist = contained(p['folder'] / 'service.plist', p['folder'])
+            if SLOT_START_SOURCE not in {entry['path'] for entry in manifest.get('inputs', [])}:
+                raise ValueError('Stage predates the test-slot startup inspection receipt; rebuild and recreate or restage the slot.')
+            receipt = reusable_seed_inspection(p, metadata, summary_source_root)
+            if receipt is None:
+                receipt = full_startup_inspection()
+            else:
+                require_receipt_path_support(stage, manifest, seed['path_inspection'])
+                inspection_mode = 'reused'
+
+    logs.mkdir(mode=0o700, exist_ok=True)
+    launch_environment = {'CHECKLIST_SLOT_RELAYS': 'synthetic' if allow_synthetic_relays else 'off'}
     contents = {'Label': p['label'], 'MachServices': {p['label']: True},
                 'Program': str(p['bundle'] / 'Contents/MacOS/ChecklistService'), 'ProcessType': 'Interactive',
-                'RunAtLoad': False, 'KeepAlive': False,
-                'EnvironmentVariables': {'CHECKLIST_SLOT_RELAYS': 'synthetic' if allow_synthetic_relays else 'off'},
-                'StandardOutPath': str(logs / 'service.stdout.log'), 'StandardErrorPath': str(logs / 'service.stderr.log')}
-    for key in ['StandardOutPath', 'StandardErrorPath']: contained(contents[key], p['folder'])
+                'RunAtLoad': False, 'KeepAlive': False, 'EnvironmentVariables': launch_environment,
+                'StandardOutPath': str(stdout), 'StandardErrorPath': str(stderr)}
     timing.start('service_registration')
-    registered = launch_state(p)['registered']
-    if registered and allow_synthetic_relays != configured_relays:
-        raise ValueError('Stop this slot before changing --allow-synthetic-relays; the registered service keeps its current relay policy.')
     first_start = metadata.get('first_start_pending') is True and not registered
     load_start = host_load()
     launch_started = time.monotonic()
-    metadata['first_start_pending'] = False
     metadata['startup_attempted_at'] = now()
     save(p, metadata)
-    if not registered:
-        plist.write_bytes(plistlib.dumps(contents))
-        validate_seed_handoff()
-        run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
-    metadata['allow_synthetic_relays'] = allow_synthetic_relays
-    metadata['mode'] = 'gui' if arguments.gui or processes(p)['app'] else 'headless'; save(p, metadata)
-    timing.start('launch_to_healthy')
-    try:
-        # RunAtLoad is false. The health call first activates a new job, so
-        # check again after registration and its bookkeeping.
-        validate_seed_handoff()
-    except (OSError, ValueError, sqlite3.Error):
-        if not registered:
-            result = run(['launchctl', 'bootout', f'gui/{os.getuid()}/{p["label"]}'], check=False)
-            if result.returncode == 0:
-                metadata['mode'] = 'stopped'
-                save(p, metadata)
-        raise
-    service_status(p, bound=bound)
+    receipt_digest = None
+    if registered:
+        save_launch_mode()
+        timing.start('launch_to_healthy')
+    else:
+        # One fallback covers changes before registration and at first access.
+        # A registered job pins one receipt and must be withdrawn before retry.
+        while True:
+            if receipt is not None:
+                receipt_digest = slot_start_receipt(p, *receipt)
+                launch_environment[SLOT_START_DIGEST] = receipt_digest
+            plist.write_bytes(plistlib.dumps(contents))
+            refusal = None
+            if handoff_matches():
+                run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', plist])
+                try:
+                    save_launch_mode()
+                except (OSError, ValueError):
+                    withdraw_job()
+                    raise
+                timing.start('launch_to_healthy')
+                if handoff_matches():
+                    try:
+                        if receipt_digest is None:
+                            service_status(p, bound=bound)
+                        else:
+                            service_status(p, bound=bound, receipt_digest=receipt_digest)
+                    except SlotInspectionRefused as error:
+                        refusal = error
+                    else:
+                        break
+                withdraw_job()
+            if inspection_mode != 'reused':
+                raise refusal or ValueError('Slot inspection observations changed before activation.')
+            timing.start('seed_path_reinspection')
+            receipt = full_startup_inspection()
+            inspection_mode = 'full'
+            timing.start('service_registration')
+
+    if registered:
+        service_status(p, bound=bound)
     launch_seconds = time.monotonic() - launch_started - timing.phases.get('seed_path_reinspection', 0)
     metadata['start_timing'] = timing.finish()
     if inspection_mode is not None:

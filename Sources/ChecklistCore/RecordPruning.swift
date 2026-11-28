@@ -51,8 +51,8 @@ enum SealedCursor {
     }
 }
 
-/// CL-72: routine records have a retention period. Each pass is bounded and runs in its
-/// own short transaction after a command (at most every ten minutes) and at startup.
+/// CL-72: routine records have a retention period. The service schedules the
+/// individual reader preparations and writer steps on its maintenance lane.
 /// - Cursor rows: issued before sealed cursors; refused after 24 hours, deleted after that.
 /// - Command results: kept 30 days for command_id replay. After that the result is
 ///   replaced by a tombstone; principal, command ID and digest stay, so a late retry is
@@ -68,88 +68,44 @@ extension CommandRouter {
     static let commandMarkInterval: TimeInterval = 3_600
     static let routinePruneInterval: TimeInterval = 600
     static let pruneBatch = 500
-    /// Cursor rows are deleted by rowid with no JSON work, so a larger batch stays short.
-    static let cursorPruneBatch = 20_000
+    static let cursorPruneBatch = 1_000
     static let prunedResult = "{\"pruned\":true,\"retention_days\":30}"
-    /// Routine pruning runs on the writer inside a command's storage gate, so every other
-    /// command waits while it runs. Each prune step is one short transaction that SQLite
-    /// stops and rolls back at this limit; the step runs again at the next pass.
-    static let routinePruneStepBudget: TimeInterval = 0.5
+    static let routinePruneStepBudget: TimeInterval = 0.2
 
     /// `budgetStops` counts steps that SQLite stopped at the time limit (no change kept).
     struct PruneCounts: Equatable { var cursors = 0, commandResults = 0, cleanupPreviews = 0, attachmentReadResults = 0, budgetStops = 0 }
-
-    /// Runs when the interval passed; returns nil when it did not run.
-    func pruneRoutineRecordsIfDue(_ db: Database, now: Date = Date()) -> PruneCounts? {
-        if let last = lastRoutinePrune, now.timeIntervalSince(last) < Self.routinePruneInterval { return nil }
-        lastRoutinePrune = now
-        return try? pruneRoutineRecords(db, now: now)
-    }
 
     /// Old command results that pruning may replace with the tombstone. A result stays when
     /// it carries a policy or a connection registration, when a storage job names its command
     /// as parent, or when any storage job has unreadable data (then nothing is pruned).
     ///
-    /// The protected (command, principal) pairs are one uncorrelated subquery, so SQLite reads
-    /// each storage job once per statement. The earlier correlated form read every storage job
-    /// again for each candidate command: 500 candidates and 23,637 jobs held the writer and the
-    /// command queue for minutes on 21 Nov 2026. `testCommandResultPruneMatchesTheCorrelatedForm`
-    /// keeps both forms equal.
+    /// Materialize each job once. SQLite can probe a single non-null key in the
+    /// membership list without the fallback scans of a row-value NOT IN.
     static let prunableCommandResultsSQL = """
+        WITH job_parents AS MATERIALIZED (
+          SELECT \(pruneJobParentSQL("r")) AS parent
+          FROM records r INDEXED BY records_scope WHERE r.type='storage_job'
+        )
         SELECT c.rowid FROM commands c WHERE c.rowid <= ? AND c.result <> ?
           AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.policy') IS NULL AND json_type(c.result,'$._connection_registration') IS NULL ELSE 0 END
           AND COALESCE(CASE WHEN json_valid(c.result) THEN
               CASE WHEN json_type(c.result,'$.pruned')='true' THEN json_extract(c.result,'$.\(MediaRoundDeletionHistory.projectionProgressField)') END END,'')
               NOT IN (SELECT key FROM metadata WHERE key GLOB '\(MediaRoundDeletionHistory.progressPrefix)*')
-          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.type='storage_job' AND CASE WHEN json_valid(r.data) THEN 0 ELSE 1 END)
-          AND (c.command_id,c.principal) NOT IN (SELECT json_extract(r.data,'$.parent_command_id'),json_extract(r.data,'$.parent_principal') FROM records r
-               WHERE r.type='storage_job' AND json_valid(r.data)
-                 AND json_extract(r.data,'$.parent_command_id') IS NOT NULL AND json_extract(r.data,'$.parent_principal') IS NOT NULL)
+          AND NOT EXISTS (SELECT 1 FROM job_parents WHERE parent IS NULL)
+          AND json_array(c.command_id,c.principal) NOT IN (SELECT parent FROM job_parents WHERE parent IS NOT NULL)
           ORDER BY c.rowid
         """
 
-    @discardableResult
-    func pruneRoutineRecords(_ db: Database, now: Date = Date(), stepBudget: TimeInterval = CommandRouter.routinePruneStepBudget) throws -> PruneCounts {
-        guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Prune records after the semantic transaction commits.") }
-        var counts = PruneCounts()
-        let time = now.timeIntervalSince1970
-        /// One step: one transaction under the time limit. A stopped step keeps no change.
-        func step(_ body: () throws -> Int) throws -> Int {
-            let changed: Int? = try Self.withPruneStepBudget(db, seconds: stepBudget) {
-                var count = 0
-                try db.inTransaction { count = try body(); return .commit }
-                return count
-            }
-            if changed == nil { counts.budgetStops += 1 }
-            return changed ?? 0
-        }
-        counts.cursors = try step {
-            try db.execute(sql: "DELETE FROM cursors WHERE rowid IN (SELECT rowid FROM cursors WHERE created_at < ? LIMIT ?)", arguments: [time - Self.cursorRowRetention, Self.cursorPruneBatch])
-            return db.changesCount
-        }
-        // The retention mark is its own short write, so a stopped prune step never loses it.
-        var cutoff: Int64?
-        try db.inTransaction { cutoff = try commandRetentionCutoff(db, now: time); return .commit }
-        if let cutoff {
-            counts.commandResults = try step {
-                try db.execute(sql: "UPDATE commands SET result=? WHERE rowid IN (\(Self.prunableCommandResultsSQL) LIMIT ?)",
-                               arguments: [Self.prunedResult, cutoff, Self.prunedResult, Self.pruneBatch])
-                return db.changesCount
-            }
-        }
-        counts.cleanupPreviews = try step {
-            let cutoff = StoredClock.shared.string(from: now.addingTimeInterval(-Self.cleanupPreviewRetention))
-            try db.execute(sql: """
-                DELETE FROM records WHERE rowid IN (SELECT p.rowid FROM records p LEFT JOIN records t ON t.type='task' AND t.id=CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.task_id') END
-                  WHERE p.type='cleanup_preview' AND json_valid(p.data)
-                  AND (t.id IS NULL OR json_extract(p.data,'$.task_revision') <> CASE WHEN json_valid(t.data) THEN json_extract(t.data,'$.revision') END
-                       OR COALESCE(json_extract(p.data,'$.created_at'),'9999') < ?)
-                  LIMIT ?)
-                """, arguments: [cutoff, Self.pruneBatch])
-            return db.changesCount
-        }
-        counts.attachmentReadResults = try step { try pruneAttachmentReadResults(db) }
-        return counts
+    static func pruneJobParentSQL(_ alias: String) -> String {
+        """
+        CASE WHEN json_valid(\(alias).data) THEN
+          CASE WHEN json_extract(\(alias).data,'$.parent_command_id') IS NOT NULL
+                 AND json_extract(\(alias).data,'$.parent_principal') IS NOT NULL
+            THEN json_array(CAST(json_extract(\(alias).data,'$.parent_command_id') AS TEXT) || '',
+                            CAST(json_extract(\(alias).data,'$.parent_principal') AS TEXT) || '')
+            ELSE '' END
+        END
+        """
     }
 
     /// Runs `body` while SQLite stops any statement that runs past `seconds`; returns nil when
@@ -171,10 +127,10 @@ extension CommandRouter {
     /// The commands table has no timestamp. Each pass records (time, highest rowid) at most
     /// hourly in `metadata`; a row at or below the newest mark older than the retention
     /// period is older than that period.
-    func commandRetentionCutoff(_ db: Database, now: TimeInterval) throws -> Int64? {
-        var marks: [[Double]] = []
-        if let raw = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'"),
-           let decoded = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [[Double]] { marks = decoded.filter { $0.count == 2 && $0[0].isFinite && $0[1] >= 0 } }
+    func commandRetentionCutoff(_ db: Database, now: TimeInterval, refresh: Bool = true) throws -> Int64? {
+        let raw = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'")
+        var marks = Self.decodeCommandRetentionMarks(raw)
+        if !refresh { return marks.last { now - $0[0] >= Self.commandResultRetention }.map { Int64($0[1]) } }
         if marks.last.map({ now - $0[0] >= Self.commandMarkInterval }) ?? true {
             let top = try Int64.fetchOne(db, sql: "SELECT COALESCE(MAX(rowid),0) FROM commands") ?? 0
             marks.append([now, Double(top)])
@@ -182,8 +138,16 @@ extension CommandRouter {
         let expired = marks.filter { now - $0[0] >= Self.commandResultRetention }
         // Keep the newest expired mark (the cutoff) and every newer mark.
         marks = Array(marks.drop { mark in now - mark[0] >= Self.commandResultRetention && mark != expired.last })
-        try db.execute(sql: "INSERT OR REPLACE INTO metadata(key,value) VALUES ('command_retention_marks',?)", arguments: [try jsonString(marks)])
+        let encoded = try jsonString(marks)
+        if encoded != raw {
+            try db.execute(sql: "INSERT OR REPLACE INTO metadata(key,value) VALUES ('command_retention_marks',?)", arguments: [encoded])
+        }
         return expired.last.map { Int64($0[1]) }
+    }
+
+    private static func decodeCommandRetentionMarks(_ raw: String?) -> [[Double]] {
+        guard let raw, let marks = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [[Double]] else { return [] }
+        return marks.filter { $0.count == 2 && $0[0].isFinite && $0[1] >= 0 && $0[1] < Double(Int64.max) && $0[1].rounded(.down) == $0[1] }
     }
 
     static func isPrunedResult(_ result: JSON) -> Bool { result["pruned"] as? Bool == true && result["data"] == nil }

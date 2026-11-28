@@ -52,13 +52,17 @@ final class BackupRetentionAnswerTests: XCTestCase {
         // A worker reads the deferral: this Trash is a file, so the owned folder fails.
         let blocked = f.workspace.appendingPathComponent("not-a-folder")
         try Data().write(to:blocked);f.router!.automaticBackupRetentionTrashRoot = blocked
-        for name in ["a","b","c"] {_ = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-" + name).path])}
+        for name in ["a","b","c"] {
+            _ = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-" + name).path])
+            try f.router!.runStorageMaintenance()
+        }
         let deferred = try f.call("backup_retention_status",["project_id":project["id"]!],caller:c)["data"] as! JSON
         let last = try XCTUnwrap(deferred["last_result"] as? JSON)
         XCTAssertEqual(deferred["newest_count"] as? Int,3);XCTAssertEqual(deferred["daily_days"] as? Int,3);XCTAssertEqual(deferred["rule_source"] as? String,"owner_answer")
         XCTAssertEqual(last["status"] as? String,"deferred");XCTAssertEqual(deferred["last_error"] as? String,"BACKUP_PRUNE_IO");XCTAssertEqual(last["posix_errno"] as? Int,Int(ENOTDIR))
         f.router!.automaticBackupRetentionTrashRoot = f.workspace
         _ = try f.call("backup_create",["path":f.root.appendingPathComponent("backups/snapshot-d").path])
+        try f.router!.runStorageMaintenance()
         let done = try f.call("backup_retention_status",["project_id":project["id"]!],caller:c)["data"] as! JSON
         XCTAssertEqual((done["last_result"] as? JSON)?["status"] as? String,"complete");XCTAssertEqual(done["moved_count"] as? Int,2);XCTAssertTrue(done["last_error"] is NSNull)
         // _checklist is the generic envelope that gives this caller its own pending answers.
@@ -187,6 +191,8 @@ final class BackupRetentionAnswerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath:old["path"] as! String))
         let latest = try snapshot(f,"new")
         XCTAssertEqual(latest["status"] as? String,"complete")
+        XCTAssertTrue(FileManager.default.fileExists(atPath:old["path"] as! String),"Backup completes before background retention.")
+        try f.router!.runStorageMaintenance()
         XCTAssertFalse(FileManager.default.fileExists(atPath:old["path"] as! String))
         XCTAssertTrue(FileManager.default.fileExists(atPath:pinned["path"] as! String))
         XCTAssertTrue(FileManager.default.fileExists(atPath:latest["path"] as! String))

@@ -1,0 +1,11 @@
+{
+  "command_id": "00000000-0000-0000-0000-000000000514",
+  "error_code": "BACKUP_CAPACITY_EXCEEDED",
+  "failed_at": "2026-01-01T15:00:00Z",
+  "reason": "snapshot_free_space",
+  "next_step": "Free space on the backup volume, then retry with a new command ID.",
+  "measured_bytes": 3758096384,
+  "measured_objects": 8250,
+  "required_free_bytes": 4831838208,
+  "available_bytes": 4294967296
+}

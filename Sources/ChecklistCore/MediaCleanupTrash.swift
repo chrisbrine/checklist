@@ -70,9 +70,13 @@ extension CommandRouter {
     /// The durable deletion receipt names its exact same-volume Trash entry
     /// before the existing executor can move bytes. A restart reuses that name.
     /// The optional root is an internal owned-fixture seam, never client input.
-    func prepareMediaCleanupTrash(_ db: Database,receipt original: JSON,page: TicketBytePageExecution? = nil) throws -> JSON {
+    func prepareMediaCleanupTrash(_ db: Database,receipt original: JSON,page: TicketBytePageExecution? = nil,check: () throws -> Void = {}) throws -> JSON {
         var receipt = original,objects = receipt["objects"] as? [JSON] ?? []
-        guard objects.contains(where:{$0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"}) else {return receipt}
+        let pendingTrash = try objects.contains {
+            try check()
+            return $0["disposal"] as? String == "trash" && $0["state"] as? String == "pending"
+        }
+        guard pendingTrash else {return receipt}
         if let reason = mediaCleanupTrashBindingFailure(receipt,allowUnboundPageTargets:page != nil && !bool(receipt,"descriptor_legacy_trash_binding")) {throw CoreError("CLEANUP_TRASH_INVALID","The retained Trash intent has no current instance authority; originals retained.",details:["reason":reason])}
         let id = try StoredRecord(receipt,family:"storage_job").string("id")
         let folderName = "Checklist-media-" + hash(Data((incarnation + ":" + id).utf8))
@@ -91,6 +95,7 @@ extension CommandRouter {
         } else {
             let trash = try ticketCleanupTrashRoot ?? FileManager.default.url(for:.trashDirectory,in:.userDomainMask,appropriateFor:root,create:true)
             directory = trash.appendingPathComponent(folderName,isDirectory:true)
+            try check()
             let created = mkdir(directory.path,0o700) == 0
             if !created && errno != EEXIST {throw CoreError("CLEANUP_TRASH_UNAVAILABLE","The owned Trash folder could not be created; originals retained.",details:["posix_errno":errno])}
             if !created,let existing = try? StorageObjectFiles(root:directory,folderAccess:.insideTrash),
@@ -102,6 +107,7 @@ extension CommandRouter {
                     // deterministic folder. Retain it and create a new exclusive
                     // container; no bytes can have moved before intent commit.
                     directory = trash.appendingPathComponent(folderName + "-" + uuid(),isDirectory:true)
+                    try check()
                     guard mkdir(directory.path,0o700) == 0 else {throw CoreError("CLEANUP_TRASH_UNAVAILABLE","A fresh owned Trash folder could not be created; originals retained.",details:["posix_errno":errno])}
                 }
                 files = try StorageObjectFiles(root:directory,folderAccess:.insideTrash)
@@ -111,18 +117,22 @@ extension CommandRouter {
         var info = stat(),source = stat()
         guard fstat(files.descriptor,&info) == 0,fstatat(AT_FDCWD,root.path,&source,AT_SYMLINK_NOFOLLOW) == 0,info.st_dev == source.st_dev else {throw CoreError("CLEANUP_TRASH_UNAVAILABLE","Cleanup requires a same-volume Trash destination; originals retained.")}
         var changed = receipt["media_trash_directory"] == nil
-        for index in objects.indices where objects[index]["disposal"] as? String == "trash" {
+        for index in objects.indices {
+            try check()
+            guard objects[index]["disposal"] as? String == "trash" else {continue}
             guard let path = objects[index]["relative_path"] as? String,path.hasPrefix("objects/"),objects[index]["kind"] as? String == "file" else {throw CoreError("CLEANUP_TRASH_INVALID","Only exact regular managed media entries can move to Trash.")}
             let target = directory.appendingPathComponent(hash(Data(path.utf8)) + "-" + URL(fileURLWithPath:path).lastPathComponent).path
             if let previous = objects[index]["trash_path"] as? String {guard previous == target else {throw CoreError("CLEANUP_TRASH_INVALID","The retained Trash destination changed; originals retained.")}}
             else {objects[index]["trash_path"] = target;changed = true}
         }
         if changed {
+            try check()
             receipt["media_trash_directory"] = directory.path;receipt["media_trash_source_root"] = root.path
             receipt["objects"] = objects;receipt = revised(receipt)
             try withValidatedDomainTransaction(db) {
                 if let page {receipt = try self.saveTicketBytePage(db,receipt:receipt,execution:page)}
                 else {try self.save(db,receipt,type:"storage_job")}
+                try check()
                 return .commit
             }
         }

@@ -16,7 +16,8 @@ extension CommandRouter {
         // CL-427: link the ticket that owns the takes; sending owner decisions stays owner only.
         "media_round_link_task", "media_item_link_task", "media_round_send_result", "media_round_delete"
     ])
-    func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller) throws -> JSON {
+    func executeMediaOwnerChannel(method: String, params p: JSON, caller c: Caller,
+                                  observeStoragePhase: ((String,TimeInterval) -> Void)? = nil) throws -> JSON {
         try owner(c)
         guard Self.mediaOwnerMethods.contains(method) else { throw CoreError("UNSUPPORTED_METHOD", "This media capability is not available in the native owner slice.") }
         let projections: [String: Set<String>] = [
@@ -71,7 +72,7 @@ extension CommandRouter {
                 return try self.mediaOwnerItem(db,round:round,itemID:text(p,"item_id"),caller:c)
             }
         }
-        return try executeMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:true)
+        return try executeMediaCommand(method:method,params:p,caller:c,nativeOwnerProjection:true,observeStoragePhase:observeStoragePhase)
     }
     private func mediaOwnerRecords(_ db: Database,project: String,family: String,predicate: String,arguments: StatementArguments,limit: Int,offset: Int = 0) throws -> [JSON] {
         var args: StatementArguments = [project,family]; args += arguments; args += [limit,offset]

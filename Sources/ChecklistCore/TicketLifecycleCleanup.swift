@@ -389,12 +389,12 @@ extension CommandRouter {
         return nil
     }
 
-    func ticketCleanupDeletionReferences(_ db: Database,receipt: JSON,inventory: TicketCleanupInventory? = nil) throws -> [JSON] {
-        let graph = try inventory.map {$0.rows.map {row -> JSON in var value = row.value;value["record_type"] = row.type;return value}} ?? archiveCleanupReferenceRows(db)
+    func ticketCleanupDeletionReferences(_ db: Database,receipt: JSON,inventory: TicketCleanupInventory) throws -> [JSON] {
+        let graph = inventory.rows.map {row -> JSON in var value = row.value;value["record_type"] = row.type;return value}
         guard receipt["cause"] as? String == "done_evidence" else {return graph}
         let fingerprints = receipt["owned_record_fingerprints"] as? [String:String] ?? [:]
         let owners = Set(fingerprints.keys.map {Data($0.utf8)})
-        let protected = try ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != receipt["task_id"] as? String},owners:owners,tokens:inventory?.tokens)
+        let protected = try ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != receipt["task_id"] as? String},owners:owners,tokens:inventory.tokens)
         return try graph.filter {value in
             // Retained historical owners do not keep their own bytes alive. Holds
             // and every newly admitted/foreign reference still win at final unlink.

@@ -222,7 +222,7 @@ extension CommandRouter {
         data:["attempt_id":(try StoredRecord(a, family: "WorkAuthority").requiredValue("id"))]);
         a.removeValue(forKey:"token_hash");a["claim_token"] = token;let task = try scoped(db,
         (try StoredRecord(a, family: "WorkAuthority").string("task_id")),pid,
-        type:"task");a["context"] = try compactTaskContext(db,task:task,caller:c);
+        type:"task");a["context"] = try withTaskRecordSelection(db,tasks:[task]) {try compactTaskContext(db,task:task,caller:c)};
         a["direction_cursor"] = (a["context"] as? JSON)?["direction_cursor"];
         if !isChild && a["parent_attempt_id"] == nil { a = try addingClaimTriageMembership(db,reply:a,task:task,caller:c) }
         return a

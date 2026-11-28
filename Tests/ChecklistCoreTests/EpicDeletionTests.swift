@@ -29,13 +29,12 @@ extension CoreTests {
                 var keys = Set(try Int64.fetchAll(db,sql:"SELECT rowid FROM records WHERE id=?",arguments:[gid]).map {"records:\($0)"})
                 keys.formUnion(try Int64.fetchAll(db,sql:"SELECT seq FROM events WHERE entity_id=?",arguments:[gid]).map {"events:\($0)"});return keys
             }
-            // Make unrelated pruning due: neither deletion nor retry may run it.
+            // Retain expired rows: neither deletion nor retry may prune them.
             try router.dbQueue.writeWithoutTransaction { db in try router.withValidatedDomainTransaction(db) {
                 try router.save(db,["id":uuid(),"project_id":pid,"revision":1,"task_id":"missing-ticket","task_revision":1,"created_at":"2000-01-01T00:00:00Z"],type:"cleanup_preview")
                 try db.execute(sql:"INSERT INTO cursors(token,principal,scope,sequence,incarnation,created_at) VALUES (?,?,?,?,?,0)",arguments:[uuid(),"legacy","scope",0,router.incarnation])
                 return .commit
             } }
-            router.lastRoutinePrune = nil
             let before = try deletionFingerprint(excluding:removed)
             let sequence = try router.dbQueue.read { try Int64.fetchOne($0,sql:"SELECT seq FROM sqlite_sequence WHERE name='events'")! }
             let input: JSON = ["project_id":pid,"epic_id":gid,"expected_revision":epic["revision"]!]
@@ -55,7 +54,6 @@ extension CoreTests {
             }
             XCTAssertEqual(try deletionFingerprint(excluding:added),before,"Every other stored row must retain its exact bytes and rowid")
             let after = try deletionFingerprint()
-            router.lastRoutinePrune = nil
             XCTAssertEqual(try call("epic_delete",input,agent,command)["epic_id"] as? String,gid)
             XCTAssertEqual(try deletionFingerprint(),after,"A lost-reply retry must not add another event")
         }

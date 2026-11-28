@@ -584,6 +584,84 @@ extension CommandRouter {
         return true
     }
 
+    func managedImportsNeedMaintenance(_ db: Database) throws -> Bool {
+        try Bool.fetchOne(db,sql:"""
+            SELECT EXISTS(SELECT 1 FROM records INDEXED BY records_scope WHERE type='storage_job'
+            AND CASE WHEN json_valid(data) THEN
+              json_extract(data,'$.kind')='attachment_import' AND (\(MediaRoundDeletionImportRecovery.needsReceiptSQL("data")))
+            ELSE 0 END AND \(MediaRoundDeletionGraph.visibleSQL("records")))
+            """) == true
+    }
+
+    private struct ImportFileObservation {
+        let identity: FileIdentity?
+        let verified: Bool
+    }
+
+    /// Durable selection and file hashing happen before each short gated turn.
+    func runManagedAttachmentImportMaintenance() throws -> StorageMaintenanceWarning? {
+        guard let readers,let after = try withMaintenanceWriter(label:"attachment_import.cursor",{_,_ in
+            self.managedImportMaintenanceAfterRow
+        }) else {throw MaintenanceStepDeferred()}
+        let rows = try readers.read {db in
+            try self.fetchStoreRows(db,sql:"""
+                SELECT rowid AS maintenance_position,\(Self.canonicalRecordColumns) FROM records INDEXED BY records_scope
+                WHERE type='storage_job' AND rowid>? AND CASE WHEN json_valid(data) THEN
+                  json_extract(data,'$.kind')='attachment_import' AND (\(MediaRoundDeletionImportRecovery.needsReceiptSQL("data")))
+                ELSE 0 END AND \(MediaRoundDeletionGraph.visibleSQL("records")) ORDER BY rowid LIMIT 8
+                """,arguments:[after])
+        }
+        if rows.isEmpty {
+            _ = try withMaintenanceWriter(label:"attachment_import.cursor") {_,_ in
+                self.managedImportMaintenanceAfterRow = 0
+                return true
+            }
+            return nil
+        }
+        var warning: StorageMaintenanceWarning?
+        for row in rows {
+            let observed = Result {try observeManagedAttachmentImportFiles(row)}
+            let admitted = try withMaintenanceGateAndWriter(label:"attachment_import.recovery") {db,_,deadline in
+                guard try !StorageSnapshotRetention.isActive(root:self.root) else {throw MaintenanceStepDeferred()}
+                let position: Int64 = row["maintenance_position"]
+                defer {self.managedImportMaintenanceAfterRow = position}
+                let original: Data = row["_envelope_data_bytes"]
+                let id: Data = row["_envelope_id_bytes"]
+                let current = try Data.fetchOne(db,sql:"SELECT CAST(data AS BLOB) FROM records WHERE rowid=? AND id=CAST(? AS TEXT) AND type='storage_job'",arguments:[position,id])
+                guard original == current else {return true}
+                defer {self.commandOperations.mediaImportWaits.refresh(failures:self.managedImportRecoveryFailures)}
+                for retry in self.commandOperations.mediaImportWaits.takeRetries() {self.managedImportRecoveryFailures.removeValue(forKey:retry)}
+                if let issue = try self.reconcileManagedAttachmentImportRow(db,row:row,observation:observed,deadline:deadline) {
+                    if issue == .suspended || warning == nil {warning = issue}
+                }
+                return true
+            }
+            guard admitted == true else {throw MaintenanceStepDeferred()}
+        }
+        return warning
+    }
+
+    private func observeManagedAttachmentImportFiles(_ row: Row) throws -> [String:ImportFileObservation] {
+        let job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
+        let objects = try managedImportObjects(job)
+        let end = ProcessInfo.processInfo.systemUptime + 60
+        var observations: [String:ImportFileObservation] = [:]
+        for object in objects {
+            let path = try StoredRecord(object,family:"ManagedAttachmentImport").string("final")
+            let identity = try? managedIdentity(path)
+            let verified: Bool
+            do {
+                verified = try TicketObjectRemovalVerification(root:root,relative:path,sha256:object["sha256"] as? String,size:Int64(int(object,"size")),check:{
+                    guard ProcessInfo.processInfo.systemUptime < end else {throw MaintenanceStepDeferred()}
+                }) != nil
+            } catch is MaintenanceStepDeferred {throw MaintenanceStepDeferred()}
+            catch {verified = false}
+            guard identity == (try? managedIdentity(path)) else {throw MaintenanceStepDeferred()}
+            observations[path] = .init(identity:identity,verified:verified)
+        }
+        return observations
+    }
+
     /// Bounded metadata recovery; never publishes a pending attachment or deletes
     /// a finalized original. Referenced objects and uncertain jobs are retained.
     func reconcileManagedAttachmentImports(_ db: Database) throws -> StorageMaintenanceWarning? {
@@ -591,33 +669,42 @@ extension CommandRouter {
         for id in commandOperations.mediaImportWaits.takeRetries() {managedImportRecoveryFailures.removeValue(forKey:id)}
         guard try ensureManagedImportRecoveryIndex(db) else {return nil}
         let rows = try self.fetchStoreRows(db,sql:"SELECT r.rowid AS maintenance_position," + Self.canonicalColumns(alias:"r") + " FROM temp.checklist_import_recovery i CROSS JOIN main.records r ON r.rowid=i.record_rowid AND CAST(r.id AS BLOB)=i.source_id WHERE i.record_rowid>? AND r.type='storage_job' AND " + MediaRoundDeletionGraph.visibleSQL("r") + " ORDER BY i.record_rowid LIMIT 32",arguments:[managedImportMaintenanceAfterRow])
-        managedImportMaintenanceAfterRow = rows.count == 32 ? (rows.last!["maintenance_position"] as Int64) : 0
         var warning: StorageMaintenanceWarning?
         for row in rows {
-            let key: Data = row["_envelope_id_bytes"] ?? Data()
-            if managedImportRecoveryFailures[key,default:0] >= 2 { warning = .suspended; continue }
-            do {
-                let job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
-                // An unrelated note can reach this maintenance tail. Settling a
-                // media import changes its round-owned job and staging bytes;
-                // defer that housekeeping while a deletion snapshot is pinned.
-                // The final deletion fence still rejects every domain change.
-                if job["kind"] as? String == "attachment_import",job["attachment_owner_id"] is String,
-                   let project = job["project_id"] as? String,self.mediaRoundDeletionPreparations[Data(project.utf8)] != nil {
-                    warning = warning ?? .retryPending;continue
-                }
-                try reconcileManagedAttachmentImport(db,job:job)
-                managedImportRecoveryFailures.removeValue(forKey:key)
-            } catch {
-                let failures = min(managedImportRecoveryFailures[key,default:0] + 1,2)
-                managedImportRecoveryFailures[key] = failures
-                if failures == 2 { warning = .suspended }
-                else if warning == nil { warning = .retryPending }
+            let position: Int64 = row["maintenance_position"]
+            defer {managedImportMaintenanceAfterRow = position}
+            if let issue = try reconcileManagedAttachmentImportRow(db,row:row) {
+                if issue == .suspended || warning == nil {warning = issue}
             }
         }
+        if rows.count < 32 {managedImportMaintenanceAfterRow = 0}
         return warning
     }
-    private func reconcileManagedAttachmentImport(_ db: Database,job initial: JSON) throws {
+    private func reconcileManagedAttachmentImportRow(_ db: Database,row: Row,observation: Result<[String:ImportFileObservation],Error>? = nil,
+                                                     deadline: MaintenanceDeadline? = nil) throws -> StorageMaintenanceWarning? {
+        try deadline?.check()
+        let key: Data = row["_envelope_id_bytes"] ?? Data()
+        if managedImportRecoveryFailures[key,default:0] >= 2 {return .suspended}
+        do {
+            let job = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"storage_job").object
+            // Move neither round-owned state nor staging bytes while a deletion
+            // snapshot is pinned. The final deletion fence still checks writes.
+            if job["kind"] as? String == "attachment_import",job["attachment_owner_id"] is String,
+               let project = job["project_id"] as? String,mediaRoundDeletionPreparations[Data(project.utf8)] != nil {return .retryPending}
+            try reconcileManagedAttachmentImport(db,job:job,observation:observation?.get(),deadline:deadline)
+            managedImportRecoveryFailures.removeValue(forKey:key)
+            return nil
+        } catch {
+            if error is MaintenanceStepDeferred {throw error}
+            if let databaseError = error as? DatabaseError,
+               [.SQLITE_BUSY,.SQLITE_LOCKED,.SQLITE_INTERRUPT].contains(databaseError.resultCode),deadline != nil {throw error}
+            let failures = min(managedImportRecoveryFailures[key,default:0] + 1,2)
+            managedImportRecoveryFailures[key] = failures
+            return failures == 2 ? .suspended : .retryPending
+        }
+    }
+
+    private func reconcileManagedAttachmentImport(_ db: Database,job initial: JSON,observation: [String:ImportFileObservation]?,deadline: MaintenanceDeadline?) throws {
         var job = initial
         guard job["kind"] as? String == "attachment_import" else { return }
         guard MediaRoundDeletionImportRecovery.receiptStates.contains(job["state"] as? String ?? "") else { return }
@@ -640,21 +727,38 @@ extension CommandRouter {
         guard let original = objects.first(where: {$0["representation"] as? String == "original"}) else {
             throw managedImportFailure("original_descriptor_missing")
         }
-        do { try verifyManagedImportFile(files,(try StoredRecord(original, family: "ManagedAttachmentImport").string("final")),original) }
-        catch {
-            try withValidatedDomainTransaction(db) {
-                attachment["availability"] = "unavailable"; try self.save(db,self.revised(attachment),type:"attachment")
-                job["state"] = "repair_required"; try self.saveManagedImportProgress(db,self.revised(job)); return .commit
+        func verify(_ object: JSON) throws {
+            let path = try StoredRecord(object,family:"ManagedAttachmentImport").string("final")
+            guard let observation else {_ = try verifyManagedImportFile(files,path,object);return}
+            guard let previous = observation[path],previous.identity == (try? managedIdentity(path)) else {throw MaintenanceStepDeferred()}
+            guard previous.verified else {throw managedImportFailure("object_observation_failed")}
+        }
+        let originalSettledByCleanup = ["original_cleaned","original_missing"].contains(attachment["availability"] as? String ?? "")
+        if !originalSettledByCleanup {
+            do {try verify(original)}
+            catch {
+                if error is MaintenanceStepDeferred {throw error}
+                try withValidatedDomainTransaction(db,deadline:deadline) {
+                    attachment["availability"] = "unavailable"; try self.save(db,self.revised(attachment),type:"attachment")
+                    job["state"] = "repair_required"; try self.saveManagedImportProgress(db,self.revised(job)); return .commit
+                }
+                throw managedImportFailure("committed_object_unavailable")
             }
-            throw managedImportFailure("committed_object_unavailable")
         }
         var previewUnavailable = false
         if job["preview_available"] as? Bool == true, let preview = objects.first(where: {$0["representation"] as? String == "preview"}) {
-            do { try verifyManagedImportFile(files,(try StoredRecord(preview, family: "ManagedAttachmentImport").string("final")),preview) }
-            catch { previewUnavailable = true }
+            do { try verify(preview) }
+            catch {
+                if error is MaintenanceStepDeferred {throw error}
+                previewUnavailable = true
+            }
         }
-        for object in objects { try removeManagedImportStage(db,files:files,path:(try StoredRecord(object, family: "ManagedAttachmentImport").string("stage"))) }
-        try withValidatedDomainTransaction(db) {
+        for object in objects {
+            try deadline?.check()
+            try removeManagedImportStage(db,files:files,path:(try StoredRecord(object, family: "ManagedAttachmentImport").string("stage")))
+        }
+        try deadline?.check()
+        try withValidatedDomainTransaction(db,deadline:deadline) {
             let restoreOriginal = attachment["availability"] as? String == "unavailable"
             if restoreOriginal { attachment["availability"] = "available"; attachment.removeValue(forKey:"availability_error") }
             if previewUnavailable { attachment.removeValue(forKey:"preview_path"); attachment["preview_availability"] = "unavailable"; job["preview_available"] = false }

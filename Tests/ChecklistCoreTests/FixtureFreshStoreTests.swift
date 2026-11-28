@@ -5,9 +5,8 @@ import ChecklistTestSupport
 
 /// CL-363: a disposable unit fixture states that its store is a fresh clone of a template
 /// (`CommandRouter.FixtureFreshStore`). The startup then leaves out the read-only preflight
-/// and, for a clone with no row and no managed file, the sweeps and pruning statements that
-/// can find nothing. These cases prove that the store has the rows, the files and the
-/// write-ahead log state of the complete startup, and that every other open keeps that startup.
+/// and, for a clone with no row and no managed file, startup sweeps. These
+/// cases compare rows and files through startup and background maintenance.
 final class FixtureFreshStoreTests: XCTestCase {
     private static let populated = TestStore.Template(name: "FixtureFreshStoreTests.populated") { router, workspace in
         let owner = Caller(role: "owner", installation: "fresh-store-template", projectIDs: [])
@@ -47,10 +46,11 @@ final class FixtureFreshStoreTests: XCTestCase {
     /// Counts for each record type and event kind: equal for two stores that ran the same commands.
     private func shape(_ router: CommandRouter) throws -> [String] {
         try router.dbQueue.read { db in
-            try String.fetchAll(db, sql: "SELECT 'record ' || type || ' ' || COUNT(*) FROM records GROUP BY type ORDER BY type")
+            let project = try String.fetchOne(db, sql: "SELECT id FROM records WHERE type='project'") ?? ""
+            return try String.fetchAll(db, sql: "SELECT 'record ' || type || ' ' || COUNT(*) FROM records GROUP BY type ORDER BY type")
                 + String.fetchAll(db, sql: "SELECT 'event ' || kind || ' ' || COUNT(*) FROM events GROUP BY kind ORDER BY kind")
                 + String.fetchAll(db, sql: "SELECT 'commands ' || COUNT(*) FROM commands")
-                + String.fetchAll(db, sql: "SELECT 'metadata ' || key FROM metadata ORDER BY key")
+                + String.fetchAll(db, sql: "SELECT 'metadata ' || replace(key, ':' || ?, ':project') FROM metadata ORDER BY key", arguments: [project])
         }
     }
     private func files(_ root: URL) throws -> [String] {
@@ -74,21 +74,18 @@ final class FixtureFreshStoreTests: XCTestCase {
         XCTAssertFalse(unitPhases.contains("schema.preflight"))
         XCTAssertTrue(durablePhases.contains("schema.preflight"), "A durable fixture keeps the complete startup")
         XCTAssertTrue(unitPhases.contains("sqlite.writer-open")); XCTAssertTrue(unitPhases.contains("schema.backfill"))
-        // The routine pruning interval is running in both, and both wrote the retention mark of the pass.
-        XCTAssertNotNil(unit.lastRoutinePrune); XCTAssertNotNil(durable.lastRoutinePrune)
-        for router in [unit!, durable!] {
-            XCTAssertNotNil(try router.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") })
-        }
-        // A pruning pass always writes its mark. An emptied mark shows whether a later pass ran.
+        // An emptied mark distinguishes a scheduled pass from open or command execution.
         for router in [unit!, durable!] {
             try router.dbQueue.write { try $0.execute(sql: "INSERT OR REPLACE INTO metadata(key,value) VALUES ('command_retention_marks','[]')") }
         }
         _ = try unit.handle(method: "project_create", params: ["command_id": UUID().uuidString, "name": "After open", "key_prefix": "FF"], caller: owner)
-        XCTAssertEqual(try unit.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") }, "[]", "No pass is due in the first ten minutes")
-        // A reopened fixture store is not a fresh clone: the preflight and a pruning pass run.
+        XCTAssertEqual(try unit.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") }, "[]")
+        // A reopened fixture runs storage preflight before the scheduler owns pruning.
         try unit.closeStore()
         let reopenPhases = try bootstrapPhases { unit = try TestStore.router(root: root.appendingPathComponent("unit"), durable: false) }
         XCTAssertTrue(reopenPhases.contains("schema.preflight"))
+        XCTAssertEqual(try unit.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") }, "[]")
+        try unit.pruneRoutineRecords()
         XCTAssertNotEqual(try unit.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='command_retention_marks'") }, "[]")
         let projects = try unit.handle(method: "project_list", params: [:], caller: owner)["data"] as! JSON
         XCTAssertEqual((projects["projects"] as! [JSON]).count, 1)
@@ -109,10 +106,10 @@ final class FixtureFreshStoreTests: XCTestCase {
         XCTAssertEqual(try rows(unit)["records"], []); XCTAssertEqual(try rows(unit)["events"], []); XCTAssertEqual(try rows(unit)["commands"], [])
         XCTAssertEqual(try rows(unit)["cursors"], [])
         XCTAssertEqual(try files(unit.root), try files(complete.root))
-        XCTAssertTrue(try files(unit.root).contains(".snapshot-retention.lock"), "The first maintenance pass ran")
-        // The retention mark of the pruning pass is the first frame of the write-ahead log: a
-        // pool reader has a comparable snapshot, as after the complete startup.
+        // The scheduled turn produces the same WAL observations for both variants.
         for router in [unit, complete] {
+            try router.runStorageMaintenance()
+            try router.pruneRoutineRecords()
             let reader = try XCTUnwrap(router.readers)
             XCTAssertNotNil(try reader.read { db in try router.readSnapshotCache.withSnapshot(db, caller: owner) { router.readSnapshotCache.readVersion(db) } })
         }
@@ -125,8 +122,7 @@ final class FixtureFreshStoreTests: XCTestCase {
         XCTAssertEqual(try unit.dbQueue.read { try String.fetchOne($0, sql: "SELECT value FROM metadata WHERE key='incarnation'") }, unit.incarnation)
         // An empty store has no import job, so neither startup made the recovery index of the maintenance pass.
         XCTAssertFalse(try hasImportRecoveryIndex(complete)); XCTAssertFalse(try hasImportRecoveryIndex(unit))
-        // The same commands on both. Each command ends with a storage maintenance pass: the one after
-        // the import makes the recovery index in the fresh clone as in the complete startup.
+        // Run the same commands and their separately scheduled maintenance on both stores.
         for (router, name) in [(unit, "unit"), (complete, "complete")] {
             let project = try router.handle(method: "project_create", params: ["command_id": UUID().uuidString, "name": "Same command", "key_prefix": "FF"], caller: owner)["data"] as! JSON
             let input: JSON = ["command_id": UUID().uuidString, "project_id": project["id"]!, "title": "Same ticket"]
@@ -134,8 +130,8 @@ final class FixtureFreshStoreTests: XCTestCase {
             let file = root.appendingPathComponent("evidence-" + name + ".txt"); try Data("same bytes".utf8).write(to: file)
             _ = try router.handle(method: "attachment_add", params: ["command_id": UUID().uuidString, "project_id": project["id"]!, "task_id": task["id"]!, "path": file.path], caller: owner)
             _ = try router.handle(method: "message_send", params: ["command_id": UUID().uuidString, "project_id": project["id"]!, "task_id": task["id"]!, "body": "After the import"], caller: owner)
+            try router.runStorageMaintenance()
         }
-        XCTAssertTrue(try hasImportRecoveryIndex(unit)); XCTAssertTrue(try hasImportRecoveryIndex(complete))
         XCTAssertEqual(try shape(unit), try shape(complete))
         XCTAssertEqual(try files(unit.root), try files(complete.root))
     }
@@ -149,11 +145,8 @@ final class FixtureFreshStoreTests: XCTestCase {
         let complete = try TestStore.router(root: root.appendingPathComponent("complete"), durable: true, template: Self.populated, workspace: root.appendingPathComponent("complete-workspace"))
         defer { try? unit.closeStore(); try? complete.closeStore() }
         XCTAssertFalse(phases.contains("schema.preflight"))
-        XCTAssertNotNil(unit.lastRoutinePrune)
-        // A prepared store has records and managed files: the sweeps, the first maintenance pass
-        // and the complete pruning pass run.
+        // A prepared store runs the crash-recovery sweeps.
         XCTAssertEqual(try rows(unit)["metadata"]?.count, try rows(complete)["metadata"]?.count)
-        XCTAssertTrue(try hasImportRecoveryIndex(unit)); XCTAssertTrue(try hasImportRecoveryIndex(complete))
         XCTAssertEqual(try shape(unit), try shape(complete))
         XCTAssertEqual(try files(unit.root), try files(complete.root))
         for router in [unit!, complete] {

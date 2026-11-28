@@ -52,6 +52,15 @@ extension CommandRouter {
         receipt["cause"] as? String == "done_evidence" && int(receipt,"cleanup_policy_version") < 2
     }
 
+    static func ticketCleanupLegacySettlement(_ receipt: JSON) -> (objects: [JSON], summary: JSON) {
+        var objects = receipt["objects"] as? [JSON] ?? []
+        for index in objects.indices where objects[index]["state"] as? String == "pending" {
+            objects[index]["state"] = "retained"
+            objects[index]["reasons"] = ["legacy_replan_required"]
+        }
+        return (objects,ticketObjectDeletionSummary(objects))
+    }
+
     /// Select a single project's bounded cohort in queue order. A later call
     /// freshly observes all authority; verified manifests never become a cache
     /// across passes. Oversized receipts get a separate descriptor-page turn.
@@ -154,7 +163,7 @@ extension CommandRouter {
             let id = try StoredRecord(receipt,family:"receipt").string("id")
             if Self.isLegacyDoneEvidenceDeletion(receipt) {
                 let fence = try TicketCleanupFence(db,inventory:TicketCleanupInventory(),project:project,ids:[id,try StoredRecord(receipt,family:"receipt").string("task_id"),project],fencesScanMetadata:false)
-                entries.append(.init(fence:fence,receipt:receipt,reactivated:false,backupGenerationRow:generation,references:try TicketObjectDeletionReferenceIndex([]),backup:nil,mediaAuthorityComplete:false,candidatePaths:[],verifications:[:],verificationFailures:[:]))
+                entries.append(.init(fence:fence,receipt:receipt,reactivated:false,backupGenerationRow:generation,references:try TicketObjectDeletionReferenceIndex([]),backup:nil,mediaAuthorityComplete:false,candidatePaths:[],verifications:[:],verificationFailures:[:],legacySettlement:Self.ticketCleanupLegacySettlement(receipt)))
                 continue
             }
             guard let inventory = inventories.inventories[id] else {continue}
@@ -216,7 +225,7 @@ extension CommandRouter {
                 object["state"] as? String == "pending" && (object["relative_path"] as? String).map {current.candidatePaths.contains($0)} == true
             }
             if remaining {
-                cohort.current = .init(fence:entry.fence,receipt:entry.receipt,reactivated:false,backupGenerationRow:entry.backupGenerationRow,references:entry.references,backup:current.backup,mediaAuthorityComplete:entry.mediaAuthorityComplete,candidatePaths:current.candidatePaths,verifications:current.verifications,verificationFailures:current.verificationFailures)
+                cohort.current = .init(fence:entry.fence,receipt:entry.receipt,reactivated:false,backupGenerationRow:entry.backupGenerationRow,references:entry.references,backup:current.backup,mediaAuthorityComplete:entry.mediaAuthorityComplete,candidatePaths:current.candidatePaths,verifications:current.verifications,verificationFailures:current.verificationFailures,hasInlineLinks:current.hasInlineLinks,legacySettlement:current.legacySettlement)
                 return cohort
             }
         }
@@ -245,6 +254,7 @@ extension CommandRouter {
             }) {db,permit,cohort in
                 if let paged = cohort.paged {
                     if let conversion = paged.conversion {
+                        try permit.checkMaintenanceDeadline()
                         try TicketCleanupChanges.deletionAccounting(db) {
                             try self.commitTicketBytePageConversion(db,work:conversion,index:paged.conversionIndex)
                         }
@@ -269,18 +279,28 @@ extension CommandRouter {
                     try self.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)
                 }
                 if !cohort.newestFirst,let id = outcome["id"] as? String,let row = cohort.receiptRows[id] {
+                    try permit.checkMaintenanceDeadline()
                     try self.advanceTicketObjectDeletionQueue(db,project:prepared.fence.projectID,row:row)
                 }
                 observe?(["phase":"outcome","receipt_id":outcome["id"] ?? "","summary":outcome["summary"] ?? [:],"state":outcome["state"] ?? "","writer_seconds":ProcessInfo.processInfo.systemUptime-writerStarted])
                 cohort.turns += 1
-                let pending = (outcome["objects"] as? [JSON] ?? []).contains {$0["state"] as? String == "pending"}
+                let pending = try (outcome["objects"] as? [JSON] ?? []).contains {
+                    try permit.checkMaintenanceDeadline()
+                    return $0["state"] as? String == "pending"
+                }
                 // A failed/no-progress chunk is bounded, not retried in a tight loop.
                 let changes = zip(before["objects"] as? [JSON] ?? [],outcome["objects"] as? [JSON] ?? [])
-                let unchanged = !changes.contains {a,b in a["state"] as? String != b["state"] as? String || int(a,"failures") != int(b,"failures")}
+                let unchanged = try !changes.contains {a,b in
+                    try permit.checkMaintenanceDeadline()
+                    return a["state"] as? String != b["state"] as? String || int(a,"failures") != int(b,"failures")
+                }
                 // A failed verification/unlink/outcome gets one attempt this call.
                 // Preserve its durable retry for another call/restart; continuing a
                 // successful sibling never spends this receipt's second failure.
-                let failed = changes.contains {a,b in int(b,"failures") > int(a,"failures")}
+                let failed = try changes.contains {a,b in
+                    try permit.checkMaintenanceDeadline()
+                    return int(b,"failures") > int(a,"failures")
+                }
                 if !pending || unchanged || failed {cohort.index += 1;cohort.current = nil}
                 else {
                     cohort.entries[cohort.index] = .init(fence:prepared.fence,receipt:outcome,reactivated:false,backupGenerationRow:prepared.backupGenerationRow,references:prepared.references,backup:nil,mediaAuthorityComplete:prepared.mediaAuthorityComplete,candidatePaths:[],verifications:[:],verificationFailures:[:])

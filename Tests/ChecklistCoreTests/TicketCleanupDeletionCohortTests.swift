@@ -111,6 +111,59 @@ extension TicketLifecycleCleanupTests {
         try router.dbQueue.read {try self.router.record($0,receipt["id"] as! String,type:"storage_job")}
     }
 
+    func testExpiredTicketCleanupPermitPreservesPendingReceiptAndBytes() throws {
+        let receipt = try XCTUnwrap(deletionCohortFixture([1]).first)
+        let original = try XCTUnwrap((receipt["objects"] as? [JSON])?.first?["relative_path"] as? String)
+        let path = router.root.appendingPathComponent(original).path
+        var observedExpiry = false
+        try router.withTicketCleanupPreparation({try self.router.prepareTicketObjectDeletionCohort($0)}) {db,permit,cohort in
+            let prepared = try XCTUnwrap(cohort.current)
+            // Model elapsed gate time before the final object check.
+            Thread.sleep(forTimeInterval:0.21)
+            XCTAssertThrowsError(try self.router.processTicketObjectDeletionIntents(db,permit:permit,prepared:prepared)) {error in
+                XCTAssertTrue(error is MaintenanceStepDeferred)
+                observedExpiry = true
+            }
+        }
+        XCTAssertTrue(observedExpiry)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:path))
+        let pending = try deletionCohortReceipt(receipt)
+        XCTAssertEqual(pending["state"] as? String,"pending")
+        XCTAssertNil((pending["objects"] as? [JSON])?.first?["failures"])
+        try router.runTicketObjectDeletionCohort()
+        XCTAssertFalse(FileManager.default.fileExists(atPath:path))
+    }
+
+    func testTicketDeletionSummaryMatchesPriorGroupingAcrossMixedObjects() throws {
+        let states = ["pending","removed","already_missing","retained"]
+        func prior(_ objects: [JSON]) -> JSON {
+            var result: JSON = ["physical_reclamation":"unmeasured"]
+            for state in states {
+                let selected = objects.filter { $0["state"] as? String == state }
+                result[state + "_count"] = selected.count
+                result[state + "_bytes"] = selected.reduce(Int64(0)) { $0 + (($1["size"] as? NSNumber)?.int64Value ?? 0) }
+            }
+            var reasons: [String:(count: Int, bytes: Int64)] = [:]
+            for object in objects where object["state"] as? String == "retained" {
+                for reason in object["reasons"] as? [String] ?? [] {
+                    let previous = reasons[reason] ?? (0,0)
+                    reasons[reason] = (previous.count + 1,previous.bytes + ((object["size"] as? NSNumber)?.int64Value ?? 0))
+                }
+            }
+            result["retained_reasons"] = reasons.mapValues { ["count":$0.count,"bytes":$0.bytes] as JSON }
+            return result
+        }
+        for length in 0...64 {
+            let objects: [JSON] = (0..<length).map { index in
+                let state = (states + ["unrecognized"])[(index + length) % 5]
+                var object: JSON = ["state":state,"reasons":index.isMultiple(of:3) ? ["hold","hold"] : ["hold","backup"]]
+                if index.isMultiple(of:2) {object["size"] = index * 11}
+                return object
+            }
+            XCTAssertEqual(try jsonString(CommandRouter.ticketObjectDeletionSummary(objects)),try jsonString(prior(objects)))
+        }
+    }
+
     /// Exercise the real preparation, journal, continuation and byte executor,
     /// with deterministic injection points between their public boundaries.
     private func deletionCohortPass(afterPreparation: ((TicketCleanupDeletionCohort) throws -> Void)? = nil,afterCommit: ((Database,TicketCleanupDeletionCohort) throws -> Void)? = nil,observeSQL: ((String) -> Void)? = nil) throws -> TicketCleanupDeletionCohort? {

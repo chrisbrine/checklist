@@ -713,8 +713,8 @@ extension TicketLifecycleCleanupTests {
         for _ in 0..<2 {
             try expireCleanupBackoff()
             XCTAssertThrowsError(try router.runStorageMaintenance())
-            XCTAssertNotNil(router.ticketCleanupRetryAt)
-            XCTAssertGreaterThan(try XCTUnwrap(router.nextArchiveCleanupDeadline()).timeIntervalSinceNow,50)
+            XCTAssertGreaterThan(try XCTUnwrap(router.ticketCleanupRetryAt).timeIntervalSinceNow,50)
+            XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
             XCTAssertTrue(try receipts(p).isEmpty)
             XCTAssertTrue(FileManager.default.fileExists(atPath:a["path"] as! String))
         }

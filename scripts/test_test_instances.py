@@ -6,6 +6,7 @@ from contextlib import redirect_stdout, redirect_stderr, closing, ExitStack, con
 import itertools
 import os
 import sqlite3
+import stat
 from types import SimpleNamespace
 import json
 from pathlib import Path
@@ -254,14 +255,20 @@ class AdditionalGuardsTests(unittest.TestCase):
                 harness.require_receipt_path_support(base, manifest, {'receipt_nonlocal_trash_absolute': 1})
 
     def test_origin_receipt_cannot_start_an_old_stage_before_launch(self):
-        p = harness.paths(2)
-        metadata = {'seed': {'kind': 'backup', 'source_root': '/owned/source'}, 'mode': 'stopped', 'stage_path': '/unused-stage'}
-        with patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={'inputs': []}), \
-             patch.object(harness, 'require_managed_path_support', return_value=5), \
-             patch.object(harness, 'require_local_paths', return_value={'receipt_origin_absolute': 1}), patch.object(harness, 'run') as run:
-            with self.assertRaisesRegex(ValueError, 'predates instance-local deletion receipts'):
-                harness.start(SimpleNamespace(slot=2, gui=False), p)
-            run.assert_not_called()
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
+            p = harness.paths(2)
+            p['data'].mkdir(parents=True)
+            store_fixture(p['data'] / 'checklist.sqlite', 2)
+            metadata = {'seed': {'kind': 'backup', 'source_root': '/owned/source'}, 'mode': 'stopped', 'stage_path': '/unused-stage'}
+            with patch.object(harness, 'load', return_value=metadata), \
+                 patch.object(harness, 'bundle_check', return_value={'inputs': [{'path': harness.SLOT_START_SOURCE}]}), \
+                 patch.object(harness, 'require_managed_path_support', return_value=5), \
+                 patch.object(harness, 'launch_state', return_value={'registered': False}), \
+                 patch.object(harness, 'require_local_paths', return_value={'receipt_origin_absolute': 1}), \
+                 patch.object(harness, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'predates instance-local deletion receipts'):
+                    harness.start(SimpleNamespace(slot=2, gui=False), p)
+                run.assert_not_called()
 
     def test_old_stages_cannot_produce_test_bundles(self):
         with self.assertRaises(ValueError): harness.require_instance_support({'inputs': []})
@@ -1455,7 +1462,7 @@ class RestoredSeedTests(unittest.TestCase):
             harness.shutil.copytree(destination, p['data'], dirs_exist_ok=True)
             harness.save(p, {'slot': 4, 'stage_path': str(base / 'stage'), 'mode': 'stopped', 'seed': seed})
             before = harness.sha(p['data'] / 'checklist.sqlite')
-            with patch.object(harness, 'bundle_check', return_value={}) as bundle, patch.object(harness, 'require_managed_path_support', return_value=4) as stage, patch.object(harness, 'launch_state', return_value={'registered': False}), patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
+            with patch.object(harness, 'bundle_check', return_value={'inputs': [{'path': harness.SLOT_START_SOURCE}]}) as bundle, patch.object(harness, 'require_managed_path_support', return_value=4) as stage, patch.object(harness, 'launch_state', return_value={'registered': False}), patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}), patch.object(harness, 'service_status') as health, patch.object(harness, 'run') as run:
                 harness.start(SimpleNamespace(slot=4, gui=False), p)
             bundle.assert_called_once();stage.assert_called_once();health.assert_called_once()
             self.assertEqual(run.call_args.args[0][:2], ['launchctl', 'bootstrap'])
@@ -2707,7 +2714,7 @@ class SeedIsolationTests(unittest.TestCase):
                 with self.assertRaises(ValueError): harness.require_local_paths(database, base / 'data', source_root='/owned/source')
 
     def test_old_staged_binary_cannot_start_a_relaxed_seed(self):
-        with test_directory() as directory:
+        with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve() / 'slots'):
             base = Path(directory).resolve();p = harness.paths(1)
             metadata = {'seed': {'kind': 'backup', 'source_root': str(harness.LIVE)}, 'mode': 'stopped', 'stage_path': str(base)}
             with patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={'inputs': []}), patch.object(harness, 'run') as run:
@@ -3127,6 +3134,28 @@ class SlotRelayTests(unittest.TestCase):
 
 
 class SeedPathReuseTests(unittest.TestCase):
+    def test_opaque_trash_canonical_denial_is_bound_even_when_lstat_succeeds(self):
+        with test_directory() as directory:
+            base = Path(directory).resolve()
+            root = base / 'slot-data'
+            root.mkdir()
+            opaque = base / 'opaque'
+            opaque.mkdir()
+            leaf = opaque / 'history'
+            leaf.write_text('inert file')
+            proof = {'aliases': {}, 'bindings': [], 'directories': {},
+                     'trash': [(str(leaf), True, True)]}
+            opaque.chmod(0o100)
+            try:
+                self.assertTrue(stat.S_ISREG(leaf.lstat().st_mode))
+                self.assertTrue(harness.receipt_trash_opacity(leaf, True))
+                paths = harness.inspect_startup_paths(root, proof)
+                self.assertEqual(paths.canonical[opaque], ['denied'])
+                self.assertTrue(paths.matches())
+            finally:
+                opaque.chmod(0o700)
+            self.assertFalse(paths.matches())
+
     @contextmanager
     def created_slot(self, retained=None):
         with test_directory() as directory, ExitStack() as stack:
@@ -3155,7 +3184,8 @@ class SeedPathReuseTests(unittest.TestCase):
                 source, _, _ = SnapshotLogicTests().fixture(base, schema=2, records=records)
                 seed = 'backup:' + str(source)
             stage = base / 'stage'
-            manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64, 'signing_profile': 'ad-hoc'}
+            manifest = {'build_id': 'fixture', 'source_fingerprint': 'b' * 64, 'signing_profile': 'ad-hoc',
+                        'inputs': [{'path': harness.SLOT_START_SOURCE}]}
             launch = {'registered': False}
             commands = []
             def run(command, **kwargs):
@@ -3230,9 +3260,10 @@ class SeedPathReuseTests(unittest.TestCase):
 
                 original_write = Path.write_bytes
                 original_run = harness.run
+                original_stamp = file.stat().st_mtime_ns
                 def write_bytes(path, data):
                     result = original_write(path, data)
-                    if boundary == 'plist' and path == p['folder'] / 'service.plist':
+                    if boundary == 'plist' and path == p['folder'] / 'service.plist' and file.stat().st_mtime_ns == original_stamp:
                         change_stamp()
                     return result
 
@@ -3241,7 +3272,7 @@ class SeedPathReuseTests(unittest.TestCase):
                     if command[:2] == ['launchctl', 'bootstrap']:
                         if boundary == 'plist':
                             self.assertEqual(scan.call_count, 2, 'inspection must precede bootstrap')
-                        else:
+                        elif file.stat().st_mtime_ns == original_stamp:
                             change_stamp()
                     return result
 
@@ -3252,6 +3283,51 @@ class SeedPathReuseTests(unittest.TestCase):
                      patch.object(harness, 'service_status', side_effect=service_status):
                     harness.start(SimpleNamespace(slot=1, gui=False), p)
                 self.assertEqual(harness.load(p)['start_path_inspection'], 'full')
+
+    def test_first_service_access_refuses_stale_reuse_and_starts_after_one_full_scan(self):
+        for changed, changes_again in itertools.product(['database', 'wal', 'directory', 'binding'], [False, True]):
+            with self.subTest(changed=changed, changes_again=changes_again), self.created_slot(retained='wal') as (
+                    p, scan, external, _, _, commands):
+                root = p['data']
+                targets = {'database': root / 'checklist.sqlite', 'wal': root / 'checklist.sqlite-wal',
+                           'directory': root / 'objects', 'binding': external}
+                target = targets[changed]
+                log = p['folder'] / 'logs/service.stderr.log'
+                receipts = []
+
+                def activate(_slot, *, bound, receipt_digest):
+                    self.assertEqual(scan.call_count, len(receipts) + 1)
+                    receipts.append(receipt_digest)
+                    if len(receipts) == 1 or changes_again:
+                        if changed == 'binding':
+                            target.rename(target.with_name('previous-' + str(len(receipts))))
+                            target.write_text('another safe outside file')
+                        else:
+                            stamp = target.stat()
+                            os.utime(target, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000_000))
+                        with log.open('a') as stream:
+                            stream.write(f'ChecklistService: SLOT_INSPECTION_REFUSED {receipt_digest}: changed at open.\n')
+                    harness.slot_inspection_refusal(p, receipt_digest)
+
+                args = SimpleNamespace(slot=1, gui=False)
+                with patch.object(harness, 'service_status', side_effect=activate):
+                    if changes_again:
+                        with self.assertRaisesRegex(harness.SlotInspectionRefused, 'changed at open'):
+                            harness.start(args, p)
+                    else:
+                        harness.start(args, p)
+
+                self.assertEqual(scan.call_count, 2)
+                self.assertEqual(len(set(receipts)), 2)
+                self.assertEqual([command[1] for command in commands if command[0] == 'launchctl'],
+                                 ['bootstrap', 'bootout', 'bootstrap'] + (['bootout'] if changes_again else []))
+                metadata = harness.load(p)
+                if changes_again:
+                    self.assertEqual(metadata['mode'], 'stopped')
+                    self.assertNotIn('start_path_inspection', metadata)
+                else:
+                    self.assertFalse(metadata['first_start_pending'])
+                    self.assertEqual(metadata['start_path_inspection'], 'full')
 
     def test_late_unsafe_seed_does_not_activate_the_new_job(self):
         for change in ['database', 'managed leaf']:
@@ -3283,6 +3359,77 @@ class SeedPathReuseTests(unittest.TestCase):
                 self.assertEqual(metadata['mode'], 'stopped')
                 self.assertNotIn('start_path_inspection', metadata)
 
+    def test_external_binding_replaced_during_registration_refreshes_receipt(self):
+        with self.created_slot() as (p, scan, external, _, _, commands):
+            original_run = harness.run
+            previous = external.with_name('previous')
+            digests = []
+            def run(command, **kwargs):
+                result = original_run(command, **kwargs)
+                if command[:2] == ['launchctl', 'bootstrap']:
+                    plist = plistlib.loads(command[-1].read_bytes())
+                    digests.append(plist['EnvironmentVariables'][harness.SLOT_START_DIGEST])
+                    if not previous.exists():
+                        external.rename(previous)
+                        external.write_text('new external inode')
+                return result
+
+            with patch.object(harness, 'run', side_effect=run):
+                harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 2)
+            self.assertEqual([cmd[1] for cmd in commands if cmd[0] == 'launchctl'], ['bootstrap', 'bootout', 'bootstrap'])
+            self.assertEqual(len(set(digests)), 2)
+            raw = (p['folder'] / harness.SLOT_START_RECEIPT).read_bytes()
+            self.assertEqual(harness.hashlib.sha256(raw).hexdigest(), digests[-1])
+            receipt = json.loads(raw)
+            observations = harness.base64.b64decode(receipt['observations'])
+            self.assertEqual(harness.hashlib.sha256(observations).hexdigest(), receipt['observations_sha256'])
+            named = {entry['path']: entry['expected'] for entry in json.loads(observations)['named']}
+            self.assertEqual(named[str(external)], harness.seed_named_stamp(external))
+            self.assertIn(str(external), {entry['path'] for entry in json.loads(observations)['canonical']})
+            self.assertEqual(harness.service_status.call_args.kwargs['receipt_digest'], digests[-1])
+
+    def test_full_scan_retains_directories_through_registration(self):
+        for already_changed in (False, True):
+            with self.subTest(already_changed=already_changed), self.created_slot() as (p, scan, _, _, _, commands):
+                database = p['data'] / 'checklist.sqlite'
+                directory = p['data'] / 'objects'
+                original = database.stat()
+                original_write = Path.write_bytes
+                original_run = harness.run
+                def change_database():
+                    os.utime(database, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000_000))
+
+                def write_bytes(path, data):
+                    result = original_write(path, data)
+                    if not already_changed and path == p['folder'] / 'service.plist' and database.stat().st_mtime_ns == original.st_mtime_ns:
+                        change_database()
+                    return result
+
+                def run(command, **kwargs):
+                    result = original_run(command, **kwargs)
+                    if command[:2] == ['launchctl', 'bootstrap']:
+                        stamp = directory.stat()
+                        os.utime(directory, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000_000))
+                    return result
+
+                if already_changed:
+                    change_database()
+                with patch.object(harness, 'run', side_effect=run), patch.object(Path, 'write_bytes', write_bytes), \
+                     self.assertRaisesRegex(ValueError, 'observations changed before activation'):
+                    harness.start(SimpleNamespace(slot=1, gui=False), p)
+                self.assertEqual(scan.call_count, 2)
+                self.assertEqual([cmd[1] for cmd in commands if cmd[0] == 'launchctl'], ['bootstrap', 'bootout'])
+                harness.service_status.assert_not_called()
+
+    def test_old_stage_cannot_boot_seeded_slot_with_unverified_receipt(self):
+        with self.created_slot() as (p, scan, _, _, _, commands):
+            with patch.object(harness, 'bundle_check', return_value={'inputs': []}), \
+                 self.assertRaisesRegex(ValueError, 'predates the test-slot startup inspection receipt'):
+                harness.start(SimpleNamespace(slot=1, gui=False), p)
+            self.assertEqual(scan.call_count, 1)
+            self.assertFalse(any(command[:2] == ['launchctl', 'bootstrap'] for command in commands))
+
     def test_cold_rollback_journal_keeps_full_inspection(self):
         with self.created_slot(retained='journal') as (p, scan, *_):
             harness.start(SimpleNamespace(slot=1, gui=False), p)
@@ -3301,9 +3448,13 @@ class SeedPathReuseTests(unittest.TestCase):
                     database.with_name('checklist.sqlite-wal').write_bytes(b'')
                 if change == 'hash':
                     do_fingerprint = harness.seed_store_files
-                    def different_digest(path, *, hash_bytes=False, allow_journal=False):
-                        files = do_fingerprint(path, hash_bytes=hash_bytes, allow_journal=allow_journal)
-                        if hash_bytes: files['']['sha256'] = '0' * 64
+                    changed = False
+                    def different_digest(path, *, hash_bytes=False, allow_journal=False, include_shm=False):
+                        nonlocal changed
+                        files = do_fingerprint(path, hash_bytes=hash_bytes, allow_journal=allow_journal, include_shm=include_shm)
+                        if hash_bytes and not changed:
+                            files['']['sha256'] = '0' * 64
+                            changed = True
                         return files
                     stack.enter_context(patch.object(harness, 'seed_store_files', side_effect=different_digest))
                 if change == 'owner':
@@ -3347,6 +3498,8 @@ class SlotStartupTests(unittest.TestCase):
         with test_directory() as directory, ExitStack() as stack:
             base = Path(directory).resolve();stack.enter_context(patch.object(harness, 'BASE', base / 'slots'))
             p = harness.checked(4);p['data'].mkdir(parents=True)
+            store_fixture(p['data'] / 'checklist.sqlite', 2)
+            manifest = {'inputs': [{'path': harness.SLOT_START_SOURCE}]}
             metadata = {'slot': 4, 'stage_path': str(base), 'build_id': 'fixture', 'source_fingerprint': 'fingerprint',
                         'seed': {'kind': 'backup', 'source_root': '/owned/source'}, 'mode': 'headless' if registered else 'stopped'}
             clock = self.Clock();calls = [];commands = [];responses = iter(responses)
@@ -3362,14 +3515,33 @@ class SlotStartupTests(unittest.TestCase):
                 if isinstance(response, subprocess.CompletedProcess): return response
                 return subprocess.CompletedProcess(command, 0, json.dumps(response), '')
             for context in [patch.dict(os.environ, environment or {}, clear=True),
-                            patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value={}),
-                            patch.object(harness, 'require_managed_path_support', return_value=4), patch.object(harness, 'require_local_paths', return_value={}),
+                            patch.object(harness, 'load', return_value=metadata), patch.object(harness, 'bundle_check', return_value=manifest),
+                            patch.object(harness, 'require_managed_path_support', return_value=4),
                             patch.object(harness, 'launch_state', return_value={'registered': registered}),
                             patch.object(harness, 'processes', return_value={'app': [], 'service': [], 'cli': []}),
                             patch.object(harness, 'run', side_effect=run), patch.object(harness.time, 'monotonic', clock.monotonic),
                             patch.object(harness.time, 'sleep', clock.sleep), redirect_stdout(output), redirect_stderr(progress)]:
                 stack.enter_context(context)
             yield p, clock, calls, commands, output, progress
+
+    def test_start_reports_service_refusal_for_only_the_current_receipt(self):
+        with self.fixture([self.healthy()]) as (p, _, calls, _, _, _):
+            logs = p['folder'] / 'logs'
+            logs.mkdir()
+            log = logs / 'service.stderr.log'
+            log.write_text('ChecklistService: SLOT_INSPECTION_REFUSED old: old failure.\n')
+            original_run = harness.run
+            def run(command, **kwargs):
+                result = original_run(command, **kwargs)
+                if command[1:3] == ['service', 'status']:
+                    plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
+                    digest = plist['EnvironmentVariables'][harness.SLOT_START_DIGEST]
+                    with log.open('a') as stream:
+                        stream.write(f'ChecklistService: SLOT_INSPECTION_REFUSED {digest}: the WAL changed.\n')
+                return result
+            with patch.object(harness, 'run', side_effect=run), self.assertRaisesRegex(ValueError, 'the WAL changed'):
+                harness.start(SimpleNamespace(slot=4, gui=False), p)
+            self.assertEqual(len(calls), 1)
 
     def test_gui_start_passes_appearance_as_app_arguments(self):
         for appearance in ['dark', 'light', None]:
@@ -3384,7 +3556,7 @@ class SlotStartupTests(unittest.TestCase):
         with self.fixture([self.healthy()], environment={'CHECKLIST_SLOT_RELAYS': 'synthetic'}) as (p, clock, calls, commands, output, progress):
             harness.start(SimpleNamespace(slot=4, gui=False), p)
             plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
-            self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'off'})
+            self.assertEqual(plist['EnvironmentVariables']['CHECKLIST_SLOT_RELAYS'], 'off')
             self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], False)
 
     def test_start_persists_explicit_relay_opt_in_and_uses_it_on_later_starts(self):
@@ -3395,7 +3567,7 @@ class SlotStartupTests(unittest.TestCase):
                 else: arguments.allow_synthetic_relays = True
                 harness.start(arguments, p)
                 plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
-                self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'synthetic'})
+                self.assertEqual(plist['EnvironmentVariables']['CHECKLIST_SLOT_RELAYS'], 'synthetic')
                 self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], True)
 
     def test_start_can_explicitly_reset_persisted_relay_opt_in(self):
@@ -3403,7 +3575,7 @@ class SlotStartupTests(unittest.TestCase):
             harness.load(p)['allow_synthetic_relays'] = True
             harness.start(SimpleNamespace(slot=4, gui=False, allow_synthetic_relays=False), p)
             plist = plistlib.loads((p['folder'] / 'service.plist').read_bytes())
-            self.assertEqual(plist['EnvironmentVariables'], {'CHECKLIST_SLOT_RELAYS': 'off'})
+            self.assertEqual(plist['EnvironmentVariables']['CHECKLIST_SLOT_RELAYS'], 'off')
             self.assertIs(json.loads((p['folder'] / 'slot.json').read_text())['allow_synthetic_relays'], False)
 
     def test_start_refuses_relay_policy_change_for_registered_service(self):
@@ -3522,7 +3694,7 @@ class SlotStartupTests(unittest.TestCase):
             metadata['first_start_pending'] = True
             metadata['seed'].update(live_snapshot=True, source_hash='manifest-digest',
                                     before_start={'schema': 3, 'identity': {'logical_store_id': 'store'}})
-            with patch.object(harness, 'bundle_check', return_value={'source_fingerprint': 'fingerprint'}), \
+            with patch.object(harness, 'bundle_check', return_value={'source_fingerprint': 'fingerprint', 'inputs': [{'path': harness.SLOT_START_SOURCE}]}), \
                  patch.object(harness, 'sha', return_value='service-digest'), patch.object(harness, 'storage_schema', return_value=4), \
                  patch.object(harness, 'host_load', return_value='{ 1 2 3 }'):
                 harness.start(SimpleNamespace(slot=4, gui=False), p)

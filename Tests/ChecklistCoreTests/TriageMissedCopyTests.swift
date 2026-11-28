@@ -729,12 +729,10 @@ extension EvidenceAuthorityTests {
         let f = try missedFixture(), resumed = try missedResumeConversation(f.p, f.o), command = UUID().uuidString
         let taken = try missedTakeover(f, f.peer, command: command)
         let notice = try missedLegacyRoleNotice(XCTUnwrap((taken["takeover_notices"] as? [JSON])?.first))
-        try router.dbQueue.writeWithoutTransaction { db in
-            // A prepared store already has a recent retention mark. Advance past
-            // the hourly mark interval so this notice's command is in the cutoff.
-            let date = Date().addingTimeInterval(CommandRouter.commandMarkInterval + 1)
-            _ = try router.pruneRoutineRecords(db, now: date)
-            _ = try router.pruneRoutineRecords(db, now: date.addingTimeInterval(CommandRouter.commandResultRetention + 1))
+        let date = Date().addingTimeInterval(CommandRouter.commandMarkInterval + 1)
+        try router.pruneRoutineRecords(now: date)
+        try router.pruneRoutineRecords(now: date.addingTimeInterval(CommandRouter.commandResultRetention + 1))
+        try router.dbQueue.read { db in
             let literal = try XCTUnwrap(String.fetchOne(db, sql: "SELECT result FROM commands WHERE principal=? AND command_id=?", arguments: [f.peer.principal, command]))
             XCTAssertTrue(CommandRouter.isPrunedResult(jsonObject(literal)))
             let attempt = try router.record(db, taken["id"] as! String, type: "attempt")

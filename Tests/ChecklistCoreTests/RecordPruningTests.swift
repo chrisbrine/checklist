@@ -51,7 +51,7 @@ extension CoreTests {
             }
         }
         XCTAssertNoThrow(try router.dbQueue.read { db in _ = try router.cursorSequence(db, ["cursor": "legacy-fresh-cursor-token"], caller: owner, scope: scope) })
-        let counts = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0) }
+        let counts = try router.pruneRoutineRecords()
         XCTAssertEqual(counts.cursors, 1)
         XCTAssertEqual(try router.dbQueue.read { try String.fetchAll($0, sql: "SELECT token FROM cursors") }, ["legacy-fresh-cursor-token"])
         assertCode("CURSOR_RESET") { _ = try self.router.dbQueue.read { db in try self.router.cursorSequence(db, ["cursor": "legacy-expired-cursor-token"], caller: self.owner, scope: scope) } }
@@ -67,7 +67,7 @@ extension CoreTests {
         }
         let recentCommand = UUID().uuidString
         _ = try router.handle(method: "task_create", params: fixtureTaskInput(router,method:"task_create",input:["project_id": p["id"]!, "title": "Recent command", "command_id": recentCommand]), caller: owner)
-        let counts = try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0) }
+        let counts = try router.pruneRoutineRecords()
         XCTAssertGreaterThan(counts.commandResults, 0)
         assertCode("COMMAND_RESULT_EXPIRED") { _ = try self.router.handle(method: "task_create", params: fixtureTaskInput(self.router,method:"task_create",input:["project_id": p["id"]!, "title": "Old command", "command_id": oldCommand]), caller: self.owner) }
         XCTAssertEqual(try router.dbQueue.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM records WHERE type='task' AND json_extract(data,'$.title')='Old command'") }, 1, "an expired retry never runs twice")
@@ -88,8 +88,8 @@ extension CoreTests {
         _ = try call("task_edit", ["project_id": p["id"]!, "task_id": t["id"]!, "expected_revision": t["revision"]!, "patch": ["title": "Renamed"]])
         _ = try call("attachment_cleanup_preview", input)
         XCTAssertEqual(try previews(), 2)
-        XCTAssertEqual(try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0) }.cleanupPreviews, 1, "the preview of an older ticket revision is unusable")
-        XCTAssertEqual(try router.dbQueue.writeWithoutTransaction { try router.pruneRoutineRecords($0, now: Date().addingTimeInterval(2 * 86_400)) }.cleanupPreviews, 1)
+        XCTAssertEqual(try router.pruneRoutineRecords().cleanupPreviews, 1, "the preview of an older ticket revision is unusable")
+        XCTAssertEqual(try router.pruneRoutineRecords(now: Date().addingTimeInterval(2 * 86_400)).cleanupPreviews, 1)
         XCTAssertEqual(try previews(), 0)
     }
 

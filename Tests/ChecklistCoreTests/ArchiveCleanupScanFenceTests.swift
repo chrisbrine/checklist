@@ -361,8 +361,8 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
     func testExecutorScanRunsBeforeTheWriterAndUnrelatedWriteCommits() throws {
         let f = try fixture(count:1),other = try call("task_create",["project_id":f.project["id"]!,"title":"Unrelated"])
         try archive(f);try makeDue(f)
-        // A command's maintenance tail prepares no scan: the due item waits for the service turn.
-        _ = try call("task_create",["project_id":f.project["id"]!,"title":"Command tail"])
+        // An ordinary command returns before the scheduled cleanup starts.
+        _ = try call("task_create",["project_id":f.project["id"]!,"title":"Concurrent command"])
         XCTAssertTrue(exists(f.files[0]));XCTAssertEqual(try deleteIntents(),0)
         var observed = 0
         router.archiveCleanupScanObserver = concurrently {
@@ -375,6 +375,43 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
         XCTAssertFalse(exists(f.files[0]),"An unrelated write does not miss the fence")
         XCTAssertEqual(try jobs(f).first?.items.first?.terminal,true)
         XCTAssertEqual(try call("task_get",["project_id":f.project["id"]!,"task_id":other["id"]!])["title"] as? String,"Written during executor scan")
+    }
+
+    func testExecutorCompletesAboveFormerArchiveCorpusLimit() throws {
+        try QualificationSuite.requireEnabled()
+        let f = try fixture(count:2)
+        let other = try call("task_create",["project_id":f.project["id"]!,"title":"Unrelated archive corpus owner"])
+        try archive(f)
+        try router.dbQueue.write {db in
+            try db.execute(sql:"""
+                WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<250001),
+                ids(id) AS (SELECT printf('00000000-0000-4000-8000-%012d',i) FROM n)
+                INSERT INTO records(id,project_id,type,revision,data)
+                SELECT id,?,'message',1,json_object('id',id,'project_id',?,'revision',1,'task_id',?,'body','Unrelated archived text')
+                FROM ids
+                """,arguments:[f.project["id"] as? String,f.project["id"] as? String,other["id"] as? String])
+            try self.router.save(db,["id":uuid(),"project_id":f.project["id"]!,"revision":1,
+                "kind":"reader","state":"active","attachment_id":f.files[1]["id"]!],type:"storage_hold")
+        }
+        try makeDue(f)
+        let started = ProcessInfo.processInfo.systemUptime
+        var preparedAt: TimeInterval?
+        router.archiveCleanupScanObserver = {preparedAt = ProcessInfo.processInfo.systemUptime}
+        defer {router.archiveCleanupScanObserver = nil}
+        try router.runStorageMaintenance()
+        let finished = ProcessInfo.processInfo.systemUptime
+        let prepared = try XCTUnwrap(preparedAt)
+        print("CL514_ARCHIVE_PREPARED corpus=250001 preparation_and_admission_seconds=\(prepared - started) continuation_seconds=\(finished - prepared)")
+        XCTAssertFalse(exists(f.files[0]))
+        XCTAssertTrue(exists(f.files[1]))
+        XCTAssertEqual(try deleteIntents(),1)
+        XCTAssertNil(try jobs(f).first?.items.first(where: {$0.original.id.text == f.files[0]["id"] as? String})?.failure)
+        try router.runStorageMaintenance()
+        let held = try XCTUnwrap(try jobs(f).first?.items.first(where: {$0.original.id.text == f.files[1]["id"] as? String}))
+        XCTAssertTrue(held.holds.contains(.activeReader))
+        XCTAssertNil(held.failure)
+        XCTAssertTrue(exists(f.files[1]))
+        XCTAssertEqual(try deleteIntents(),1)
     }
 
     func testExecutorFenceMissFromAnotherConnectionRetriesWithoutDeletion() throws {
@@ -394,6 +431,27 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
         try router.runStorageMaintenance()
         XCTAssertFalse(exists(f.files[0]),"The next turn rescans and deletes")
         XCTAssertEqual(try jobs(f).first?.items.first?.terminal,true)
+    }
+
+    func testExecutorRetainsOriginalReplacedAfterByteVerification() throws {
+        let f = try fixture(count:1)
+        try archive(f)
+        try makeDue(f)
+        let path = try XCTUnwrap(f.files[0]["path"] as? String)
+        let url = URL(fileURLWithPath:path)
+        let bytes = try Data(contentsOf:url)
+        router.archiveCleanupScanObserver = {
+            // Same contents and size, new inode. The verified descriptor must
+            // still name the exact object when the deletion step runs.
+            do { try bytes.write(to:url,options:.atomic) }
+            catch { XCTFail("Replacing the verified fixture failed: \(error)") }
+        }
+        try router.runStorageMaintenance()
+        router.archiveCleanupScanObserver = nil
+        XCTAssertEqual(try Data(contentsOf:url),bytes)
+        XCTAssertEqual(try jobs(f).first?.items.first?.failure,.identityChanged)
+        try router.runStorageMaintenance()
+        XCTAssertFalse(exists(f.files[0]))
     }
 
     func testExecutorRelevantChangeBetweenScanAndCommitRetriesWithoutDeletion() throws {
@@ -442,7 +500,7 @@ final class ArchiveCleanupScanFenceTests: XCTestCase {
         var start = ProcessInfo.processInfo.systemUptime
         try router.dbQueue.writeWithoutTransaction {db in try self.router.withValidatedDomainTransaction(db) {
             let task = try self.router.record(db,f.task["id"] as! String,type:"task"),a = try self.router.record(db,f.files[0]["id"] as! String,type:"attachment")
-            let graph = try self.router.archiveCleanupReferenceRows(db)
+            let graph = try legacyArchiveCleanupReferenceRows(db)
             _ = try self.router.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph)
             _ = try self.router.archiveRetentionFacts(db,task:task,currentGraph:graph);return .rollback
         }}

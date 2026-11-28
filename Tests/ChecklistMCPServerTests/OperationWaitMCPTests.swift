@@ -224,4 +224,23 @@ final class OperationWaitMCPTests: XCTestCase {
         } catch is OperationWait.LimitExpired {}
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 1)
     }
+
+    func testWaitRetriesClaimCredentialProjectionWithinItsDeadline() async throws {
+        final class Reads: @unchecked Sendable {
+            let lock = NSLock()
+            var count = 0
+            func next() -> Int {lock.withLock {count += 1;return count}}
+        }
+        let reads = Reads()
+        let result = Value.object(["claim_token":.string("fixture-credential")])
+        let reply = try await OperationWait.read(statusMethod:"operation_get",known:nil,
+            identity:["operation_id":UUID().uuidString],limit:5,clock:.init(now:{0},sleep:{_ in})) { _ in
+                switch reads.next() {
+                case 1: throw ChecklistError("OPERATION_RESULT_BUSY","Retry the credential projection.")
+                case 2: throw ChecklistError("BACKUP_CAPTURE_ACTIVE","Retry after the backup releases admission.")
+                default: return .object(["data":.object(["state":.string("succeeded"),"result":result])])
+                }
+            }
+        XCTAssertEqual(reply,result)
+    }
 }

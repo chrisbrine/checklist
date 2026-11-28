@@ -108,9 +108,19 @@ public struct ChecklistInstance: Sendable {
         }
     }
 
-    private static func canonicalRoot(_ url: URL) throws -> CanonicalRoot {
+    private struct CanonicalAccessDenied: Error {}
+
+    package static func slotInspectionCanonicalPath(_ path: String, permitDenied: Bool = false) throws -> [String] {
+        do {
+            let observed = try canonicalRoot(URL(fileURLWithPath: path), reportDenial: permitDenied)
+            return [observed.existing.path, String(observed.device), String(observed.inode)] + observed.missing
+        } catch is CanonicalAccessDenied { return ["denied"] }
+    }
+
+    private static func canonicalRoot(_ url: URL, reportDenial: Bool = false) throws -> CanonicalRoot {
         var existing = try resolvingLinks(url), missing: [String] = [], before = stat()
         while stat(existing.path,&before) != 0 {
+            if reportDenial && (errno == EACCES || errno == EPERM) { throw CanonicalAccessDenied() }
             guard errno == ENOENT || errno == ENOTDIR else {
                 throw ChecklistError("INSTANCE_COLLISION", "Cannot inspect an instance root.")
             }
@@ -122,11 +132,17 @@ public struct ChecklistInstance: Sendable {
             existing = parent
         }
         let descriptor = open(existing.path,O_RDONLY | O_NONBLOCK | O_CLOEXEC)
-        guard descriptor >= 0 else { throw ChecklistError("INSTANCE_COLLISION", "Cannot open an instance root ancestor.") }
+        guard descriptor >= 0 else {
+            if reportDenial && (errno == EACCES || errno == EPERM) { throw CanonicalAccessDenied() }
+            throw ChecklistError("INSTANCE_COLLISION", "Cannot open an instance root ancestor.")
+        }
         defer { close(descriptor) }
         var actual = stat(), spelling = [CChar](repeating:0,count:Int(MAXPATHLEN))
-        guard fstat(descriptor,&actual) == 0, before.st_dev == actual.st_dev, before.st_ino == actual.st_ino,
-              fcntl(descriptor,F_GETPATH,&spelling) == 0 else {
+        guard fstat(descriptor,&actual) == 0, before.st_dev == actual.st_dev, before.st_ino == actual.st_ino else {
+            throw ChecklistError("INSTANCE_COLLISION", "Cannot verify the canonical instance root spelling and identity.")
+        }
+        guard fcntl(descriptor,F_GETPATH,&spelling) == 0 else {
+            if reportDenial && (errno == EACCES || errno == EPERM) { throw CanonicalAccessDenied() }
             throw ChecklistError("INSTANCE_COLLISION", "Cannot verify the canonical instance root spelling and identity.")
         }
         return CanonicalRoot(existing:URL(fileURLWithPath:String(decoding: spelling.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)),missing:missing,device:actual.st_dev,inode:actual.st_ino)

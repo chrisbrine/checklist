@@ -19,6 +19,14 @@ final class StorageObjectWalk {
               current.st_mode & S_IFMT == S_IFDIR,current.st_dev == directory.device,current.st_ino == directory.inode else { throw StorageSnapshotFailure.sourceChanged }
     }
     func parent(_ parts: [String], create: Bool) throws -> Int32? {
+        guard let parent = try pinnedParent(parts, create: create) else { return nil }
+        let result = fcntl(parent,F_DUPFD_CLOEXEC,0)
+        guard result >= 0 else { throw StorageSnapshotFailure.failed("fcntl",path:parts.joined(separator:"/"),root:rootPath) }
+        return result
+    }
+
+    /// Borrow only for a synchronous syscall before the walk changes or ends.
+    func pinnedParent(_ parts: [String], create: Bool) throws -> Int32? {
         guard parts.count <= 8 else { try finish(); return nil }
         var shared = 0
         while shared < min(parts.count,directories.count),parts[shared].utf8.elementsEqual(directories[shared].name.utf8) { shared += 1 }
@@ -36,9 +44,7 @@ final class StorageObjectWalk {
             }
             directories.append(.init(name:part,descriptor:fd,device:info.st_dev,inode:info.st_ino))
         }
-        let result = fcntl(directories.last?.descriptor ?? root,F_DUPFD_CLOEXEC,0)
-        guard result >= 0 else { throw StorageSnapshotFailure.failed("fcntl",path:parts.joined(separator:"/"),root:rootPath) }
-        return result
+        return directories.last?.descriptor ?? root
     }
     func finish() throws { while !directories.isEmpty { try pop() } }
 }

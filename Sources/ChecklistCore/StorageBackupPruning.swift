@@ -95,6 +95,33 @@ struct StorageBackupRetentionPolicy {
 }
 
 extension CommandRouter {
+    private struct BackupPruneFence {
+        let receipts: [String]
+        let preparedUpgrade: Data?
+    }
+
+    /// Bind the paths and receipts used by the retention decision. Full
+    /// manifests and generation indexes stay off the writer.
+    private func backupPruneFenceRows(_ db: Database) throws -> [String] {
+        try String.fetchAll(db,sql:"""
+            SELECT json_array(key,CASE WHEN key GLOB 'backup-generation:*' THEN
+                json_array(json_extract(value,'$.format'),json_extract(value,'$.operation_id'),
+                    json_extract(value,'$.state'),json_extract(value,'$.manifest_sha256'),
+                    json_type(value,'$.historical_catalog'),json_extract(value,'$.summary.path'),
+                    json_extract(value,'$.summary.manifest_sha256'),json_extract(value,'$.summary.source_root'),
+                    json_extract(value,'$.summary.verification'),json_extract(value,'$.summary.captured_at'))
+                ELSE value END)
+            FROM metadata WHERE key GLOB 'backup-generation:*' OR key IN
+              ('backup-retention-settings','preupgrade_snapshot','backup-protected-history') ORDER BY key
+            """)
+    }
+
+    private func backupPrunePreparedUpgrade() throws -> Data? {
+        let files = try StorageObjectFiles(root:root)
+        guard try files.regularOrLinkExists(StorageUpgradePreparation.receiptName) else {return nil}
+        return try files.read(StorageUpgradePreparation.receiptName,maximum:16_384)
+    }
+
     static let storageBackupPruningMethods: Set<String> = ["backup_retention_get","backup_retention_set","backup_pin","backup_prune_preview","backup_prune","backup_incomplete_preview","backup_incomplete_retire"]
     /// Test seam is an explicit owned directory, never the user's Trash. Production
     /// uses the filesystem's appropriate Trash and atomic same-volume rename only.
@@ -112,7 +139,7 @@ extension CommandRouter {
             authorityGeneration = try requireIncompleteBackupAuthority(params:params,caller:caller,expectedGeneration:expectedAuthorizationGeneration)
         }
         else {try owner(caller);authorityGeneration = nil}
-        if method == "backup_retention_get" {return ["data":try dbQueue.read {db -> JSON in
+        if method == "backup_retention_get" {return ["data":try readForPreparation {db -> JSON in
             var settings = try backupRetentionSettings(db)
             if let last = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-last'") {settings["last_automatic_prune"] = jsonObject(last)}
             settings["automatic_prune_history"] = try automaticBackupRetentionHistory(db)
@@ -122,12 +149,21 @@ extension CommandRouter {
         let command = try text(params,"command_id",max:100)
         guard UUID(uuidString:command) != nil else {throw CoreError("INVALID_INPUT","command_id must be a UUID.")}
         let digest = hash(Data((method + (try jsonString(params))).utf8))
-        do {return try ArchiveStorageGate.withExclusive(root:root) { _ in
-            // Registration changes also take this gate. Check the admitted
-            // generation here before any Trash move, then keep the gate through
-            // the transaction that retires the moved folders' metadata.
+        func writeStep<T>(_ label: String,_ body: (Database,MaintenanceDeadline?) throws -> T) throws -> T {
+            guard automaticTrigger != nil else {return try dbQueue.write {try body($0,nil)}}
+            let result = try withMaintenanceGateAndWriter(label:label) {db,_,deadline in
+                try StorageSnapshotRetention.requireNoCapture(root:self.root)
+                return try deadline.transaction(db) {try body(db,deadline)}
+            }
+            guard let value = result else {throw MaintenanceStepDeferred()}
+            return value
+        }
+        func executePrune() throws -> JSON {
+            // Explicit incomplete-retirement keeps its gate through authority
+            // checks and final accounting. Automatic retention rechecks the
+            // current protection basis in each gated move.
             if incompleteOnly {try requireIncompleteBackupAuthority(params:params,caller:caller,expectedGeneration:authorityGeneration)}
-            if let replay = try dbQueue.read({try backupPruneReplay($0,command:command,digest:digest,caller:caller)}) {return replay}
+            if let replay = try readForPreparation({try backupPruneReplay($0,command:command,digest:digest,caller:caller)}) {return replay}
             if method == "backup_retention_set" || method == "backup_pin" {
                 return try dbQueue.write {db in
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
@@ -177,7 +213,7 @@ extension CommandRouter {
             }
             try StorageSnapshotRetention.requireNoCapture(root:root)
             let journalKey = "backup-prune-intent:" + hash(Data((caller.principal + command).utf8))
-            var journal = try dbQueue.read {db -> JSON? in
+            var journal = try readForPreparation {db -> JSON? in
                 guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[journalKey]) else {return nil}
                 let value = jsonObject(raw)
                 guard value["digest"] as? String == digest else {throw CoreError("IDEMPOTENCY_CONFLICT","This prune command belongs to another intent.")}
@@ -214,7 +250,7 @@ extension CommandRouter {
                 }
                 journal = ["digest":digest,"entries":entries,"retained_entries":(preview["snapshots"] as? [JSON] ?? []).filter {!bool($0,"prune")},"created_at":now()]
                 if incompleteOnly {journal?["authorization_generation"] = authorityGeneration as Any? ?? NSNull()}
-                try dbQueue.write {db in
+                try writeStep("backup_retention.intent") {db,_ in
                     try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                     try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:[journalKey,try jsonString(journal!)])
                     let pendingKey = try self.pendingStorageCommandKey(principal:caller.principal,command:command)
@@ -223,7 +259,7 @@ extension CommandRouter {
                 try observe("prune_intent_committed")
             }
             let pendingKey = try pendingStorageCommandKey(principal:caller.principal,command:command)
-            try dbQueue.write {db in
+            try writeStep("backup_retention.pending") {db,_ in
                 try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                 try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[pendingKey,try jsonString(["kind":"backup_prune","intent_digest":digest,"state":"pending"])])
             }
@@ -233,7 +269,11 @@ extension CommandRouter {
             // A crash releases the object gate. Pins, upgrade protection and the
             // owner's rule may change before original retry. Recheck every source
             // still present; already moved exact inodes must finish reconciliation.
-            let current = try backupPrunePreview(includeUnrecorded:incompleteOnly || bool(params,"include_unrecorded"),incompleteOnly:incompleteOnly,retainingOperation:automaticTrigger)
+            let observeFence: ((BackupPruneFence) -> Void)?
+            var fence: BackupPruneFence?
+            if automaticTrigger != nil {observeFence = {fence = $0}}
+            else {observeFence = nil}
+            let current = try backupPrunePreview(includeUnrecorded:incompleteOnly || bool(params,"include_unrecorded"),incompleteOnly:incompleteOnly,retainingOperation:automaticTrigger,observeFence:observeFence)
             let decisions = Dictionary(uniqueKeysWithValues:(current["snapshots"] as? [JSON] ?? []).map {($0["path"] as! String,$0)})
             for entry in journal!["entries"] as? [JSON] ?? [] {
                 let path = entry["path"] as! String
@@ -243,16 +283,34 @@ extension CommandRouter {
                     kept["keep_reasons"] = decisions[path]?["keep_reasons"] ?? ["no_current_prune_authority"]
                     retained.append(kept);continue
                 }
-                do {try moveBackupToTrash(entry);try moveBackupIndexToTrash(entry);moved.append(entry);try observe("prune_snapshot_moved")}
+                do {
+                    if let fence {
+                        let proof = try prepareBackupPruneMove(entry)
+                        try writeStep("backup_retention.move") {db,deadline in
+                            guard try fence.receipts == self.backupPruneFenceRows(db),
+                                  try fence.preparedUpgrade == self.backupPrunePreparedUpgrade() else {throw MaintenanceStepDeferred()}
+                            try deadline?.check()
+                            try self.moveBackupToTrash(entry,proof:proof)
+                            try deadline?.check()
+                            try self.moveBackupIndexToTrash(entry)
+                        }
+                    } else {
+                        try moveBackupToTrash(entry)
+                        try moveBackupIndexToTrash(entry)
+                    }
+                    moved.append(entry)
+                    try observe("prune_snapshot_moved")
+                }
                 catch let error as CoreError where error.code == "BACKUP_IN_USE" {var kept = entry;kept["reason"] = "in_use";retained.append(kept)}
                 catch let error as CoreError where incompleteOnly && error.code == "BACKUP_PRUNE_SOURCE_CHANGED" {var kept = entry;kept["reason"] = "source_changed";kept["keep_reasons"] = ["source_changed"];retained.append(kept)}
             }
-            return try dbQueue.write {db in
+            return try writeStep("backup_retention.finish") {db,deadline in
                 if let authorityGeneration {
                     _ = try self.backupWriteAuthorization(db,params:params,caller:caller,expectedGeneration:authorityGeneration)
                 }
                 try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
                 for entry in moved {
+                    try deadline?.check()
                     if let key = entry["generation_key"] as? String,!key.isEmpty {
                         // The durable intent binds an exact manifest, path and row.
                         // Do not retire a replacement record under an old plan.
@@ -281,10 +339,14 @@ extension CommandRouter {
                 try event(db,caller:caller,project:nil,entity:nil,kind:"backup_pruned",data:data)
                 return try backupPruneFinish(db,command:command,digest:digest,caller:caller,data:data)
             }
-        }} catch {
+        }
+        do {
+            if automaticTrigger != nil {return try executePrune()}
+            return try ArchiveStorageGate.withExclusive(root:root) { _ in try executePrune() }
+        } catch {
             if method == "backup_prune" || method == "backup_incomplete_retire" {
                 let key = "backup-prune-intent:" + hash(Data((caller.principal + command).utf8))
-                let pending = (try? dbQueue.read {db in
+                let pending = (try? readForPreparation {db in
                     guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[key]) else {return false}
                     return jsonObject(raw)["digest"] as? String == digest
                 }) ?? true // An unreadable journal cannot establish rejection.
@@ -334,7 +396,11 @@ extension CommandRouter {
         guard direct,snapshot else {throw CoreError("BACKUP_PRUNE_PATH_REFUSED","Only named snapshot folders directly in backups or its qualification folder can be pruned.")}
     }
     func backupPrunePreview(includeUnrecorded: Bool = false,incompleteOnly: Bool = false,at date: Date = Date(),retainingOperation: String? = nil) throws -> JSON {
-        let (settings,receipts,protected,historical) = try readForPreparation {db -> (JSON,[JSON],Set<String>,Set<String>) in
+        try backupPrunePreview(includeUnrecorded:includeUnrecorded,incompleteOnly:incompleteOnly,at:date,retainingOperation:retainingOperation,observeFence:nil)
+    }
+
+    private func backupPrunePreview(includeUnrecorded: Bool,incompleteOnly: Bool,at date: Date = Date(),retainingOperation: String?,observeFence: ((BackupPruneFence) -> Void)?) throws -> JSON {
+        let (settings,receipts,protected,historical,fenceRows) = try readForPreparation {db -> (JSON,[JSON],Set<String>,Set<String>,[String]) in
             let settings = try backupRetentionSettings(db)
             let receipts = try backupCompletionReceipts(db)
             var protected = Set<String>(),historical = Set<String>()
@@ -360,7 +426,7 @@ extension CommandRouter {
                     }
                 }
             }
-            return (settings,receipts,protected,historical)
+            return (settings,receipts,protected,historical,try observeFence == nil ? [] : backupPruneFenceRows(db))
         }
         let policy = try StorageBackupRetentionPolicy.parse(settings)
         var snapshots: [String:JSON] = [:]
@@ -385,13 +451,13 @@ extension CommandRouter {
             try files.requireNamedRoot(parent);try scan(parent,0);try files.requireNamedRoot(parent)
         }
         // A prepared upgrade is protected before its database migration commits.
-        let storeFiles = try StorageObjectFiles(root:root)
-        if try storeFiles.regularOrLinkExists(StorageUpgradePreparation.receiptName) {
-            let bytes = try storeFiles.read(StorageUpgradePreparation.receiptName,maximum:16_384)
+        let preparedUpgrade = try backupPrunePreparedUpgrade()
+        if let bytes = preparedUpgrade {
             guard let value = try? JSONSerialization.jsonObject(with:bytes) as? JSON,let operation = value["operation"] as? String,UUID(uuidString:operation) != nil else {throw StoreRecovery.required("backup_prepared_protection_invalid")}
             let path = parent.appendingPathComponent("snapshot-" + operation.lowercased()).path
             protectedInsert(path,into:&snapshots)
         }
+        observeFence?(.init(receipts:fenceRows,preparedUpgrade:preparedUpgrade))
         let eligible = snapshots.values.filter {$0["state"] as? String == "complete"}.compactMap {value -> (path:String,date:String)? in
             guard let path = value["path"] as? String,let time = value["captured_at"] as? String else {return nil};return (path,time)
         }
@@ -455,7 +521,33 @@ extension CommandRouter {
         guard renameatx_np(parent,name,trash.descriptor,target,UInt32(RENAME_EXCL)) == 0,fsync(parent) == 0 else {throw CoreError("BACKUP_PRUNE_IO","The derived backup index could not be moved to Trash.",details:["posix_errno":errno])}
         try trash.synchronizePublicationDirectory()
     }
-    private func moveBackupToTrash(_ entry: JSON) throws {
+    private enum BackupPruneMoveProof {
+        case source(StorageBackupUseLease)
+        case destination(TicketObjectRemovalVerification)
+    }
+
+    private func prepareBackupPruneMove(_ entry: JSON) throws -> BackupPruneMoveProof {
+        let source = URL(fileURLWithPath:entry["path"] as! String)
+        let destination = URL(fileURLWithPath:entry["trash_path"] as! String)
+        try requireManagedBackupPath(source)
+        let digest = entry["manifest_sha256"] as? String
+        func changed() -> CoreError {CoreError("BACKUP_PRUNE_SOURCE_CHANGED","The snapshot changed; preserve the original prune intent.")}
+        var info = stat()
+        if lstat(source.path,&info) == 0 {
+            let lease = try StorageBackupUseLease(root:source,exclusive:true)
+            guard try lease.manifestSHA256() == digest else {throw changed()}
+            return .source(lease)
+        }
+        guard errno == ENOENT,let digest else {throw changed()}
+        do {
+            guard let verified = try TicketObjectRemovalVerification(root:destination,relative:"manifest.json",sha256:digest,folderAccess:.insideTrash) else {throw changed()}
+            return .destination(verified)
+        } catch let error as CoreError where error.code == "CLEANUP_IDENTITY_CHANGED" {
+            throw changed()
+        }
+    }
+
+    private func moveBackupToTrash(_ entry: JSON,proof: BackupPruneMoveProof? = nil) throws {
         if bool(entry,"manifest_absent") {try moveIncompleteBackupWithoutManifest(entry);return}
         let source = URL(fileURLWithPath:entry["path"] as! String),destination = URL(fileURLWithPath:entry["trash_path"] as! String)
         try requireManagedBackupPath(source)
@@ -473,12 +565,28 @@ extension CommandRouter {
             // proves or restores from a moved copy, so this reads it by path.
             let moved = try StorageObjectFiles(root:destination,folderAccess:.insideTrash)
             try exact(moved) {
-                try StorageBackupUseLease.manifestSHA256(moved)
+                guard let proof else {return try StorageBackupUseLease.manifestSHA256(moved)}
+                guard case .destination(let verified) = proof else {throw changed()}
+                var named = stat(),opened = stat()
+                guard fstatat(moved.descriptor,"manifest.json",&named,AT_SYMLINK_NOFOLLOW) == 0,
+                      fstat(verified.descriptor,&opened) == 0,TicketObjectRemovalVerification.same(verified.identity,opened),
+                      TicketObjectRemovalVerification.same(opened,named) else {throw changed()}
+                return verified.sha256
             }
             return
         }
-        let lease = try StorageBackupUseLease(root:source,exclusive:true)
-        try exact(lease.files) {try lease.manifestSHA256()}
+        let lease: StorageBackupUseLease
+        if let proof {
+            guard case .source(let held) = proof else {throw changed()}
+            lease = held
+            try exact(lease.files) {
+                try lease.requireCurrent()
+                return entry["manifest_sha256"] as? String ?? ""
+            }
+        } else {
+            lease = try StorageBackupUseLease(root:source,exclusive:true)
+            try exact(lease.files) {try lease.manifestSHA256()}
+        }
         let parent = try StorageObjectFiles(root:source.deletingLastPathComponent()),trash = try StorageObjectFiles(root:destination.deletingLastPathComponent(),folderAccess:.insideTrash)
         try lease.requireCurrent()
         guard renameatx_np(parent.descriptor,source.lastPathComponent,trash.descriptor,destination.lastPathComponent,UInt32(RENAME_EXCL)) == 0 else {throw CoreError("BACKUP_PRUNE_IO","Snapshot could not be moved atomically to the same-volume Trash; it was retained.",details:["posix_errno":errno])}

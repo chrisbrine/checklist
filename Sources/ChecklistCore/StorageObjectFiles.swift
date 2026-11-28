@@ -35,10 +35,8 @@ struct StorageSnapshotBudget {
     static let freeSpaceMinimumMarginBytes: Int64 = 1_073_741_824
     static let objectLimit = 500_000
     static let manifestByteLimit = 512 * 1_048_576
-    // CL-514 (22 Nov 2026): no fixed record-count ceiling. The store passed 100,000 records on
-    // 19 Nov 2026 and every backup failed with BACKUP_CAPACITY_EXCEEDED. The shared deadline,
-    // the manifest-byte and object limits and free space still bound each backup.
-    static let recordLimit = Int.max
+    static let workingByteLimit = 1_024 * 1_048_576
+    static let envelopeByteLimit = 512 * 1_048_576
     static let productionSeconds: TimeInterval = 1_800
     static func production() -> Self {
         .init(deadlineUptime: ProcessInfo.processInfo.systemUptime + productionSeconds, canceled: { false })
@@ -53,7 +51,7 @@ struct StorageSnapshotBudget {
     var maximumObjectBytes: Int64 = 524_288_000
     var maximumObjects: Int = Self.objectLimit
     var maximumManifestBytes: Int = Self.manifestByteLimit
-    var maximumRecords: Int = Self.recordLimit
+    var maximumWorkingBytes: Int = Self.workingByteLimit
     var parallelism: Int = 4
     var pagesPerStep: Int32 = 64
     var folderAccess = StorageFolderAccess()
@@ -119,11 +117,11 @@ struct StorageSnapshotBudget {
         let next = "Keep the store and existing backups. Retry backup_create with a new command ID on an idle Mac for a time limit; for a capacity limit, use a Checklist build supporting this store size. Do not delete retained captures or attachments to make it fit."
         let manifestMeasure = measurement.manifestBytes.map { " The manifest measured \($0) bytes." } ?? ""
         return CoreError(reason == "snapshot_deadline" ? "BACKUP_DEADLINE_EXCEEDED" : "BACKUP_CAPACITY_EXCEEDED",
-            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured.\(manifestMeasure) Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, \(maximumRecords) records; owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
+            "Backup could not finish: \(qualifier)\(measurement.bytes) bytes in \(qualifier)\(measurement.objects) managed objects were measured.\(manifestMeasure) Limits: \(bytesLimit), \(maximumObjects) objects, \(maximumManifestBytes) manifest bytes, \(maximumObjectBytes) bytes per managed file, and \(maximumWorkingBytes) working metadata bytes. Owner and pre-upgrade backups allow \(Int(Self.productionSeconds)) seconds. " + next,
             details: ["reason": reason, "measured_bytes": measurement.bytes, "measured_objects": measurement.objects,
                       "measurement_is_lower_bound": measurement.lowerBound, "maximum_bytes": limit,
                       "maximum_objects": maximumObjects, "maximum_manifest_bytes": maximumManifestBytes,
-                      "maximum_object_bytes": maximumObjectBytes, "maximum_records": maximumRecords, "measured_manifest_bytes": measurement.manifestBytes.map { $0 as Any } ?? NSNull(),
+                      "maximum_object_bytes": maximumObjectBytes, "maximum_working_bytes": maximumWorkingBytes, "measured_manifest_bytes": measurement.manifestBytes.map { $0 as Any } ?? NSNull(),
                       "production_deadline_seconds": Int(Self.productionSeconds), "next_step": next])
     }
     func reporting(_ error: Error) -> Error {
@@ -142,7 +140,7 @@ struct StorageSnapshotBudget {
     func adding(_ bytes: Int64, to total: Int64) throws -> Int64 {
         let sum = total.addingReportingOverflow(bytes)
         guard bytes >= 0, total >= 0, !sum.overflow, sum.partialValue <= maximumBytes else { throw StorageSnapshotFailure.limit }
-        // Preserve the cause: record, object and metadata limits also throw .limit.
+        // Preserve the cause: object and metadata limits also throw .limit.
         // Carry the attempted total so the needed/free guidance describes this refusal.
         guard sum.partialValue <= effectiveMaximumBytes else { throw StorageSnapshotFailure.freeSpace(measured: sum.partialValue) }
         return sum.partialValue
@@ -328,16 +326,31 @@ final class StorageObjectFiles {
     }
 
     func regularOrLinkExists(_ path: String) throws -> Bool {
+        func exists(_ directory: Int32, _ name: String) throws -> Bool {
+            var info = stat()
+            if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { return false }
+                throw StorageSnapshotFailure.failed("fstatat",path:path,root:root.path)
+            }
+            guard [S_IFREG,S_IFLNK].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.unsupportedAuthority }
+            return true
+        }
+        if walkDirectories {
+            var parts = try Self.parts(path)
+            let name = parts.removeLast()
+            if walk == nil { walk = StorageObjectWalk(root:descriptor,rootPath:root.path) }
+            let directory: Int32?
+            do { directory = try walk!.pinnedParent(parts, create: false) }
+            catch where StorageFolderAccess.isMissing(error) { return false }
+            // The walk is operation-local. This synchronous leaf check never
+            // retains the borrowed descriptor or moves the walk to another path.
+            if let directory { return try exists(directory, name) }
+        }
         let parentFD: Int32, name: String
         do { (parentFD, name) = try parent(path) }
         catch { if StorageFolderAccess.isMissing(error) { return false }; throw error }
         defer { Darwin.close(parentFD) }
-        var info = stat()
-        if fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
-            if errno == ENOENT { return false }; throw StorageSnapshotFailure.failed("fstatat",path:path,root:root.path)
-        }
-        guard [S_IFREG,S_IFLNK].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.unsupportedAuthority }
-        return true
+        return try exists(parentFD, name)
     }
 
     func directoryExists(_ path: String) throws -> Bool {
@@ -631,23 +644,64 @@ final class StorageObjectFiles {
         pendingDirectories.removeAll()
     }
 
-    func publish(_ staging: String, as name: String, beforeFlush: () throws -> Void = {}) throws {
+    func publish(_ staging: String, as name: String, verifiedStage: StorageObjectFiles? = nil, beforeFlush: () throws -> Void = {}) throws {
         guard !staging.contains("/"), !name.contains("/") else { throw StorageSnapshotFailure.io }
+        if let verifiedStage, try !namesDirectory(staging, matching: verifiedStage) { throw StorageSnapshotFailure.sourceChanged }
         guard renameatx_np(descriptor, staging, descriptor, name, UInt32(RENAME_EXCL)) == 0 else { throw StorageSnapshotFailure.failed("renameatx_np",path:name,root:root.path) }
         try synchronizePublicationDirectory(beforeFlush: beforeFlush)
+    }
+    func requirePublishedDirectory(_ name: String, matching directory: StorageObjectFiles) throws {
+        guard try namesDirectory(name, matching: directory) else { throw StorageSnapshotFailure.publicationUncertain }
+    }
+    private func namesDirectory(_ name: String, matching directory: StorageObjectFiles) throws -> Bool {
+        var entry = stat(), opened = stat()
+        guard fstat(directory.descriptor, &opened) == 0 else { throw StorageSnapshotFailure.failed("fstat",root:directory.root.path) }
+        return fstatat(descriptor, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 &&
+            entry.st_mode & S_IFMT == S_IFDIR && entry.st_dev == opened.st_dev && entry.st_ino == opened.st_ino
     }
     func synchronizePublicationDirectory(beforeFlush: () throws -> Void = {}) throws {
         do { try beforeFlush() } catch { throw StorageSnapshotFailure.publicationUncertain }
         guard fsync(descriptor) == 0 else { throw StorageSnapshotFailure.publicationUncertain }
     }
     func listedFiles(budget: StorageSnapshotBudget) throws -> Set<String> {
+        var files: Set<String> = []
+        try visitListedFiles(budget: budget) { path, _ in _ = files.insert(path) }
+        return files
+    }
+
+    /// Record exact members and change identities before content verification.
+    /// A mode, inode, size, mtime or ctime change invalidates the publication
+    /// even when the namespace and manifest digest still match.
+    func publicationWitness(budget: StorageSnapshotBudget) throws -> [Data: StorageFileDigestIdentity] {
+        var files: [Data: StorageFileDigestIdentity] = [:]
+        var bytes = StorageSnapshotWorkingBytes(budget)
+        try visitListedFiles(budget: budget) { path, info in
+            let key = Data(path.utf8)
+            try bytes.retain(160 + key.count)
+            guard files.updateValue(StorageFileDigestIdentity(info), forKey: key) == nil else {
+                throw StorageSnapshotFailure.incomplete
+            }
+        }
+        return files
+    }
+
+    func requirePublicationWitness(_ witnessed: [Data: StorageFileDigestIdentity], budget: StorageSnapshotBudget) throws {
+        var count = 0
+        try visitListedFiles(budget: budget) { path, info in
+            guard witnessed[Data(path.utf8)] == StorageFileDigestIdentity(info) else { throw StorageSnapshotFailure.sourceChanged }
+            count += 1
+        }
+        guard count == witnessed.count else { throw StorageSnapshotFailure.sourceChanged }
+    }
+
+    private func visitListedFiles(budget: StorageSnapshotBudget, visit: (String, stat) throws -> Void) throws {
         // Enumerate relative to the already-open root; never resolve a managed
         // descendant through Foundation or a symlink.
-        var files: Set<String> = [], directories = [""]
+        var count = 0, directories = [""]
         while let relative = directories.popLast() {
             try budget.check()
             let directory: Int32
-            if relative.isEmpty { directory = dup(descriptor) }
+            if relative.isEmpty { directory = openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK) }
             else {
                 let (parent,name) = try self.parent(relative)
                 defer { Darwin.close(parent) }
@@ -672,13 +726,14 @@ final class StorageObjectFiles {
                 guard fstatat(dirfd(entries),name,&info,AT_SYMLINK_NOFOLLOW) == 0 else { throw StorageSnapshotFailure.failed("fstatat",root:root.path) }
                 switch info.st_mode & S_IFMT {
                 case S_IFDIR: directories.append(path)
-                case S_IFREG, S_IFLNK: files.insert(path)
+                case S_IFREG, S_IFLNK:
+                    count += 1
+                    guard count - 3 <= budget.maximumObjects else { throw StorageSnapshotFailure.limit }
+                    try visit(path, info)
                 default: throw StorageSnapshotFailure.unsupportedAuthority
                 }
-                guard files.count <= budget.maximumObjects + 3 else { throw StorageSnapshotFailure.limit }
             }
         }
-        return files
     }
     static func flush(_ file: Int32) throws {
         guard fsync(file) == 0, fcntl(file, F_FULLFSYNC) == 0 else { throw StorageSnapshotFailure.failed("fsync") }

@@ -306,6 +306,69 @@ final class WorkHealthPreparationChangesTests: XCTestCase {
         }
     }
 
+    func testDormantJournalReusesSchemaAndCapturesOnlyCurrentObservation() throws {
+        try withDatabase {db in
+            let journal = WorkHealthPreparationChanges(),version = try journal.start(db)
+            let schemaVersion = try Int.fetchOne(db,sql:"PRAGMA temp.schema_version")
+            let first = UUID().uuidString,idle = UUID().uuidString,next = UUID().uuidString
+            try Self.insert(db,id:first,type:"task")
+            try journal.stop(db)
+            try Self.insert(db,id:idle,type:"attempt")
+            XCTAssertEqual(try XCTUnwrap(journal.read(db,version:version)).map(\.id),[Data(first.utf8)])
+            let nextVersion = try journal.start(db)
+            try Self.insert(db,id:next,type:"task")
+            XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA temp.schema_version"),schemaVersion)
+            XCTAssertEqual(try XCTUnwrap(journal.read(db,version:nextVersion)).map(\.id),[Data(next.utf8)])
+        }
+    }
+
+    func testStagedJournalSetupStaysInactiveAndResumesAfterRollback() throws {
+        try withDatabase {db in
+            let journal = WorkHealthPreparationChanges(), steps = journal.installationSteps
+            XCTAssertNil(try journal.startIfPrepared(db))
+            for step in steps.dropLast() {
+                try journal.prepareStep(db,step)
+                let schemaVersion = try Int.fetchOne(db,sql:"PRAGMA temp.schema_version")
+                try journal.prepareStep(db,step)
+                XCTAssertEqual(try Int.fetchOne(db,sql:"PRAGMA temp.schema_version"),schemaVersion)
+                XCTAssertNil(try journal.startIfPrepared(db))
+            }
+            try Self.insert(db,id:UUID().uuidString,type:"task")
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT active FROM \(journal.name)_state"),0)
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM \(journal.name)"),0)
+
+            let last = try XCTUnwrap(steps.last)
+            try db.inSavepoint {
+                try journal.prepareStep(db,last)
+                return .rollback
+            }
+            XCTAssertNil(try journal.startIfPrepared(db),"An interrupted setup must not activate its partial trigger set")
+            XCTAssertThrowsError(try journal.prepareStep(db,last,deadline:.init(seconds:0)))
+            XCTAssertNil(try journal.startIfPrepared(db))
+            try journal.prepareStep(db,last)
+            let version = try XCTUnwrap(journal.startIfPrepared(db))
+            let watchedID = UUID().uuidString
+            try Self.insert(db,id:watchedID,type:"task")
+            XCTAssertEqual(try XCTUnwrap(journal.read(db,version:version)).map(\.id),[Data(watchedID.utf8)])
+        }
+    }
+
+    func testJournalSnapshotRefreshesOnNewRowsAndRejectsSameCountRefusal() throws {
+        try withDatabase {db in
+            let journal = WorkHealthPreparationChanges(), version = try journal.start(db)
+            let empty = try XCTUnwrap(journal.readSnapshot(db,version:version,previous:nil))
+            let watchedID = UUID().uuidString
+            try Self.insert(db,id:watchedID,type:"task")
+            let changed = try XCTUnwrap(journal.readSnapshot(db,version:version,previous:empty))
+            XCTAssertEqual(changed.changes.map(\.id),[Data(watchedID.utf8)])
+            XCTAssertEqual(try journal.readSnapshot(db,version:version,previous:changed)?.changes.map(\.id),[Data(watchedID.utf8)])
+
+            try db.execute(sql:"INSERT INTO records VALUES(?,?,'task',1,'{')",arguments:[UUID().uuidString,Self.project])
+            XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT units FROM \(journal.name)_state"),1)
+            XCTAssertNil(try journal.readSnapshot(db,version:version,previous:changed))
+        }
+    }
+
     func testExternalUnjournaledWriteRefusesWhileSameWriterNoteRemainsValid() throws {
         let caches = try FileManager.default.url(for:.cachesDirectory,in:.userDomainMask,appropriateFor:nil,create:true)
         let directory = caches.appendingPathComponent("ChecklistQualification/p11-G/work-health-changes-" + UUID().uuidString,isDirectory:true)
@@ -316,11 +379,23 @@ final class WorkHealthPreparationChangesTests: XCTestCase {
         try writer.writeWithoutTransaction {try Self.schema($0)}
         let external = try DatabaseQueue(path:directory.appendingPathComponent("fixture.sqlite").path)
         defer {try? external.close()}
-        let journal = WorkHealthPreparationChanges(),version = try writer.writeWithoutTransaction {try journal.install($0)}
+        let journal = WorkHealthPreparationChanges()
+        let version = try external.writeWithoutTransaction {db -> Int64 in
+            var version: Int64?
+            try db.inTransaction(.immediate) {
+                version = try writer.writeWithoutTransaction {writerDB in
+                    for step in journal.installationSteps {try journal.prepareStep(writerDB,step)}
+                    return try XCTUnwrap(journal.startIfPrepared(writerDB))
+                }
+                return .rollback
+            }
+            return try XCTUnwrap(version)
+        }
         defer {try? writer.writeWithoutTransaction {try journal.remove($0)}}
         try writer.write {try Self.insert($0,id:UUID().uuidString,type:"message")}
-        XCTAssertTrue(try XCTUnwrap(writer.writeWithoutTransaction {try journal.read($0,version:version)}).isEmpty)
+        let previous = try XCTUnwrap(writer.writeWithoutTransaction {try journal.readSnapshot($0,version:version,previous:nil)})
+        XCTAssertTrue(previous.changes.isEmpty)
         try external.write {try Self.insert($0,id:UUID().uuidString,type:"message")}
-        XCTAssertNil(try writer.writeWithoutTransaction {try journal.read($0,version:version)})
+        XCTAssertNil(try writer.writeWithoutTransaction {try journal.readSnapshot($0,version:version,previous:previous)})
     }
 }

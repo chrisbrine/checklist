@@ -48,7 +48,8 @@ extension CommandRouter {
     }
 
     func queueDirectionDeliveries(_ db: Database, message: JSON, recipients: [JSON], recordOrchestratorOmission: Bool = false,
-                                  nativeClosureLineage: NativeClosureReceiptLineage? = nil) throws -> [JSON] {
+                                  nativeClosureLineage: NativeClosureReceiptLineage? = nil,
+                                  nativeClosureReads: NativeClosureDeliveryReads? = nil) throws -> [JSON] {
         if recordOrchestratorOmission { try recordStaleTriageCopyOmissions(db, message: message, recipients: recipients) }
         let pid = (try StoredRecord(message, family: "message").string("project_id")), mid = (try StoredRecord(message, family: "message").string("id"))
         var deliveries = try Row.fetchAll(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=? AND json_extract(data,'$.message_id')=? COLLATE BINARY ORDER BY rowid",arguments:[pid,mid]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
@@ -71,10 +72,15 @@ extension CommandRouter {
             // but the relay selects only push_state "unavailable", so it does not send the note again.
             let priorReceipts = try deliveries.map { prior -> JSON in
                 var prior = prior
-                if prior["recipient_session_id"] as? String == sid,
-                   let closure = try deliveryNativeClosure(db,prior) {
-                    prior["native_closure_ref"] = closure["id"]
-                    prior["fenced_at"] = closure["observed_at"]
+                if prior["recipient_session_id"] as? String == sid {
+                    let closure: JSON?
+                    if let nativeClosureReads {
+                        closure = try nativeClosureReads.lookup(prior) {try deliveryNativeClosure(db,prior)}
+                    } else {closure = try deliveryNativeClosure(db,prior)}
+                    if let closure {
+                        prior["native_closure_ref"] = closure["id"]
+                        prior["fenced_at"] = closure["observed_at"]
+                    }
                 }
                 return prior
             }

@@ -53,6 +53,25 @@ extension StorageBackupRetentionPolicy {
 }
 
 extension CommandRouter {
+    /// Durable backup intent schedules maintenance independently of the backup reply.
+    func nextAutomaticBackupRetentionDeadline(_ db: Database, at time: Date) throws -> Date? {
+        let due = try String.fetchAll(db,sql:"SELECT value FROM metadata WHERE key IN ('backup-automatic-prune-pending','backup-automatic-prune-due') ORDER BY key DESC")
+            .map(jsonObject)
+            .first {value in
+                value["source_root"] as? String == root.path && value["incarnation"] as? String == incarnation &&
+                    UUID(uuidString:value["trigger_operation_id"] as? String ?? "") != nil
+            }
+        guard let trigger = due?["trigger_operation_id"] as? String,
+              try StorageAutomaticBackupRetention.isConfirmed(backupRetentionSettings(db),root:root,incarnation:incarnation) else {return nil}
+        let last = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-last'").map(jsonObject)
+        let failedTrigger = last?["trigger_operation_id"] as? String
+        if last?["status"] as? String == "deferred",failedTrigger == nil || failedTrigger == trigger,
+           let occurred = last?["occurred_at"] as? String,let failedAt = ISO8601DateFormatter().date(from:occurred) {
+            return max(time,failedAt.addingTimeInterval(60))
+        }
+        return time
+    }
+
     static var automaticBackupRetentionCaller: Caller {Caller(role:"storage_service",installation:"backup-retention",projectIDs:[])}
 
     /// Called inside the successful backup receipt/protected-ready transaction,
@@ -185,7 +204,7 @@ extension CommandRouter {
         // The latest completed backup may replace an older due trigger while an
         // older exact prune intent still reconciles first. A conditional delete
         // below cannot consume a newer backup's concurrently committed trigger.
-        let due = try? dbQueue.read {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'")}
+        let due = try? readForPreparation {try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'")}
         let dueValue = due.map(jsonObject)
         let boundDue = dueValue.flatMap {value -> String? in
             guard value["source_root"] as? String == root.path,value["incarnation"] as? String == incarnation,
@@ -200,23 +219,31 @@ extension CommandRouter {
             result = performAutomaticBackupRetention(after:trigger,trashRoot:trashRoot,observe:observe)
         }
         if let due,let boundDue,result["status"] as? String == "complete",result["trigger_operation_id"] as? String == boundDue {
-            try? ArchiveStorageGate.withExclusive(root:root) { _ in
-                try dbQueue.write {db in try db.execute(sql:"DELETE FROM metadata WHERE key='backup-automatic-prune-due' AND value=?",arguments:[due])}
+            try? withAutomaticBackupRetentionWriter("backup_retention.clear_due") {db in
+                try db.execute(sql:"DELETE FROM metadata WHERE key='backup-automatic-prune-due' AND value=?",arguments:[due])
             }
         }
         return result
+    }
+
+    private func withAutomaticBackupRetentionWriter<T>(_ label: String,_ body: (Database) throws -> T) throws -> T {
+        let result = try withMaintenanceGateAndWriter(label:label) {db,_,deadline in
+            try StorageSnapshotRetention.requireNoCapture(root:self.root)
+            return try deadline.transaction(db) {try body(db)}
+        }
+        guard let value = result else {throw MaintenanceStepDeferred()}
+        return value
     }
 
     private func performAutomaticBackupRetention(after operation: String?,trashRoot: URL?,observe: (String) throws -> Void) -> JSON {
         let caller = Self.automaticBackupRetentionCaller,pendingKey = "backup-automatic-prune-pending"
         var attempt: JSON?
         do {
-            let settings = try dbQueue.read {try backupRetentionSettings($0)}
+            let settings = try readForPreparation {try backupRetentionSettings($0)}
             guard try StorageAutomaticBackupRetention.isConfirmed(settings,root:root,incarnation:incarnation) else {return ["status":"unconfirmed","moved_count":0]}
             var replay: JSON?
-            attempt = try ArchiveStorageGate.withExclusive(root:root) { _ -> JSON? in
-                try StorageSnapshotRetention.requireNoCapture(root:root)
-                if let raw = try dbQueue.read({try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:[pendingKey])}) {
+            attempt = try { () throws -> JSON? in
+                if let raw = try readForPreparation({try String.fetchOne($0,sql:"SELECT value FROM metadata WHERE key=?",arguments:[pendingKey])}) {
                     let value = jsonObject(raw)
                     guard value["source_root"] as? String == root.path,value["incarnation"] as? String == incarnation,
                           let trigger = value["trigger_operation_id"] as? String,UUID(uuidString:trigger) != nil,
@@ -229,7 +256,7 @@ extension CommandRouter {
                 guard let operation else {return nil}
                 guard UUID(uuidString:operation) != nil else {throw CoreError("INVALID_INPUT","A completed backup operation is required for automatic retention.")}
                 let command = StorageAutomaticBackupRetention.command(root:root,incarnation:incarnation,trigger:operation)
-                if let raw = try dbQueue.read({try String.fetchOne($0,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command])}) {
+                if let raw = try readForPreparation({try String.fetchOne($0,sql:"SELECT result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command])}) {
                     let result = jsonObject(raw)
                     guard (result["data"] as? JSON)?["trigger_operation_id"] as? String == operation else {throw StoreRecovery.required("backup_automatic_prune_receipt_invalid")}
                     replay = result["data"] as? JSON;return nil
@@ -238,37 +265,36 @@ extension CommandRouter {
                 guard let current = preview["settings"] as? JSON,try StorageAutomaticBackupRetention.isConfirmed(current,root:root,incarnation:incarnation) else {return nil}
                 let params: JSON = ["command_id":command,"preview_sha256":preview["preview_sha256"]!,"include_unrecorded":false]
                 let value: JSON = ["source_root":root.path,"incarnation":incarnation,"trigger_operation_id":operation,"params":params,"created_at":now()]
-                try dbQueue.write {db in try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:[pendingKey,try jsonString(value)])}
+                try withAutomaticBackupRetentionWriter("backup_retention.plan") {db in
+                    guard try StorageAutomaticBackupRetention.isConfirmed(self.backupRetentionSettings(db),root:self.root,incarnation:self.incarnation) else {throw MaintenanceStepDeferred()}
+                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:[pendingKey,try jsonString(value)])
+                }
                 return value
-            }
+            }()
             if let replay {return replay.merging(["replayed":true]) {_,new in new}}
             guard let attempt,let params = attempt["params"] as? JSON,let trigger = attempt["trigger_operation_id"] as? String else {return ["status":"idle","moved_count":0]}
             let reply = try executeStorageBackupPruning(method:"backup_prune",params:params,caller:caller,trashRoot:trashRoot ?? automaticBackupRetentionTrashRoot,automaticTrigger:trigger,observe:observe)
             let data = reply["data"] as? JSON ?? [:]
-            try ArchiveStorageGate.withExclusive(root:root) { _ in
-                try dbQueue.write {db in
-                    try db.execute(sql:"DELETE FROM metadata WHERE key=? AND value=?",arguments:[pendingKey,try jsonString(attempt)])
-                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-automatic-prune-last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(data)])
-                }
+            try withAutomaticBackupRetentionWriter("backup_retention.publish") {db in
+                try db.execute(sql:"DELETE FROM metadata WHERE key=? AND value=?",arguments:[pendingKey,try jsonString(attempt)])
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-automatic-prune-last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(data)])
             }
             return data
         } catch {
             var data: JSON = ["status":"deferred","origin":"automatic_backup_retention","error_code":(error as? CoreError)?.code ?? "BACKUP_PRUNE_IO","occurred_at":now(),"moved_count":NSNull()]
-            if let trigger = attempt?["trigger_operation_id"] {data["trigger_operation_id"] = trigger}
+            if let trigger = attempt?["trigger_operation_id"] ?? operation {data["trigger_operation_id"] = trigger}
             for key in ["underlying_error","posix_errno"] {if let value = (error as? CoreError)?.details[key] {data[key] = value}}
-            // Keep an interrupted prune's exact UUID and parameters. If pruning
-            // never committed its intent, the next completed backup may replan.
-            try? ArchiveStorageGate.withExclusive(root:root) { _ in
-                try dbQueue.write {db in
-                    if let attempt,let params = attempt["params"] as? JSON,let command = params["command_id"] as? String {
-                        let journal = "backup-prune-intent:" + hash(Data((caller.principal + command).utf8))
-                        if try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[journal]) == nil {
-                            try db.execute(sql:"DELETE FROM metadata WHERE key=? AND value=?",arguments:[pendingKey,try jsonString(attempt)])
-                        }
+            // Keep an interrupted prune's exact UUID and parameters. A turn
+            // without a committed intent can use a fresh preview on retry.
+            try? withAutomaticBackupRetentionWriter("backup_retention.defer") {db in
+                if let attempt,let params = attempt["params"] as? JSON,let command = params["command_id"] as? String {
+                    let journal = "backup-prune-intent:" + hash(Data((caller.principal + command).utf8))
+                    if try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[journal]) == nil {
+                        try db.execute(sql:"DELETE FROM metadata WHERE key=? AND value=?",arguments:[pendingKey,try jsonString(attempt)])
                     }
-                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-automatic-prune-last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(data)])
-                    try event(db,caller:caller,project:nil,entity:nil,kind:"backup_retention_deferred",data:data)
                 }
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES ('backup-automatic-prune-last',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[try jsonString(data)])
+                try event(db,caller:caller,project:nil,entity:nil,kind:"backup_retention_deferred",data:data)
             }
             return data
         }

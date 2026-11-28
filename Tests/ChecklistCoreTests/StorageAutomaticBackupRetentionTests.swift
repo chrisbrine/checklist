@@ -70,7 +70,12 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
     func testCompletedBackupAutomaticallyPrunesWithHistoryAndStableReplay() throws {
         let f = try fixture(),project = try f.project(),old = try snapshot(f,"old");try age(f,old)
         _ = try configure(f)
-        let latest = try snapshot(f,"new"),result = try last(f)
+        let latest = try snapshot(f,"new")
+        XCTAssertTrue(exists(old),"The verified backup reply arrives before retention")
+        XCTAssertTrue(try last(f).isEmpty)
+        XCTAssertNotNil(try f.router!.nextArchiveCleanupDeadline())
+        try f.router!.runStorageMaintenance()
+        let result = try last(f)
         XCTAssertEqual(latest["status"] as? String,"complete");XCTAssertTrue(exists(latest));XCTAssertFalse(exists(old))
         XCTAssertEqual(result["status"] as? String,"complete");XCTAssertEqual(result["moved_count"] as? Int,1)
         XCTAssertEqual(result["origin"] as? String,"automatic_backup_retention")
@@ -105,11 +110,13 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
         try Data("incomplete".utf8).write(to:incomplete.appendingPathComponent("manifest.json"))
         var lease: StorageBackupUseLease? = try StorageBackupUseLease(root:URL(fileURLWithPath:used["path"] as! String))
         _ = try configure(f);_ = try snapshot(f,"latest")
+        try f.router!.runStorageMaintenance()
         XCTAssertTrue(exists(pinned));XCTAssertTrue(exists(protected));XCTAssertTrue(exists(used));XCTAssertFalse(exists(removable))
         XCTAssertTrue(FileManager.default.fileExists(atPath:incomplete.path))
         XCTAssertEqual((try last(f)["retained_in_use"] as? [JSON])?.count,1)
         withExtendedLifetime(lease) {};lease = nil
         _ = try snapshot(f,"later")
+        try f.router!.runStorageMaintenance()
         XCTAssertFalse(exists(used));XCTAssertTrue(exists(pinned));XCTAssertTrue(exists(protected))
     }
     func testInterruptedAutomaticIntentRechecksPinThenReconcilesOriginalUUID() throws {
@@ -127,6 +134,30 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
             XCTAssertNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-pending'"))
         }
         XCTAssertEqual(try last(f)["command_id"] as? String,command)
+    }
+
+    func testPinCanCommitAfterAutomaticPruneIntendsToMoveTheBackup() throws {
+        let f = try fixture(),old = try snapshot(f,"old")
+        try age(f,old)
+        _ = try configure(f)
+        let latest = try snapshot(f,"latest")
+        let router = try XCTUnwrap(f.router),owner = f.owner,trash = f.workspace
+        let path = try XCTUnwrap(old["path"] as? String)
+        let pin = expectation(description:"owner pins the candidate before the move")
+        let result = router.applyAutomaticBackupRetention(after:latest["operation_id"] as? String,observe:{phase in
+            guard phase == "prune_intent_committed" else {return}
+            DispatchQueue.global().async {
+                defer {pin.fulfill()}
+                do {
+                    _ = try router.executeStorageBackupPruning(method:"backup_pin",params:["path":path,"pinned":true,"command_id":UUID().uuidString],caller:owner,trashRoot:trash)
+                }
+                catch {XCTFail(String(describing:error))}
+            }
+            self.wait(for:[pin],timeout:5)
+        })
+        XCTAssertEqual(result["status"] as? String,"complete")
+        XCTAssertEqual(result["moved_count"] as? Int,0)
+        XCTAssertTrue(exists(old))
     }
     func testInterruptedAutomaticMoveReconcilesWithoutSecondTrashMove() throws {
         let f = try fixture(),old = try snapshot(f,"old");try age(f,old)
@@ -205,9 +236,11 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
             try CommandRouter.enqueueAutomaticBackupRetention(db,root:f.root,incarnation:f.router!.incarnation,operation:trigger)
             XCTAssertNotNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'"))
         }
-        // Simulates termination after receipt/due commit and before post-commit
-        // apply: the constructor receives owned Trash before startup recovery.
+        // Simulates termination after the backup receipt and due marker commit.
         try reopen(f)
+        XCTAssertTrue(exists(old),"Opening the store leaves the durable turn queued")
+        XCTAssertNotNil(try f.router!.nextArchiveCleanupDeadline())
+        try f.router!.runStorageMaintenance()
         XCTAssertFalse(exists(old));XCTAssertTrue(exists(latest))
         let result = try last(f)
         XCTAssertEqual(result["trigger_operation_id"] as? String,trigger)
@@ -231,7 +264,9 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
     func testPruneReachesATrashWhoseRootRefusesOpen() throws {
         let f = try fixture(),trash = try refusingTrash(f),old = try snapshot(f,"old");try age(f,old)
         _ = try configure(f)
-        let latest = try snapshot(f,"latest"),result = try last(f)
+        let latest = try snapshot(f,"latest")
+        try f.router!.runStorageMaintenance()
+        let result = try last(f)
         XCTAssertEqual(result["status"] as? String,"complete",String(describing:result))
         XCTAssertEqual(result["moved_count"] as? Int,1);XCTAssertTrue(exists(latest));XCTAssertFalse(exists(old))
         let moved = try XCTUnwrap((result["moved_to_trash"] as? [JSON])?.first?["trash_path"] as? String)
@@ -277,6 +312,7 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
         print("P360D trash_root=\(trash.path) open_fd=\(probe) errno=\(refusal)")
         _ = try configure(f)
         _ = try snapshot(f,"new")
+        _ = f.router!.applyAutomaticBackupRetention()
         let result = try last(f)
         print("P360D result=\(try jsonString(result))")
         XCTAssertEqual(result["status"] as? String,"complete");XCTAssertFalse(exists(old))
@@ -292,6 +328,8 @@ final class StorageAutomaticBackupRetentionTests: XCTestCase {
         XCTAssertEqual(result["status"] as? String,"deferred");XCTAssertTrue(exists(old))
         try f.router!.dbQueue.read {db in XCTAssertNotNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'"))}
         try reopen(f)
+        XCTAssertTrue(exists(old))
+        XCTAssertEqual(f.router!.applyAutomaticBackupRetention()["status"] as? String,"complete")
         XCTAssertFalse(exists(old))
         try f.router!.dbQueue.read {db in XCTAssertNil(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='backup-automatic-prune-due'"))}
     }

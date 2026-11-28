@@ -491,7 +491,11 @@ final class ChecklistStore: ObservableObject {
     var currentProject: Record? { projectID.flatMap { project($0) } }
     var outstandingRequests: [Record] { requests.filter { !["answered", "canceled", "superseded", "resolved"].contains(Canceled.normalized($0.string("state"))) } }
     var yourTasks: [Record] { tasks.filter { !$0.bool("archived") && !$0.bool("trashed") && ($0.string("planned_assignee") == "human" || $0.object("planned_assignee")["kind"] as? String == "human" || $0.string("assignee") == "human") && !["done", "completed", "canceled"].contains(Canceled.normalized($0.string("status_category"))) } }
-    var needsCount: Int { ticketCatalog.needsCount ?? (outstandingRequests.count + yourTasks.count) }
+    var backupCapacityAttention: Record? {
+        guard let value = service.values["backup_capacity_attention"] as? [String: Any], !value.isEmpty else { return nil }
+        return Record(values: value)
+    }
+    var needsCount: Int { (ticketCatalog.needsCount ?? (outstandingRequests.count + yourTasks.count)) + (backupCapacityAttention == nil ? 0 : 1) }
     var service: Record { (usesTicketPages || page == .overview ? ticketCatalog.service : workspaceObservation.page?.service) ?? selectedTicketDisplay?.service ?? otherDetailObservation.page?.service ?? Record(values: data["service"] as? [String: Any] ?? [:]) }
     var buildLabel: String { BuildIdentity.current }
 

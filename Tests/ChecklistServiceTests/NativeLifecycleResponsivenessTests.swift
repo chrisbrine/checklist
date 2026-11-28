@@ -235,7 +235,8 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
     private func retire(_ fixture: Fixture) throws {
         let coordinator = fixture.coordinator
         for _ in 0..<2 {
-            coordinator.storageQueue.sync {}; coordinator.workHealthQueue.sync {}; coordinator.queue.sync {}
+            coordinator.storageQueue.sync {}; coordinator.workHealthQueue.sync {}
+            coordinator.nativeLifecycle.closureQueue.sync {}; coordinator.queue.sync {}
         }
         coordinator.queue.sync {
             coordinator.storageWake?.cancel(); coordinator.workHealthWake?.cancel()
@@ -449,6 +450,21 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
         }
         let coordinator = fixture.coordinator, router = coordinator.router
         let finished = DispatchSemaphore(value: 0), results = WorkloadResults()
+        let gateEntered = DispatchSemaphore(value:0), gateRelease = DispatchSemaphore(value:0)
+        let gateFinished = DispatchSemaphore(value:0), readFinished = DispatchSemaphore(value:0)
+        DispatchQueue.global().async {
+            defer {gateFinished.signal()}
+            do {
+                try ArchiveStorageGate.withExclusive(root:router.root) { _ in
+                    gateEntered.signal()
+                    guard gateRelease.wait(timeout:.now()+15) == .success else {
+                        throw NSError(domain:"NativeClosureFixtureGateNotReleased",code:1)
+                    }
+                }
+            } catch {results.failed(error)}
+        }
+        defer {gateRelease.signal();_ = gateFinished.wait(timeout:.now()+15)}
+        XCTAssertEqual(gateEntered.wait(timeout:.now()+5),.success)
         coordinator.queue.sync {
             coordinator.waiters[UUID()] = {
                 do {
@@ -463,14 +479,29 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
             }
             // Only this task's conversation closes. An unrelated closure can
             // legitimately wake a general waiter before this task is released.
-            let target = fixture.enrollments[0].sessionID
+            let enrollment = fixture.enrollments[0], target = enrollment.sessionID
             coordinator.nativeLifecycle.inspect = { registration in
-                .init(process: registration.sessionID == target ? .gone : .running,
+                if registration.sessionID == target {
+                    coordinator.queue.async {
+                        defer {readFinished.signal()}
+                        do {
+                            let response = try router.handle(method:"task_get",params:["project_id":fixture.project,"task_id":fixture.readTask],
+                                caller:Caller(role:"owner",installation:"before-closure-reader",projectIDs:[]))
+                            if coordinator.enrollmentSnapshot().committed[enrollment.installation]?.revoked != true ||
+                                (response["data"] as? JSON)?["active_attempt_id"] == nil {
+                                throw NSError(domain:"NativeClosureEarlyRelease",code:1)
+                            }
+                        } catch {results.failed(error)}
+                    }
+                }
+                return .init(process: registration.sessionID == target ? .gone : .running,
                     registry: registration.sessionID == target ? .absent : .matching,
                     detail: "Owned asynchronous closure fixture")
             }
             coordinator.observeNativeConversationLifecycles()
         }
+        XCTAssertEqual(readFinished.wait(timeout:.now()+5),.success,"The held archive gate must leave the command queue available")
+        gateRelease.signal()
         XCTAssertEqual(finished.wait(timeout: .now() + 10), .success)
         coordinator.queue.sync { coordinator.waiters.removeAll() }
         XCTAssertTrue(results.snapshot().errors.isEmpty, "The closure waiter must observe the committed release")

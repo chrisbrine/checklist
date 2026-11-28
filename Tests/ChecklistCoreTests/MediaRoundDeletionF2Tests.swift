@@ -249,7 +249,9 @@ extension MediaRoundDeletionTests {
             XCTAssertTrue(try f.router.dbQueue.read {_ in f.router.mediaRoundDeletionPreparations.isEmpty},"Success and refusal must both release preparation ownership")
             XCTAssertEqual(try f.record(neighborID,"storage_job")["state"] as? String,"committed")
             _ = try results.call(f,"message_send",["task_id":task["id"]!,"kind":"note","body":"F2 note after preparation releases housekeeping"],as:writer)
-            XCTAssertEqual(try f.record(neighborID,"storage_job")["state"] as? String,"settled","The next ordinary-note maintenance pass must resume the retained import")
+            XCTAssertEqual(try f.record(neighborID,"storage_job")["state"] as? String,"committed")
+            try f.router.runArchiveStorageMaintenance()
+            XCTAssertEqual(try f.record(neighborID,"storage_job")["state"] as? String,"settled","The background maintenance pass must resume the retained import")
             XCTAssertEqual(try f.get(neighbor)["id"] as? String,neighbor["id"] as? String)
             XCTAssertTrue(try f.router.dbQueue.read {_ in f.router.mediaRoundDeletionPreparations.isEmpty})
         }

@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import XCTest
 import MCP
 import ChecklistIPC
@@ -61,6 +62,41 @@ final class InitializeCompatibilityTransportTests: XCTestCase {
             let bytes = Data(frame.utf8)
             XCTAssertEqual(InitializeCompatibilityTransport.supportedInitialize(bytes), bytes, frame)
         }
+    }
+
+    func testConcurrentResponsesFinishEachFrameBeforeStartingAnother() async throws {
+        let base = SuspendingTransport()
+        let transport = await InitializeCompatibilityTransport(base)
+        let messages = (0..<16).map { Data("frame-\($0)".utf8) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for message in messages {
+                group.addTask { try await transport.send(message) }
+            }
+            try await group.waitForAll()
+        }
+        let (maximum, sent) = await base.result()
+        XCTAssertEqual(maximum, 1)
+        XCTAssertEqual(Set(sent), Set(messages))
+    }
+
+    private actor SuspendingTransport: Transport {
+        nonisolated let logger = Logger(label: "checklist.test.suspending-transport")
+        private var active = 0
+        private var maximum = 0
+        private var sent: [Data] = []
+
+        func connect() async throws {}
+        func disconnect() async {}
+        func receive() -> AsyncThrowingStream<Data, Error> { AsyncThrowingStream { $0.finish() } }
+        func send(_ data: Data) async throws {
+            active += 1
+            maximum = max(maximum, active)
+            defer { active -= 1 }
+            try await Task.sleep(for: .milliseconds(10))
+            sent.append(data)
+        }
+
+        func result() -> (Int, [Data]) { (maximum, sent) }
     }
 
     func testRawCodexInitializeThenCatalogAndPingUseOnlyFakeBridge() async throws {

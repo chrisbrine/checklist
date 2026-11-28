@@ -28,7 +28,10 @@ extension EvidenceAuthorityTests {
     }
     private func checkHealth(at date: Date = Date()) throws {
         // Only this deterministic one-page fixture invocation; never a polling loop.
-        _ = try router.runWorkHealthChecks(at:date)
+        let result = try router.runWorkHealthChecks(at:date)
+        if result["deferred"] as? Bool == true {
+            throw CoreError("TEST_HEALTH_DEFERRED","The fixture requires a completed work-health page.",details:result)
+        }
     }
     private func respondHealth(_ p: JSON, _ t: JSON, request: String, caller: Caller, progress: String = "Still handling this; awaiting the bounded build") throws -> JSON {
         try call("work_health_respond", ["project_id":p["id"]!, "task_id":t["id"]!, "request_id":request, "expected_revision":healthTask(p,t)["revision"]!, "progress":progress], caller)
@@ -289,7 +292,7 @@ extension EvidenceAuthorityTests {
     func testWorkHealthLateReplyAfterTakeoverPreservesNewClaimAndAssignment() throws {
         let p = try project(), t = try ready(p), first = try native(p,"health-old",domain:"health-old"), next = try native(p,"health-new",domain:"health-new")
         let a = try claim(p,t,caller:first); try ageHealthAttempt(a); try checkHealth()
-        let mid = try health(p,t)["request_id"] as! String, current = try healthTask(p,t)
+        let mid = try XCTUnwrap(health(p,t)["request_id"] as? String), current = try healthTask(p,t)
         let replacement = try call("work_takeover",["project_id":p["id"]!,"task_id":t["id"]!,"expected_revision":current["revision"]!,"reason":"Explicit takeover for this fixture"],next)
         let before = try healthTask(p,t)
         XCTAssertEqual(try respondHealth(p,t,request:mid,caller:first)["outcome"] as? String,"fresh_claim_or_handoff_required")

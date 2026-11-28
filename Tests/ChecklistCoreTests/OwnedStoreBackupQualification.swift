@@ -184,7 +184,7 @@ enum OwnedStoreBackupQualification {
     static func diagnoseInventory(_ root: URL) throws -> Object {
         let started = ProcessInfo.processInfo.systemUptime,files = try StorageObjectFiles(root:root)
         var budget = StorageSnapshotBudget(deadlineUptime:started+300,canceled:{false})
-        budget.maximumRecords = 1_000_000;budget.maximumObjects = 1_000_000
+        budget.maximumObjects = 1_000_000
         budget.maximumBytes = 1_099_511_627_776;budget.maximumObjectBytes = 1_099_511_627_776
         let queue = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration(readonly:true));defer {try? queue.close()}
         let inventory = try queue.read {try StorageSnapshotAuthority.inventory($0,root:root,budget:budget,retainedExists:{try files.regularOrLinkExists($0)})}

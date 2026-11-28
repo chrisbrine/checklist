@@ -50,6 +50,7 @@ final class CommandOperations: @unchecked Sendable {
         let params: Data
         let method: String
         let mediaRoundDeletionProject: Data?
+        let workAuthorityProject: Data?
         let caller: Caller
         let generation: String?
         let lease: StorageOperationLease
@@ -58,6 +59,7 @@ final class CommandOperations: @unchecked Sendable {
     private var queue: DispatchQueue?
     private var mediaRoundDeletionQueue: DispatchQueue?
     private var jobs: [String:Job] = [:]
+    private var workAuthorityJobs: [Job] = []
     // Each large preparation can use four CPU-intensive snapshot readers.
     // Leave excess project heads queued without dispatching blocked workers.
     private static let mediaRoundDeletionLimit = 2
@@ -206,6 +208,8 @@ final class CommandOperations: @unchecked Sendable {
         lock.withLock {
             if job.mediaRoundDeletionProject != nil {
                 mediaRoundDeletions.append(job)
+            } else if job.workAuthorityProject != nil {
+                workAuthorityJobs.append(job)
             } else {
                 jobs[job.id] = job
             }
@@ -228,6 +232,15 @@ final class CommandOperations: @unchecked Sendable {
                 scheduledMediaRoundDeletions += 1
                 schedule(job,on:mediaRoundDeletionQueue ?? queue,router:router)
             }
+            // Checkpoints and delegated authority can change the same attempt
+            // or project lane reservation. An earlier project head settles
+            // before later authority work, while other projects can start.
+            var authorityProjects = Set<Data>()
+            for job in workAuthorityJobs {
+                guard let project = job.workAuthorityProject,authorityProjects.insert(project).inserted,
+                      scheduled.insert(job.id).inserted else { continue }
+                schedule(job,on:queue,router:router)
+            }
             for job in jobs.values where scheduled.insert(job.id).inserted {schedule(job,on:queue,router:router)}
         }
     }
@@ -244,6 +257,8 @@ final class CommandOperations: @unchecked Sendable {
                 if job.mediaRoundDeletionProject != nil {
                     scheduledMediaRoundDeletions -= 1
                     if finished {mediaRoundDeletions.removeAll {$0.attempt == job.attempt}}
+                } else if job.workAuthorityProject != nil {
+                    if finished {workAuthorityJobs.removeAll {$0.attempt == job.attempt}}
                 } else if finished,jobs[job.id]?.attempt == job.attempt {
                     jobs.removeValue(forKey:job.id)
                 }
@@ -271,19 +286,20 @@ extension CommandRouter {
         let id = Self.commandOperationID(principal:caller.principal,command:command)
         return try readForPreparation {try self.operationRecord($0,id:id) != nil}
     }
-    static let alwaysOperationMethods: Set<String> = [
+    static let workAuthorityOperationMethods: Set<String> = ["work_checkpoint","work_child_accept"]
+    static let alwaysOperationMethods: Set<String> = workAuthorityOperationMethods.union([
         "backup_create","restore_create","restore_preview","backup_prune_preview","backup_prune","backup_incomplete_preview","backup_incomplete_retire","attachment_cleanup_preview",
         "import_preview","import_commit","import_rollback","export_project",
         "media_intake_preview","media_intake_capture","media_intake_confirm","media_round_publish","media_context_reconcile","project_icon_import",
         "task_purge_preview","task_purge","epic_delete","media_round_delete",
         "policy_preview","policy_propose","policy_apply","status_retire","relation_import",
         "media_publication_preview","media_type_adopt","media_type_retire","media_context_approve","media_round_finish","media_round_successor"
-    ]
+    ])
     static let operationEvidenceMethods = sourceTargetMethods.union([
         "review_context","review_prepare","review_batch_inputs","work_takeover",
         "human_request_create","human_request_revise","task_get"
     ])
-    static let operationCredentialMethods: Set<String> = ["work_claim","batch_claim","work_takeover"]
+    static let operationCredentialMethods: Set<String> = ["work_claim","batch_claim","work_takeover","work_child_accept"]
     /// Methods that needsCommandOperation routes for some inputs only. The catalog
     /// and docs/mcp-contract.md name them; CommandOperationTests checks both.
     static let conditionalOperationMethods: Set<String> = sourceCaptureMethods.union(operationEvidenceMethods)
@@ -408,7 +424,8 @@ extension CommandRouter {
         }
         return value
     }
-    func commandOperationRead(params: JSON,caller: Caller,byCommand: Bool = false,observeWriterWait: ((TimeInterval) -> Void)? = nil) throws -> JSON? {
+    func commandOperationRead(params: JSON,caller: Caller,byCommand: Bool = false,observeWriterWait: ((TimeInterval) -> Void)? = nil,
+                              independentRead: Bool = false) throws -> JSON? {
         let readLease = try storageAdmission.acquire();defer {readLease.finish()}
         let id: String
         if byCommand {id = Self.commandOperationID(principal:caller.principal,command:try text(params,"command_id",max:100))}
@@ -437,15 +454,30 @@ extension CommandRouter {
         }
         let result = try readForPreparation {try read($0)}
         if let payload = result?["data"] as? JSON,payload["state"] as? String == "succeeded",
-           Self.operationCredentialMethods.contains(payload["method"] as? String ?? "") {
+           let method = payload["method"] as? String, Self.operationCredentialMethods.contains(method) {
             guard let reply = try backupWrites.withImmediateAccess({
                 let lease = try storageAdmission.acquire();defer {lease.finish()}
-                return try ArchiveStorageGate.withExclusive(root:root) { _ in
-                    let queued = observeWriterWait.map {_ in ProcessInfo.processInfo.systemUptime}
-                    return try dbQueue.writeWithoutTransaction {db in
-                        if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime-queued)}
-                        return try read(db,credentials:true)
+                let queued = observeWriterWait.map {_ in ProcessInfo.processInfo.systemUptime}
+                func refresh(_ db: Database) throws -> JSON? {
+                    if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime - queued)}
+                    return try read(db,credentials:true)
+                }
+                if independentRead {
+                    // Issuing a fresh claim token mutates its canonical hash.
+                    // A status read may use an immediately available turn.
+                    let work = "operation.credentials." + method
+                    let attempted = try ArchiveStorageGate.withMaintenanceAccess(root:root,work:work) { _,deadline in
+                        try dbQueue.tryMaintenanceWrite(label:work,deadline:deadline) { db,_ in try refresh(db) }
+                    } ?? nil
+                    guard let result = attempted else {
+                        throw CoreError("OPERATION_RESULT_BUSY",
+                            "The operation succeeded. Retry this read to refresh its claim credential.",
+                            details:["operation_id":id,"retryable":true])
                     }
+                    return result
+                }
+                return try ArchiveStorageGate.withExclusive(root:root) { _ in
+                    try dbQueue.writeWithoutTransaction {try refresh($0)}
                 }
             }) else {throw CoreError("BACKUP_CAPTURE_ACTIVE","The operation succeeded; credential projection waits for backup write admission. Read the same operation again.",details:["command_outcome":"unknown","operation_id":id])}
             return reply
@@ -461,7 +493,7 @@ extension CommandRouter {
         }
     }
     func acceptCommandOperation(method: String,params input: JSON,caller: Caller,observeWriterWait: ((TimeInterval) -> Void)? = nil,
-                                expectedGeneration: String? = nil) throws -> JSON {
+                                expectedGeneration: String? = nil,preferImmediateWriter: Bool = false) throws -> JSON {
         var params = input
         if Self.readMethods.contains(method),params["command_id"] == nil {params["command_id"] = uuid()}
         let command = try text(params,"command_id",max:100)
@@ -533,14 +565,23 @@ extension CommandRouter {
         let operation: JSON
         // Admission and the capture flag share one atomic writer count: capture
         // cannot acquire its SQLite lease between this check and the SQL write.
-        if let canonical = try backupWrites.withImmediateAccess({
+        if let canonical = try backupWrites.withImmediateAccess({ () throws -> JSON? in
             let queued = observeWriterWait.map {_ in ProcessInfo.processInfo.systemUptime}
+            if preferImmediateWriter || Self.workAuthorityOperationMethods.contains(method) {
+                return try dbQueue.tryMaintenanceWrite(label:"operation.admit."+method,deadline:.init()) { db,deadline in
+                    if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime-queued)}
+                    return try deadline.transaction(db) {try accept(db,persist:true)}
+                }
+            }
             return try dbQueue.write {db in
                 if let queued {observeWriterWait?(ProcessInfo.processInfo.systemUptime-queued)}
                 return try accept(db,persist:true)
             }
-        }) {operation = canonical}
+        }) ?? nil {operation = canonical}
         else {
+            // An independent read can also reach this durable admission path
+            // when another normal command owns the writer.
+            schedule = false
             let staged = try readForPreparation {db -> (JSON,String?) in
                 let base = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:[Self.commandOperationKey(id)])
                 return (try accept(db,persist:false),base.map {hash(Data($0.utf8))})
@@ -549,9 +590,12 @@ extension CommandRouter {
             operation = staged.0
         }
         if schedule {
-            let deletionProject = method == "media_round_delete" ? (params["project_id"] as? String).map {Data($0.utf8)} : nil
+            let project = (params["project_id"] as? String).map {Data($0.utf8)}
+            let deletionProject = method == "media_round_delete" ? project : nil
+            let authorityProject = Self.workAuthorityOperationMethods.contains(method) ? project : nil
             let job = CommandOperations.Job(id:id,params:try JSONSerialization.data(withJSONObject:params),method:method,
-                                            mediaRoundDeletionProject:deletionProject,caller:caller,generation:generation,lease:lease)
+                                            mediaRoundDeletionProject:deletionProject,workAuthorityProject:authorityProject,
+                                            caller:caller,generation:generation,lease:lease)
             retained = true;commandOperations.add(job,router:self)
         }
         // Acceptance always identifies the same operation, including on replay.
@@ -668,7 +712,7 @@ extension CommandRouter {
             } else {try markRunning()}
             commandOperations.executionProbe?(job.id)
             switch job.method {
-            case "media_round_delete", "epic_delete", "import_rollback", "task_archive", "backup_incomplete_retire":
+            case "media_round_delete", "epic_delete", "import_rollback", "task_archive", "backup_incomplete_retire", "work_checkpoint", "work_child_accept":
                 output = try handle(method:job.method,params:params,caller:job.caller,observeOperationWriterWait:nil,
                                     expectedAuthorizationGeneration:job.generation)
             default:

@@ -14,25 +14,58 @@ enum StorageMaintenanceWarning: Equatable {
 }
 
 extension CommandRouter {
-    /// This tail is best effort only. It cannot change a committed semantic result.
-    /// Error text, paths and record identities never enter the public warning.
-    /// Deferred infrastructure failures get a one-shot retry. Per-object failure
-    /// suspension still requires the existing explicit retry authority.
-    func performStorageMaintenance(_ db: Database, permit: ArchiveStoragePermit, archiveScan: PreparedArchiveCleanupScan? = nil) -> StorageMaintenanceWarning? {
-        do {
-            // CL-363: the cleanup pass below does not read the hold a second time. It accepts this
-            // read only after `permit.requireRoot`: a permit that is active there was active here.
-            if try StorageSnapshotRetention.isActive(root:root) {return .backupCapture}
-            if let retry = storageMaintenanceRetryAt,retry > Date() {return .retryPending}
-            let importWarning = try reconcileManagedAttachmentImports(db)
-            try processArchiveCleanupJobs(db, permit: permit, nowMS: Int64(Date().timeIntervalSince1970 * 1000), prepared: archiveScan, noCaptureUnderPermit: true)
-            storageMaintenanceFallbackFailures = 0
-            storageMaintenanceRetryAt = nil
-            return importWarning
-        } catch {
-            storageMaintenanceFallbackFailures = min(storageMaintenanceFallbackFailures + 1, 2)
+    /// A command can describe a pending continuation without running it.
+    func currentStorageMaintenanceWarning() -> StorageMaintenanceWarning? {
+        if (try? StorageSnapshotRetention.isActive(root:root)) == true {return .backupCapture}
+        guard let retry = storageMaintenanceRetryAt,retry > Date() else {return nil}
+        return storageMaintenanceFallbackFailures >= 2 ? .suspended : .retryPending
+    }
+
+    /// Imports and archive cleanup take separate background admissions. The
+    /// deadline is shared by the gate and the SQLite step.
+    func runArchiveStorageMaintenance() throws {
+        guard !(storageMaintenanceRetryAt.map {$0 > Date()} ?? false) else {return}
+        guard let readers else {
             storageMaintenanceRetryAt = Date().addingTimeInterval(60)
-            return storageMaintenanceFallbackFailures == 2 ? .suspended : .retryPending
+            return
+        }
+        let now = archiveCleanupNowMS()
+        let (importDue,archiveIDs) = try readers.read {db in
+            (try self.managedImportsNeedMaintenance(db),try self.dueArchiveCleanupJobIDs(db,nowMS:now))
+        }
+        var importWarning: StorageMaintenanceWarning?
+        var deferred = false
+        do {
+            if importDue {
+                do {importWarning = try runManagedAttachmentImportMaintenance()}
+                catch is MaintenanceStepDeferred {deferred = true}
+            }
+            if !archiveIDs.isEmpty {
+                let scan = prepareArchiveCleanupJobScan(nowMS:now,ids:archiveIDs)
+                defer {finishArchiveCleanupScan(scan)}
+                let admitted = try withMaintenanceGateAndWriter(label:"archive_cleanup.execute") {db,permit,deadline in
+                    try self.processArchiveCleanupJobs(db,permit:permit,nowMS:now,prepared:scan,deadline:deadline,dueIDs:archiveIDs)
+                    return true
+                }
+                deferred = deferred || admitted != true || scan == nil
+            }
+            if deferred {
+                storageMaintenanceRetryAt = Date().addingTimeInterval(0.25)
+                return
+            }
+            // These counters are also changed by the explicit retry command.
+            _ = try withMaintenanceWriter(label:"storage_maintenance.state") {_,_ in
+                self.storageMaintenanceFallbackFailures = 0
+                self.storageMaintenanceRetryAt = importWarning == nil ? nil : Date().addingTimeInterval(60)
+                return true
+            }
+        } catch {
+            _ = try? withMaintenanceWriter(label:"storage_maintenance.state") {_,_ in
+                self.storageMaintenanceFallbackFailures = min(self.storageMaintenanceFallbackFailures + 1,2)
+                return true
+            }
+            storageMaintenanceRetryAt = Date().addingTimeInterval(60)
+            throw error
         }
     }
 

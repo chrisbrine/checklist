@@ -3,7 +3,7 @@ import GRDB
 @testable import ChecklistCore
 
 final class StorageDeadlineReadTests: XCTestCase {
-    func testForegroundCleanupAdmissionReadsOnlyIndexedJobFamily() throws {
+    func testBackgroundCleanupAdmissionReadsOnlyIndexedJobFamily() throws {
         let f = try ReadPerformanceFixture("CL-283-cleanup-admission"), router = f.router
         let statements = LockedTestState<[String]>([])
         router.dbQueue.writeWithoutTransaction { db in
@@ -11,6 +11,14 @@ final class StorageDeadlineReadTests: XCTestCase {
         }
         _ = try f.call("project_create",["name":"Indexed admissions","key_prefix":"IA"])
         router.dbQueue.writeWithoutTransaction { $0.trace(options:[]) }
+        XCTAssertFalse(statements.snapshot.contains { $0.contains("SELECT j.id FROM records j LEFT JOIN records c") })
+
+        let readers = try XCTUnwrap(router.readers)
+        try readers.read { db in
+            db.trace { if case .statement(let statement) = $0 { statements.withLock { $0.append(statement.expandedSQL) } } }
+        }
+        defer {try? readers.read { $0.trace(options:[]) }}
+        try router.runArchiveStorageMaintenance()
         let admission = try XCTUnwrap(statements.snapshot.first { $0.contains("SELECT j.id FROM records j LEFT JOIN records c") })
         try router.dbQueue.read { db in
             let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + admission).map { $0["detail"] as String }
@@ -24,19 +32,20 @@ final class StorageDeadlineReadTests: XCTestCase {
         _ = try f.call("project_create",["name":"Indexed deadlines","key_prefix":"ID"])
         let readers = try XCTUnwrap(router.readers)
         let statements = LockedTestState<[String]>([])
-        try readers.read { db in
+        _ = try router.nextArchiveCleanupDeadline(observeRead:{ db in
             db.trace { if case .statement(let statement) = $0 { statements.withLock { $0.append(statement.expandedSQL) } } }
-        }
-        _ = try router.nextArchiveCleanupDeadline()
-        try readers.read { $0.trace(options:[]) }
-        let metadata = statements.snapshot.filter { $0.contains("json_valid") }
+        })
+        let metadata = statements.snapshot.filter { $0.contains("json_valid") && $0.contains("rowid IN") }
         XCTAssertEqual(metadata.count,4)
+        let imports = try XCTUnwrap(statements.snapshot.first { $0.contains("'attachment_import'") && $0.contains("json_valid") })
         try readers.read { db in
             for sql in metadata {
                 let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + sql)
                 XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("COVERING INDEX records_scope") })
                 XCTAssertTrue(plan.contains { ($0["detail"] as String).contains("INTEGER PRIMARY KEY") })
             }
+            let importPlan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + imports).map { $0["detail"] as String }
+            XCTAssertTrue(importPlan.contains { $0.contains("USING INDEX records_scope") },importPlan.joined(separator:"\n"))
         }
     }
 
@@ -69,24 +78,24 @@ final class StorageDeadlineReadTests: XCTestCase {
 extension StorageDeadlineReadTests {
     func testDeadlineReadParticipatesInDrainAndNewReadsStayFenced() throws {
         let f = try ReadPerformanceFixture("CL-283-deadline-drain"), router = f.router
-        let readers = try XCTUnwrap(router.readers)
         let started = DispatchSemaphore(value:0), resume = DispatchSemaphore(value:0)
         let finished = expectation(description:"deadline read released")
         let failure = LockedTestState<Error?>(nil)
         let gated = LockedTestState(false)
-        try readers.read { db in
-            db.trace(options:.profile) { event in
-                if case .profile(let statement, _) = event, statement.sql.contains("SELECT MIN"), gated.withLock({ value in
-                    if value { return false }; value = true; return true
-                }) {
-                    started.signal()
-                    _ = resume.wait(timeout:.now()+10)
-                }
-            }
-        }
         DispatchQueue.global().async {
             defer {finished.fulfill()}
-            do {_ = try router.nextArchiveCleanupDeadline()}
+            do {
+                _ = try router.nextArchiveCleanupDeadline(observeRead:{ db in
+                    db.trace(options:.profile) { event in
+                        if case .profile(let statement, _) = event, statement.sql.contains("SELECT MIN"), gated.withLock({ value in
+                            if value { return false }; value = true; return true
+                        }) {
+                            started.signal()
+                            _ = resume.wait(timeout:.now()+10)
+                        }
+                    }
+                })
+            }
             catch {failure.withLock { $0 = error };started.signal()}
         }
         defer {resume.signal()}
@@ -100,6 +109,5 @@ extension StorageDeadlineReadTests {
         resume.signal();wait(for:[finished],timeout:10)
         XCTAssertNil(failure.snapshot)
         XCTAssertTrue(try router.waitForStorageDrain(drain,timeout:0,caller:f.owner))
-        try readers.read {$0.trace(options:[])}
     }
 }

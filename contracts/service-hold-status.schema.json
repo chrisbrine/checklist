@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Service hold watchdog status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["active", "recent"],
+  "properties": {
+    "active": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/hold", "properties": {"active": {"const": true}}}
+    },
+    "recent": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/hold", "properties": {"active": {"const": false}}}
+    }
+  },
+  "$defs": {
+    "hold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "duration_ms", "resource", "work", "active"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "duration_ms": {"type": "number", "exclusiveMinimum": 1000},
+        "resource": {"enum": ["command_queue", "writer", "archive_storage_gate"]},
+        "work": {"type": "string", "minLength": 1},
+        "active": {"type": "boolean"}
+      }
+    }
+  }
+}

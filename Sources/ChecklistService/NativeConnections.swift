@@ -29,7 +29,7 @@ extension Coordinator {
     func bootstrap(_ context:[String:Any], connection:NSXPCConnection, currentConnectionOnly: Bool = false,
                    timing: ServiceCallTiming? = nil) throws -> BootstrapResult {
         let native = try ServiceCallTiming.measure(timing,"bootstrap_native_peer_ms") {
-            try verifiedNativeWorkspace(context, connection: connection)
+            try verifiedNativeWorkspace(context,peerPID:connection.processIdentifier)
         }
         return try bootstrapVerifiedWorkspace(context, native: native, readCredential: credentials.read,
             currentConnectionOnly: currentConnectionOnly, timing:timing)
@@ -38,7 +38,9 @@ extension Coordinator {
     // Peer/process verification stays at the XPC boundary; this stage retains all grant checks.
     func bootstrapVerifiedWorkspace(_ context: [String: Any], native: VerifiedNativeWorkspace,
                                     readCredential: (String) throws -> String?, currentConnectionOnly: Bool = false,
-                                    timing: ServiceCallTiming? = nil) throws -> BootstrapResult {
+                                    timing: ServiceCallTiming? = nil, readEnrollments: [String:Enrollment]? = nil) throws -> BootstrapResult {
+        if readEnrollments != nil {precondition(currentConnectionOnly)}
+        let directory = readEnrollments ?? enrollments
         let (provider, sid, process, executionDomain, workspace) = (native.provider, native.session, native.process, native.executionDomain, native.workspace)
         let plugin = ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession)!
         let owner=Caller(role:"owner",installation:"native-thread-bootstrap",projectIDs:[])
@@ -49,7 +51,10 @@ extension Coordinator {
         guard context["mode"] == nil || relay else { throw ChecklistError("INVALID_CONNECTION_MODE","Use worker or personal-assistant relay access.") }
         if relay && ProviderPluginRegistry.bundled.plugin(provider, requiring: .assistantRelay) == nil { throw ChecklistError("ADAPTER_UNAVAILABLE","The personal-assistant helper currently uses native Codex.") }
         let resolved = try ServiceCallTiming.measure(timing,"bootstrap_workspace_resolution_ms") {
-            try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
+            if readEnrollments != nil {
+                return try router.handleIndependentRead(method:"project_resolve",params:["workspace_path":workspace],caller:owner)
+            }
+            return try router.handle(method:relay ? "project_list":"project_resolve",params:relay ? [:]:["workspace_path":workspace],caller:owner)
         }
         let body=resolved["data"] as? [String:Any] ?? resolved
         var projects=body["projects"] as? [[String:Any]] ?? []
@@ -81,29 +86,29 @@ extension Coordinator {
         // Project creation had to choose an identity before its project ID existed.
         // Reuse that enrollment; an ordinary reconnect must preserve its receipt principal.
         let creationInstallation=NativeWorkspaceCreation.installation(provider:provider,session:sid,workspace:binding ?? workspace)
-        let installation = !relay && enrollments[creationInstallation]?.sessionID == sid ? creationInstallation : defaultInstallation
+        let installation = !relay && directory[creationInstallation]?.sessionID == sid ? creationInstallation : defaultInstallation
         if project["archived"] as? Bool == true {
             // Archiving hides ordinary discovery, not an existing worker's read/restore grant.
             // Never enroll, repair or rotate a connection here; Core still fences project writes.
-            guard !relay,let existing=enrollments[installation],existing.automatic == true,
+            guard !relay,let existing=directory[installation],existing.automatic == true,
                   existing.role == "worker",existing.assistantRelay != true,existing.revoked != true,existing.ownerRevoked != true,
                   existing.sessionID == boundSessionID,existing.provider == provider,existing.workspace == binding,
                   existing.projectIDs == [pid],existing.nativeExecutionDomain == executionDomain else {
                 throw ChecklistError("PROJECT_ARCHIVED","This workspace is archived. Only its existing active worker connection can read its history or restore it.")
             }
-            try requireCommittedRegistration(existing,project:pid,caller:owner)
+            try requireCommittedRegistration(existing,project:pid,caller:owner,readsOnly:readEnrollments != nil)
         }
-        guard !enrollments.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
-        if let earlier = enrollments[installation], earlier.nativeExecutionDomain != executionDomain,
-           earlier.ownerRevoked != true,
-           !nativeLifecycle.reconciled.contains(earlier.installation + "/" + earlier.generation) {
+        guard !directory.values.contains(where:{$0.sessionID == boundSessionID && $0.installation != installation}) else { throw ChecklistError("BINDING_CHANGED","This reported session is already bound to another connection. Use a thread created for this project.") }
+        if let earlier = directory[installation], earlier.nativeExecutionDomain != executionDomain, earlier.ownerRevoked != true {
             // Reconciliation fences local authority and commits closure effects.
             guard !currentConnectionOnly else { throw NativeBootstrapRequiresWrite() }
-            observeNativeConversationLifecycle(earlier)
+            if !nativeLifecycle.reconciled.contains(earlier.installation + "/" + earlier.generation) {
+                observeNativeConversationLifecycle(earlier)
+            }
         }
-        if var existing=enrollments[installation] {
+        if var existing=(readEnrollments ?? enrollments)[installation] {
             let session = try ServiceCallTiming.measure(timing,"bootstrap_canonical_session_ms") {
-                try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner)
+                try router.connectionSession(sessionID:boundSessionID,project:pid,caller:owner,readsOnly:readEnrollments != nil)
             }
             if let session {
                 guard session["owner_revoked"] as? Bool != true else {
@@ -112,7 +117,7 @@ extension Coordinator {
                 // A concurrent transport can see the continuation's staged local
                 // generation while pooled reads still see the earlier ended one.
                 // Wait for that commit, then reverify the complete request in FIFO.
-                if currentConnectionOnly, nativeLifecycle.resumptionInFlight,
+                if currentConnectionOnly, (readEnrollments != nil || nativeLifecycle.resumptionInFlight),
                    session["installation"] as? String != existing.installation + "/" + existing.generation {
                     throw NativeBootstrapRequiresWrite()
                 }
@@ -141,7 +146,10 @@ extension Coordinator {
             guard (existing.assistantRelay == true) == relay else { throw ChecklistError("CONNECTION_MODE_MISMATCH","This native thread cannot change its access role.") }
             // Ordinary MCP/client restarts do not rotate claims, deliveries or grants.
             let savedCredential = try ServiceCallTiming.measure(timing,"bootstrap_credential_read_ms") {try readCredential(installation)}
-            guard let credential = savedCredential, SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.") }
+            guard let credential = savedCredential, SHA256.hash(data: Data(credential.utf8)).map({ String(format: "%02x", $0) }).joined() == existing.tokenDigest else {
+                if readEnrollments != nil {throw NativeBootstrapRequiresWrite()}
+                throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This thread's saved credential does not match its enrollment. Repair it in Checklist.")
+            }
             if let session {
                 guard !["revoked","ended"].contains(session["state"] as? String ?? "") else { throw ChecklistError("CONNECTION_REVOKED","This thread was ended or disconnected. Its authority cannot be resumed automatically.") }
                 guard ConnectionCommit.registrationMatches(session, sessionID: existing.sessionID, installation: existing.installation, generation: existing.generation, role: existing.role, provider: existing.provider, projects: existing.projectIDs) else { throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "This prepared connection does not match its committed session. Repair it in Checklist.") }
@@ -169,7 +177,7 @@ extension Coordinator {
                     return BootstrapResult(reply:connectionResult(existing, project:pid),changed:true)
                 }
             }
-            try requireCommittedRegistration(existing, project: pid, caller: owner, timing:timing)
+            try requireCommittedRegistration(existing,project:pid,caller:owner,timing:timing,readsOnly:readEnrollments != nil)
             return BootstrapResult(reply:connectionResult(existing, project:pid),changed:false)
         }
         return try bootstrapWrite(currentConnectionOnly: currentConnectionOnly) {
@@ -188,6 +196,8 @@ extension Coordinator {
             if relay { enrollment.assistantGrants=grantMap;enrollment.relayPolicyRevisions=grantRevisions;enrollment.relaySelector=selector;enrollment.identityVerification="native_codex_helper_not_dot_identity" }
             if ProviderPluginRegistry.bundled.plugin(provider, requiring: .nativePeer) != nil,let endpoint=context["native_endpoint"] as? String { try bindProviderEndpoint(&enrollment,endpoint:endpoint,process:process) }
             // Save no caller-supplied role, projects, profile, title or human provenance.
+            beginStagingEnrollment(installation)
+            defer {finishStagingEnrollment(installation)}
             _ = try ConnectionCommit.perform(
                 saveCredential: { try credentials.write(installation, token) },
                 saveEnrollment: { enrollments[installation] = enrollment; try saveEnrollments() },
@@ -207,13 +217,13 @@ extension Coordinator {
     }
 
     /// Shared by bootstrap and workspace creation; never derive a folder from service cwd.
-    private func verifiedNativeWorkspace(_ context: [String: Any], connection: NSXPCConnection) throws -> VerifiedNativeWorkspace {
-        guard bundledCLI(connection.processIdentifier) else { throw ChecklistError("NATIVE_CLIENT_REQUIRED","Connect through the installed Checklist executable inside a Codex or Claude thread.") }
+    func verifiedNativeWorkspace(_ context: [String: Any], peerPID: pid_t) throws -> VerifiedNativeWorkspace {
+        guard bundledCLI(peerPID) else { throw ChecklistError("NATIVE_CLIENT_REQUIRED","Connect through the installed Checklist executable inside a Codex or Claude thread.") }
         guard let provider=context["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),
               let sid=context["native_session_id"] as? String,UUID(uuidString:sid) != nil else { throw ChecklistError("NATIVE_SESSION_REQUIRED","This process does not expose a supported native thread identity.") }
-        let process = try nativeProcess(connection.processIdentifier, provider:provider)
+        let process = try nativeProcess(peerPID,provider:provider)
         let executionDomain=try processDomain(process,provider:provider)
-        let workspace = try currentDirectory(connection.processIdentifier)
+        let workspace = try currentDirectory(peerPID)
         if let supplied=context["workspace_path"] as? String,canonical(supplied) != workspace { throw ChecklistError("WORKSPACE_MISMATCH","The supplied workspace differs from this process's actual working directory.") }
         try verifyProviderRegistry(plugin,process:process,session:sid,workspace:workspace,endpoint:context["native_endpoint"] as? String)
         return VerifiedNativeWorkspace(provider:provider,session:sid,process:process,executionDomain:executionDomain,workspace:workspace)
@@ -223,7 +233,7 @@ extension Coordinator {
         guard let context=request["native_context"] as? [String:Any], context["mode"] == nil else {
             throw ChecklistError("NATIVE_SESSION_REQUIRED","Project creation requires a verified native worker conversation in its actual workspace.")
         }
-        let native=try verifiedNativeWorkspace(context,connection:connection)
+        let native=try verifiedNativeWorkspace(context,peerPID:connection.processIdentifier)
         guard let supplied=request["workspace"] as? String,canonical(supplied) == native.workspace else {
             throw ChecklistError("WORKSPACE_MISMATCH","Use this conversation's actual workspace folder.")
         }
@@ -259,6 +269,8 @@ extension Coordinator {
         }
         let caller=Caller(role:"worker",installation:boundInstallation+"/"+generation,projectIDs:projects,sessionID:native.session,workspace:native.workspace,executionDomain:native.executionDomain)
         var priorCredential:String?,snapshotTaken=false
+        beginStagingEnrollment(boundInstallation)
+        defer {finishStagingEnrollment(boundInstallation)}
         return try router.commitWorkspaceProjectCreation(intent:intent,caller:caller,provider:native.provider,preparePersistence:{ pid in
             priorCredential=try credentials.read(boundInstallation);snapshotTaken=true
             var bytes=[UInt8](repeating:0,count:32)
@@ -286,9 +298,10 @@ extension Coordinator {
     }
 
     @discardableResult
-    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller, timing: ServiceCallTiming? = nil) throws -> String {
+    func requireCommittedRegistration(_ enrollment: Enrollment, project: String, caller: Caller, timing: ServiceCallTiming? = nil,
+                                      readsOnly: Bool = false) throws -> String {
         let currentSession = try ServiceCallTiming.measure(timing,"route_current_session_ms") {
-            try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller)
+            try router.connectionSession(sessionID:enrollment.sessionID,project:project,caller:caller,readsOnly:readsOnly)
         }
         guard let session = currentSession,
               ConnectionCommit.registrationMatches(session, sessionID: enrollment.sessionID, installation: enrollment.installation, generation: enrollment.generation, role: enrollment.role, provider: enrollment.provider, projects: enrollment.projectIDs) else {
@@ -297,7 +310,7 @@ extension Coordinator {
         if let command = enrollment.pairingCommandID {
             guard let digest = enrollment.pairingIntentDigest, let principal = enrollment.pairingPrincipal,
                   try ServiceCallTiming.measure(timing,"route_registration_receipt_ms", {
-                      try router.connectionRegistrationIsCurrent(commandID: command, digest: digest, sessionID: enrollment.sessionID, installation: enrollment.installation, receiptPrincipal: principal, caller: caller)
+                      try router.connectionRegistrationIsCurrent(commandID: command, digest: digest, sessionID: enrollment.sessionID, installation: enrollment.installation, receiptPrincipal: principal, caller: caller, readsOnly:readsOnly)
                   }) else {
                 throw ChecklistError("CONNECTION_REPAIR_REQUIRED", "Pairing preparation has no matching committed receipt. Reconcile its original command before repair.")
             }
@@ -355,6 +368,11 @@ extension Coordinator {
                    session["state"] as? String == "revoked" || session["owner_revoked"] as? Bool == true {
                     throw ownerDisconnected
                 }
+                if nativeResumptionIsDeferred {
+                    throw NativeBootstrapContinuation(coordinator: self, existing: existing, project: project,
+                        oldExecutionDomain: oldDomain, executionDomain: executionDomain, binding: binding, process: process, endpoint: endpoint,
+                        kind: .codexRestart(old: old, new: new, effects: codexAppHostRestartEffects))
+                }
                 let state = try verifyCodexRestartHost(old: old, new: new)
                 let released = try reconcileNativeClosure(existing, processState: state.process.rawValue, registryState: "not_applicable",
                     registryDigest: nil, basis: .codexAppHostRestart, replacementDomain: executionDomain)
@@ -363,11 +381,6 @@ extension Coordinator {
                 existing = enrollments[existing.installation]!
                 guard released else {
                     throw CoreError("NATIVE_CLOSURE_PENDING", "Work from the earlier Codex app host must stop and return for pickup before reconnecting.")
-                }
-                if nativeResumptionIsDeferred {
-                    throw NativeBootstrapContinuation(coordinator: self, existing: existing, project: project,
-                        oldExecutionDomain: oldDomain, executionDomain: executionDomain, binding: binding, process: process, endpoint: endpoint,
-                        kind: .codexRestart(old: old, new: new, effects: codexAppHostRestartEffects))
                 }
                 _ = try verifyCodexRestartAfterClosure(old: old, new: new, checkOwner: checkOwnerRevocation)
                 codexRestart = (old, new)
@@ -409,6 +422,8 @@ extension Coordinator {
         let resumption=NativeSessionResumption(projectID:project,sessionID:existing.sessionID,provider:existing.provider,
             oldInstallation:existing.installation+"/"+existing.generation,oldExecutionDomain:oldDomain,
             newInstallation:resumed.installation+"/"+resumed.generation,newExecutionDomain:executionDomain)
+        beginStagingEnrollment(existing.installation)
+        defer {finishStagingEnrollment(existing.installation)}
         _ = try ConnectionCommit.perform(
             saveCredential: { try credentials.write(existing.installation, token) },
             saveEnrollment: { enrollments[existing.installation] = resumed; try saveEnrollments() },
@@ -435,15 +450,18 @@ extension Coordinator {
         return try router.handle(method:"session_register",params:params,caller:caller)
     }
 
-    func verifyAutomatic(_ e:Enrollment,request:[String:Any],connection:NSXPCConnection) throws -> String {
-        guard bundledCLI(connection.processIdentifier),let context=request["native_context"] as? [String:Any],context["provider"] as? String == e.provider,context["native_session_id"] as? String == (e.nativeSessionID ?? e.sessionID) else { throw ChecklistError("NATIVE_SESSION_REQUIRED","Use this connection from its actual native thread. An installation label cannot select a different thread.") }
-        let native=try nativeProcess(connection.processIdentifier,provider:e.provider)
+    func verifyAutomatic(_ e:Enrollment,request:[String:Any],peerPID:pid_t,readsOnly:Bool) throws -> String {
+        guard bundledCLI(peerPID),let context=request["native_context"] as? [String:Any],context["provider"] as? String == e.provider,context["native_session_id"] as? String == (e.nativeSessionID ?? e.sessionID) else { throw ChecklistError("NATIVE_SESSION_REQUIRED","Use this connection from its actual native thread. An installation label cannot select a different thread.") }
+        let native=try nativeProcess(peerPID,provider:e.provider)
         guard try processDomain(native,provider:e.provider) == e.nativeExecutionDomain else { throw ChecklistError("NATIVE_SESSION_MISMATCH","This connection belongs to another native host process.") }
-        let workspace=try currentDirectory(connection.processIdentifier)
+        let workspace=try currentDirectory(peerPID)
         guard let supplied=request["workspace"] as? String,canonical(supplied) == workspace else { throw ChecklistError("WORKSPACE_MISMATCH","This process differs from its claimed working directory.") }
         if e.assistantRelay == true {
             guard context["mode"] as? String == "assistant_relay",let selector=e.relaySelector else { throw ChecklistError("CONNECTION_MODE_MISMATCH","Use the personal-assistant helper access mode for this connection.") }
-            let result=try router.handle(method:"project_list",params:[:],caller:Caller(role:"owner",installation:"relay-grant-check",projectIDs:[]))
+            let owner = Caller(role:"owner",installation:"relay-grant-check",projectIDs:[])
+            let result = try readsOnly
+                ? router.handleIndependentRead(method:"project_list",params:[:],caller:owner)
+                : router.handle(method:"project_list",params:[:],caller:owner)
             let data=result["data"] as? [String:Any] ?? result
             let candidates=(data["projects"] as? [[String:Any]] ?? []).filter { item in selector == "@enabled" ? (item["archived"] as? Bool != true && ((item["policy"] as? [String:Any])?["assistant_relay_grants"] as? [String:Bool])?["read"] == true):item["id"] as? String == selector }
             var current:[String:[String:Bool]]=[:],revisions:[String:Int]=[:]
@@ -482,11 +500,15 @@ extension Coordinator {
         return Dictionary(uniqueKeysWithValues:keys.map{($0,requested[$0] ?? false)})
     }
 
-    func prepareHandoff(_ p:[String:Any],caller:Caller) throws -> [String:Any] {
+    func prepareHandoff(_ p:[String:Any],caller:Caller,readsOnly:Bool = false) throws -> [String:Any] {
         guard caller.role == "owner",let provider=p["provider"] as? String,let plugin=ProviderPluginRegistry.bundled.plugin(provider, requiring: .workSession),let pid=p["project_id"] as? String,let tid=p["task_id"] as? String else { throw ChecklistError("INVALID_HANDOFF","Choose a task and Codex or Claude from the native app.") }
-        let result=try router.handle(method:"task_get",params:["project_id":pid,"task_id":tid],caller:caller)
+        func read(_ method: String,_ params: [String:Any]) throws -> [String:Any] {
+            if readsOnly {return try router.handleIndependentRead(method:method,params:params,caller:caller)}
+            return try router.handle(method:method,params:params,caller:caller)
+        }
+        let result = try read("task_get",["project_id":pid,"task_id":tid])
         let task=result["data"] as? [String:Any] ?? result
-        let projectResult=try router.handle(method:"project_settings_get",params:["project_id":pid],caller:caller)
+        let projectResult = try read("project_settings_get",["project_id":pid])
         let project=projectResult["data"] as? [String:Any] ?? projectResult
         let root=project["root_path"] as? String ?? ""
         let key=task["key"] as? String ?? tid

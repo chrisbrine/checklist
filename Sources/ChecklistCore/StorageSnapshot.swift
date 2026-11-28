@@ -60,20 +60,23 @@ enum StorageSnapshot {
 
     static func build(_ fixture: StorageSnapshotSource, operation: UUID,
                       budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
-        do { return try prepareGeneration(fixture, operation: operation, budget: budget)() }
+        do {
+            try fixture.permit.requireRoot(fixture.source)
+            return try prepareGeneration(source: fixture.source, parentRoot: fixture.parent, storeID: fixture.storeID,
+                                         publicationName: fixture.publicationName, operation: operation, budget: budget)()
+        }
         catch { throw budget.reporting(error) }
     }
 
     /// Owner backup holds the crash-released retention barrier across capture,
-    /// copying and publication. Only the database copy occupies the ordinary object gate.
+    /// copying and publication. The ordinary gate is released once that barrier
+    /// is published. The backup queue still fences writes through database copy.
     static func buildOnline(source: URL, parent: URL, storeID: String, publicationName: String,
                             operation: UUID, budget: StorageSnapshotBudget, retention: StorageSnapshotRetention) throws -> StorageSnapshotReceipt {
         try retention.requireRoot(source)
         do {
-            let finish = try ArchiveStorageGate.withExclusive(root: source) { permit in
-                try prepareGeneration(StorageSnapshotSource(source: source, parent: parent, storeID: storeID,
-                    publicationName: publicationName, permit: permit), operation: operation, budget: budget)
-            }
+            let finish = try prepareGeneration(source: source, parentRoot: parent, storeID: storeID,
+                                               publicationName: publicationName, operation: operation, budget: budget)
             try budget.notify("capture_released")
             return try finish()
         } catch { throw budget.reporting(error) }
@@ -81,27 +84,25 @@ enum StorageSnapshot {
 
     /// The returned continuation touches only immutable source objects and its
     /// owned stage. Callers retain either the exclusive gate or a retention lease.
-    private static func prepareGeneration(_ fixture: StorageSnapshotSource, operation: UUID,
+    private static func prepareGeneration(source: URL, parentRoot: URL, storeID: String, publicationName: String?, operation: UUID,
                                           budget: StorageSnapshotBudget) throws -> () throws -> StorageSnapshotReceipt {
-        try fixture.permit.requireRoot(fixture.source)
         try budget.check()
         guard budget.pagesPerStep > 0, budget.maximumBytes > 0, budget.maximumObjectBytes > 0,
-              budget.maximumObjects > 0, budget.maximumRecords > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
-        let parent = try StorageObjectFiles(root: fixture.parent,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: fixture.source,folderAccess:budget.folderAccess,walkDirectories:true)
-        try budget.measureFreeSpace(fixture.parent)
-        let names = names(operation, publicationName: fixture.publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
-        let intent = ["format": "3", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": fixture.storeID, "source_root": fixture.source.path]
+              budget.maximumObjects > 0, budget.maximumManifestBytes > 0 else { throw StorageSnapshotFailure.limit }
+        let parent = try StorageObjectFiles(root: parentRoot,folderAccess:budget.folderAccess), sourceFiles = try StorageObjectFiles(root: source,folderAccess:budget.folderAccess,walkDirectories:true)
+        try budget.measureFreeSpace(parentRoot)
+        let names = names(operation, publicationName: publicationName), stage = try parent.makeDirectory(names.staging, batchSynchronization: true)
+        let intent = ["format": "3", "kind": kind, "operation_id": operation.uuidString.lowercased(), "store_id": storeID, "source_root": source.path]
         let intentData = try encoded(intent)
         let intentSize = try budget.adding(Int64(intentData.count), to: 0)
         try stage.writeNew("intent.json", bytes: intentData)
         // Do not clean staging in a defer. Restart must retain uncertain state.
         var writerConfiguration = Configuration()
         writerConfiguration.prepareDatabase { db in try SchemaMigrations.installStorageCollation(db); try db.execute(sql: "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50") }
-        let capturedAt = try StorageDatabaseCapture.copy(source: fixture.source,
+        let capturedAt = try StorageDatabaseCapture.copy(source: source,
             destination: stage.root.appendingPathComponent("database.sqlite"), configuration: writerConfiguration,
             intentSize: intentSize, budget: budget)
-        // The continuation runs after the ordinary gate is released for online
-        // capture. Retention protects the whole immutable namespace before its
+        // Retention protects the whole immutable namespace before its
         // inventory is known, including pending imports and recovery objects.
         return {
             // Normalize only the owned copy after releasing the source writer.
@@ -125,7 +126,7 @@ enum StorageSnapshot {
                 try budget.notify("inventory_started")
                 (inventory, schema, families, tables) = try copy.read { db in
                     _ = try SchemaMigrations.inspect(db)
-                    return (try StorageSnapshotAuthority.inventory(db, root: fixture.source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
+                    return (try StorageSnapshotAuthority.inventory(db, root: source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
                 }
                 try copy.close()
                 try budget.notify("inventory_finished")
@@ -172,7 +173,7 @@ enum StorageSnapshot {
             try sourceFiles.finishWalk()
             try budget.notify("objects_finished")
             let manifest = StorageSnapshotManifest(format: 3, kind: kind, operationID: operation.uuidString.lowercased(),
-                storeID: fixture.storeID, sourceRoot: fixture.source.path, schema: schema, databaseSHA256: database.0,
+                storeID: storeID, sourceRoot: source.path, schema: schema, databaseSHA256: database.0,
                 databaseSize: database.1, objects: materialized.sorted { $0.descriptor.relativePath < $1.descriptor.relativePath },
                 unavailable: inventory.unavailable, externalReferences: inventory.externalReferences, recordFamilies: families, tableRows: tables, capturedAt: capturedAt)
             let manifestData = try encoded(manifest)
@@ -186,14 +187,22 @@ enum StorageSnapshot {
             try budget.check()
             try stage.writeNew("manifest.json", bytes: manifestData)
             try budget.notify("manifest_written")
-            _ = try verify(stage, operation: operation, budget: budget)
+            let witnessed = try stage.publicationWitness(budget: budget)
+            let digest = try verify(stage, operation: operation, budget: budget, stageWitness: witnessed)
             try budget.check()
             // After rename, a flush failure is publication-uncertain; it must
             // never trigger deletion of the published directory or source.
             try budget.notify("before_publish")
             try budget.check()
-            try parent.publish(names.staging, as: names.published) { try budget.notify("published_before_parent_flush") }
-            return try reconcile(parent: fixture.parent, operation: operation, publicationName: fixture.publicationName, budget: budget)
+            try parent.publish(names.staging, as: names.published, verifiedStage: stage) {
+                try budget.notify("published_before_parent_flush")
+                try budget.check()
+            }
+            try stage.requirePublicationWitness(witnessed, budget: budget)
+            try budget.check()
+            try budget.notify("publication_fence_checked")
+            try parent.requirePublishedDirectory(names.published, matching: stage)
+            return .init(operationID: operation, manifestSHA256: digest)
         }
     }
 
@@ -220,7 +229,8 @@ enum StorageSnapshot {
     }
 
     private static func reconcileGeneration(parent: URL, operation: UUID, publicationName: String?, budget: StorageSnapshotBudget) throws -> StorageSnapshotReceipt {
-        let published = try StorageObjectFiles(root: parent.appendingPathComponent(names(operation, publicationName: publicationName).published, isDirectory: true),folderAccess:budget.folderAccess)
+        let name = names(operation, publicationName: publicationName).published
+        let published = try StorageObjectFiles(root: parent.appendingPathComponent(name, isDirectory: true),folderAccess:budget.folderAccess)
         let digest = try verify(published, operation: operation, budget: budget)
         let containingDirectory = try StorageObjectFiles(root: parent,folderAccess:budget.folderAccess)
         // Readability cannot establish the rename's required durability barrier.
@@ -230,6 +240,7 @@ enum StorageSnapshot {
             try budget.check()
         }
         try budget.check()
+        try containingDirectory.requirePublishedDirectory(name, matching: published)
         return .init(operationID: operation, manifestSHA256: digest)
     }
 
@@ -240,8 +251,11 @@ enum StorageSnapshot {
         let containing = try StorageObjectFiles(root:parent,folderAccess:budget.folderAccess)
         let stageName = names(operation).staging
         let stage = try StorageObjectFiles(root:parent.appendingPathComponent(stageName,isDirectory:true),folderAccess:budget.folderAccess)
+        let digest: String
+        let witnessed: [Data: StorageFileDigestIdentity]
         do {
-            _ = try verify(stage,operation:operation,budget:budget)
+            witnessed = try stage.publicationWitness(budget: budget)
+            digest = try verify(stage,operation:operation,budget:budget,stageWitness:witnessed)
         } catch {
             // IO/permission/full-volume failures may be transient; retaining the
             // stage is safe and the explicit retry can create a fresh attempt.
@@ -250,26 +264,36 @@ enum StorageSnapshot {
             try containing.publish(stageName,as:quarantine)
             return nil
         }
-        try budget.check()
         // A previous attempt may have ended during the commit barrier. Redo
         // the root-entry fsync and full-device barrier before publication.
         try stage.synchronizePublicationDirectory()
         try stage.synchronizeOwnedFile("manifest.json")
         try budget.check()
-        try containing.publish(stageName,as:publicationName)
-        return try reconcile(parent:parent,operation:operation,publicationName:publicationName,budget:budget)
+        try containing.publish(stageName, as: publicationName, verifiedStage: stage) {
+            try budget.notify("published_before_parent_flush")
+            try budget.check()
+        }
+        try stage.requirePublicationWitness(witnessed, budget: budget)
+        try budget.check()
+        try budget.notify("publication_fence_checked")
+        try containing.requirePublishedDirectory(publicationName, matching: stage)
+        return .init(operationID: operation, manifestSHA256: digest)
     }
 
-    static func verify(_ files: StorageObjectFiles, operation: UUID, budget: StorageSnapshotBudget) throws -> String {
+    static func verify(_ files: StorageObjectFiles, operation: UUID, budget: StorageSnapshotBudget,
+                       stageWitness: [Data: StorageFileDigestIdentity]? = nil) throws -> String {
         try budget.notify("verify_started")
         try budget.check()
         let manifestSize = try files.size("manifest.json")
         budget.measurement.manifestBytes = Int(manifestSize)
         guard manifestSize <= budget.maximumManifestBytes else { throw budget.capacityFailure("snapshot_manifest_capacity") }
         let manifestData = try files.read("manifest.json", maximum: budget.maximumManifestBytes)
-        guard let shape = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any], Set(shape.keys).subtracting(["recordFamilies","tableRows","capturedAt"]) == [
-            "format", "kind", "operationID", "storeID", "sourceRoot", "schema", "databaseSHA256", "databaseSize", "objects", "unavailable", "externalReferences"
-        ] else { throw StorageSnapshotFailure.incomplete }
+        try autoreleasepool {
+            guard let shape = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any], Set(shape.keys).subtracting(["recordFamilies","tableRows","capturedAt"]) == [
+                "format", "kind", "operationID", "storeID", "sourceRoot", "schema", "databaseSHA256", "databaseSize", "objects", "unavailable", "externalReferences"
+            ] else { throw StorageSnapshotFailure.incomplete }
+        }
+        try budget.check()
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self, from: manifestData)
         guard [1, 2, 3].contains(manifest.format), manifest.kind == kind, manifest.operationID == operation.uuidString.lowercased(),
               UUID(uuidString: manifest.storeID) != nil, (0...SchemaMigrations.currentSchema).contains(manifest.schema), manifest.objects.count <= budget.maximumObjects else { throw StorageSnapshotFailure.incomplete }
@@ -299,7 +323,14 @@ enum StorageSnapshot {
                 if let counts = manifest.tableRows { guard counts == (try tableCounts(db)) else {throw StorageSnapshotFailure.incomplete} }
                 guard try Int.fetchOne(db, sql: "PRAGMA user_version") == manifest.schema else { throw StorageSnapshotFailure.incomplete }
                 let sourceRoot = URL(fileURLWithPath: manifest.sourceRoot, isDirectory: true)
-                return try StorageSnapshotAuthority.inventory(db, root: sourceRoot, budget: budget, objectRoot: files.root.appendingPathComponent("managed"), retainedExists: { try inventoryFiles.regularOrLinkExists("managed/" + $0) })
+                return try StorageSnapshotAuthority.inventory(db, root: sourceRoot, budget: budget, objectRoot: files.root.appendingPathComponent("managed")) { relative in
+                    let path = "managed/" + relative
+                    // Only fresh owned stages have this exact no-follow listing.
+                    // Publication rechecks its identity after hashing and rename.
+                    // A miss still needs the normal lookup and alias/error rules.
+                    if let stageWitness, stageWitness[Data(path.utf8)] != nil { return true }
+                    return try inventoryFiles.regularOrLinkExists(path)
+                }
             }
             try inventoryFiles.finishWalk()
             try copy.close()

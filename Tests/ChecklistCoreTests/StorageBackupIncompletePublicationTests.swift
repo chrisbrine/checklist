@@ -13,7 +13,7 @@ final class StorageBackupIncompletePublicationTests: XCTestCase {
             if flushing {checksAfterFlush += 1;return checksAfterFlush > 1 ? 2 : 0}
             return 0
         }
-        budget.observe = {event in if event == "reconcile_before_parent_flush" {flushing = true}}
+        budget.observe = {event in if event == "published_before_parent_flush" {flushing = true}}
         XCTAssertThrowsError(try f.router!.executeStorageBackup(params:["command_id":uuid(),"path":destination.path],caller:f.owner,budget:budget)) {
             XCTAssertEqual(($0 as? CoreError)?.code,"BACKUP_DEADLINE_EXCEEDED")
         }

@@ -20,10 +20,10 @@ extension CommandRouter {
     /// Internal service authentication read. Returns one current canonical
     /// session, including ended/revoked state, without rendering a session list.
     /// Never caches authority or repairs a missing registration.
-    public func connectionSession(sessionID: String, project: String, caller: Caller) throws -> [String: Any]? {
+    public func connectionSession(sessionID: String, project: String, caller: Caller, readsOnly: Bool = false) throws -> [String: Any]? {
         try owner(caller)
         let lease = try storageAdmission.acquire(); defer { lease.finish() }
-        return try readConnectionAuthority { db in
+        return try readConnectionAuthority(readsOnly:readsOnly) { db in
             let pid = try self.scope(db,["project_id":project],caller)
             do { return try self.scoped(db,sessionID,pid,type:"session") }
             catch let error as CoreError where error.code == "NOT_FOUND" { return nil }
@@ -42,8 +42,9 @@ extension CommandRouter {
         }
     }
 
-    private func readConnectionAuthority<T>(_ body: (Database) throws -> T) throws -> T {
-        if readers != nil {return try readForPreparation(body)}
+    private func readConnectionAuthority<T>(readsOnly: Bool = false, _ body: (Database) throws -> T) throws -> T {
+        if let readers {return try readers.read(body)}
+        if readsOnly {throw readerUnavailable()}
         guard let result = try withImmediateWriteAccess({try dbQueue.read(body)}) else {
             throw CoreError("BACKUP_SERVICE_CALL_DEFERRED","Connection authority verification waits for backup write admission.")
         }
@@ -88,11 +89,11 @@ extension CommandRouter {
 
     /// Used by credential authentication to fence a prepared enrollment after a
     /// crash/failed commit. It never creates, rotates or repairs a session.
-    public func connectionRegistrationIsCurrent(commandID: String, digest: String, sessionID: String, installation: String, receiptPrincipal: String, caller: Caller) throws -> Bool {
+    public func connectionRegistrationIsCurrent(commandID: String, digest: String, sessionID: String, installation: String, receiptPrincipal: String, caller: Caller, readsOnly: Bool = false) throws -> Bool {
         try owner(caller)
         let operationLease = try storageAdmission.acquire()
         defer { operationLease.finish() }
-        return try readConnectionAuthority { db in
+        return try readConnectionAuthority(readsOnly:readsOnly) { db in
             guard let stored = try self.connectionReceipt(db, command: commandID, digest: digest, principal: receiptPrincipal),
                   let basis = stored["_connection_registration"] as? JSON,
                   basis["session_id"] as? String == sessionID,

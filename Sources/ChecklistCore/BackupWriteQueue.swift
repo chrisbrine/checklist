@@ -41,10 +41,14 @@ final class BackupWriteQueue: @unchecked Sendable {
         case applied(digest: String,method: String)
     }
     private let condition = NSCondition()
+    private let statusLock = NSLock()
+    private var observedStatus: JSON = [:]
     private let immediateContextKey = "ChecklistBackupImmediate-" + UUID().uuidString
     private let worker = DispatchQueue(label:"org.checklist.backup-writes",qos:.userInitiated,autoreleaseFrequency:.workItem)
     private let generation = UUID().uuidString.lowercased()
-    private var revision: UInt64 = 0
+    private var revision: UInt64 = 0 {
+        didSet { publishStatus() }
+    }
     private var backupActive = false
     private var finishedBackups: UInt64 = 0
     private var captureLocked = false
@@ -61,8 +65,10 @@ final class BackupWriteQueue: @unchecked Sendable {
     private var observer: (@Sendable () -> Void)?
     private var operationLeases: [String:StorageOperationLease] = [:]
 
+    init() { publishStatus() }
+
     func restore(root: URL,incarnation: String,admission: StorageAdmission) throws {
-        condition.lock();defer {condition.unlock()}
+        condition.lock();defer {publishStatus();condition.unlock()}
         self.files = try StorageObjectFiles(root:root)
         self.incarnation = incarnation;self.root = root.path
         guard try files!.directoryExists("backup-write-queue") else {return}
@@ -115,7 +121,13 @@ final class BackupWriteQueue: @unchecked Sendable {
     }
 
     func status() -> JSON {
-        condition.lock();defer {condition.unlock()};return statusLocked()
+        statusLock.withLock { observedStatus }
+    }
+    /// Called under the admission condition, after an observed state change.
+    /// Readers take only the short snapshot lock and never wait for a journal flush.
+    private func publishStatus() {
+        let value = statusLocked()
+        statusLock.withLock { observedStatus = value }
     }
     private func statusLocked(queued: Bool = false) -> JSON {
         let queuedWork = draining || !pending.isEmpty

@@ -2,6 +2,8 @@ import SwiftUI
 
 struct NeedsYouView: View {
     @EnvironmentObject var store: ChecklistStore
+    @Environment(\.openSettings) private var openSettings
+    @AppStorage("settingsSection") private var settingsSection = "general"
     @State private var selected = 0
     @State private var showSnoozed = false
     @State private var requestScrollID: RecordIdentity?
@@ -12,6 +14,17 @@ struct NeedsYouView: View {
         let _ = NativeRenderMetrics.body(.needsYou)
         VStack(alignment: .leading, spacing: Spacing.section) {
             Text("Needs You").checklistFont(.pageTitle)
+            if let attention = store.backupCapacityAttention {
+                VStack(alignment: .leading, spacing: Spacing.small) {
+                    Label(StorageSettingsSummary.backupAttentionTitle(attention.values), systemImage: "externaldrive.badge.exclamationmark")
+                        .checklistFont(.bodyStrong)
+                    Text(attention.string("next_step")).checklistFont(.callout)
+                    Button("Open Storage settings") {
+                        settingsSection = "storage"
+                        openSettings()
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading).checklistCard(padding: Spacing.group)
+            }
             Picker("View", selection: $selected) { Text("Requests · \(requests.count)").tag(0); Text("Your tickets · \(yourTasks.count)").tag(1) }.pickerStyle(.segmented).tint(.checklistAccent).checklistActionScroll()
             if selected == 0 {
                 Toggle("Show snoozed requests", isOn: $showSnoozed).toggleStyle(.checkbox).checklistFont(.micro)

@@ -9,7 +9,8 @@ final class MediaBackupTests: XCTestCase {
         let round = try f.round(f.type(helper.imageSchema()))
         let intake = try helper.confirm(f,helper.preview(f,round,[helper.source(f,"backup.png")]))
         _ = try helper.capture(f,intake);_ = try f.publish(round)
-        try f.reopen() // Import reconciliation changes committed jobs to settled.
+        try f.reopen()
+        try f.router.runStorageMaintenance() // The service settles committed imports on its maintenance lane.
         XCTAssertEqual(try f.rows("storage_job").filter {$0["kind"] as? String == "attachment_import"}.map {$0["state"] as? String},["settled"])
         return f
     }

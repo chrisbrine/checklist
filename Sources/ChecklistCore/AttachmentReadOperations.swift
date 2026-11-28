@@ -64,20 +64,32 @@ extension CommandRouter {
         return output
     }
 
-    /// No migration and no file deletion. At most four legacy replies lose their
-    /// base64 field per ordinary retention pass. UUID, digest and reply metadata stay.
-    @discardableResult
-    func pruneAttachmentReadResults(_ db: Database) throws -> Int {
-        try db.execute(sql:"""
-            UPDATE commands SET result=json_set(json_remove(result,'$.data.content_base64'),'$.attachment_read_expired',json('true'))
-            WHERE rowid IN (
-              SELECT c.rowid FROM metadata m JOIN commands c
-                ON c.principal=json_extract(m.value,'$.principal') AND c.command_id=json_extract(m.value,'$.command_id') AND c.digest=json_extract(m.value,'$.digest')
-              WHERE m.key GLOB 'command-operation:*' AND json_valid(m.value)
-                AND json_extract(m.value,'$.method')='attachment_read' AND json_extract(m.value,'$.state')='succeeded'
-                AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.content_base64')='text' ELSE 0 END
-              ORDER BY c.rowid LIMIT ?)
-            """,arguments:[Self.attachmentReadPruneBatch])
-        return db.changesCount
+    private static let legacyAttachmentReadPruneCondition = """
+        m.key GLOB 'command-operation:*' AND json_valid(m.value)
+        AND c.principal=json_extract(m.value,'$.principal') AND c.command_id=json_extract(m.value,'$.command_id')
+        AND c.digest=json_extract(m.value,'$.digest')
+        AND json_extract(m.value,'$.method')='attachment_read' AND json_extract(m.value,'$.state')='succeeded'
+        AND CASE WHEN json_valid(c.result) THEN json_type(c.result,'$.data.content_base64')='text' ELSE 0 END
+        """
+
+    func legacyAttachmentReadPruneRows(_ db: Database) throws -> [(Int64, String)] {
+        try Row.fetchAll(db, sql: """
+            SELECT c.rowid, m.key FROM metadata m JOIN commands c
+              WHERE \(Self.legacyAttachmentReadPruneCondition)
+              ORDER BY c.rowid LIMIT ?
+            """, arguments: [Self.attachmentReadPruneBatch]).map { ($0[0], $0[1]) }
+    }
+
+    /// Recheck each selected operation by its metadata key and current receipt.
+    func pruneAttachmentReadResults(_ db: Database, rows: [(Int64, String)]) throws -> Int {
+        var count = 0
+        for (row, operation) in rows {
+            try db.execute(sql: """
+                UPDATE commands AS c SET result=json_set(json_remove(result,'$.data.content_base64'),'$.attachment_read_expired',json('true'))
+                WHERE c.rowid=? AND EXISTS (SELECT 1 FROM metadata m WHERE m.key=? AND \(Self.legacyAttachmentReadPruneCondition))
+                """, arguments: [row, operation])
+            count += db.changesCount
+        }
+        return count
     }
 }

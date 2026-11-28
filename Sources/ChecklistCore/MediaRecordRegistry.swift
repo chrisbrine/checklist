@@ -32,9 +32,19 @@ enum MediaRecordRegistry {
     /// Snapshot inventory already streams every canonical row. Resolve only the
     /// dependencies this row actually names, inside the same SQLite observation.
     /// Never materialize the complete store merely to validate media references.
-    static func validateSnapshotEnvelope(_ envelope: DecodedEnvelope,db: Database) throws {
+    static func validateSnapshotEnvelope(_ envelope: DecodedEnvelope,db: Database,exportProject: String? = nil,
+                                         check: () throws -> Void,requireInput: (Int) throws -> Void) throws {
         try validate([envelope],resolve:{id in
-            guard let row = try Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]) else {return nil}
+            try check()
+            var arguments: StatementArguments = [Data(id.utf8)]
+            var condition = "id=CAST(? AS TEXT)"
+            if let exportProject {
+                condition += " AND project_id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL()
+                arguments += [Data(exportProject.utf8)]
+            }
+            let columns = CommandRouter.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength
+            guard let row = try Row.fetchOne(db,sql:"SELECT " + columns + " FROM records WHERE " + condition,arguments:arguments) else {return nil}
+            try requireInput(row["snapshot_envelope_bytes"])
             return try GRDBRecordEnvelopeAdapter.decode(row)
         })
     }
@@ -133,14 +143,24 @@ enum MediaRecordRegistry {
         }
     }
 
-    static func envelopes(_ db: Database, project: String? = nil, limit: Int = 100_000, check: () throws -> Void = {}) throws -> [DecodedEnvelope] {
+    static func visitEnvelopes(_ db: Database, project: String? = nil, check: () throws -> Void = {}, visit: (Row) throws -> Void) throws {
         let condition = project == nil ? "" : " WHERE project_id = CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL()
         let arguments = project.map { StatementArguments([Data($0.utf8)]) } ?? StatementArguments()
-        let rows = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records" + condition + " ORDER BY id COLLATE BINARY",arguments:arguments)
-        var result: [DecodedEnvelope] = []
+        let columns = CommandRouter.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength
+        let rows = try Row.fetchCursor(db,sql:"SELECT " + columns + " FROM records" + condition + " ORDER BY id COLLATE BINARY",arguments:arguments)
         while let row = try rows.next() {
             try check()
-            guard result.count < limit else { throw StorageSnapshotFailure.limit }
+            try visit(row)
+        }
+    }
+
+    static func envelopes(_ db: Database, project: String? = nil, check: () throws -> Void = {}) throws -> [DecodedEnvelope] {
+        let byteLimit = 128 * 1_048_576
+        var bytes = 0, result: [DecodedEnvelope] = []
+        try visitEnvelopes(db, project: project, check: check) { row in
+            let length: Int = row["snapshot_envelope_bytes"]
+            guard length <= byteLimit - bytes - 128 else { throw StorageSnapshotFailure.limit }
+            bytes += length + 128
             result.append(try GRDBRecordEnvelopeAdapter.decode(row))
         }
         if project == nil {StorageMemoryGuardSeam.observe?("whole_store_records","MediaRecordRegistry.envelopes",result.count)}

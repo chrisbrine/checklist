@@ -2,6 +2,13 @@ import XCTest
 @testable import ChecklistApp
 
 final class StorageSettingsSummaryTests: XCTestCase {
+    func testCapacityAttentionAndAutomaticFailureShowActionAndRetryTime() {
+        XCTAssertEqual(StorageSettingsSummary.backupAttentionTitle(["reason": "snapshot_free_space"]), "Backup needs more free space")
+        XCTAssertEqual(StorageSettingsSummary.backupAttentionTitle(["reason": "snapshot_deadline"]), "Backup ran out of time")
+        let rows = StorageSettingsSummary.automaticBackup(["state": "failed", "next_step": "Free space on the backup volume.", "retry_not_before": "2026-01-01T15:00:00Z"])
+        XCTAssertEqual(rows.map(\.value), ["Failed", "Free space on the backup volume.", "2026-01-01T15:00:00Z"])
+        XCTAssertEqual(StorageSettingsSummary.automaticBackup(["state": "complete"]).map(\.value), ["Verified"])
+    }
     func testPreviewShowsSourceCaptureTimeAndVerificationTime() {
         let rows = StorageSettingsSummary.preview(["path":"/backup","source_root":"/source-installation","store_id":"store-id","captured_at":"2026-10-23T12:34:56Z","verified_at":"2026-10-24T01:02:03Z"])
         XCTAssertEqual(rows.first {$0.label == "Source installation"}?.value,"/source-installation")

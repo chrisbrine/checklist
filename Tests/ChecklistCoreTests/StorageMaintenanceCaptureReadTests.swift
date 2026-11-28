@@ -15,7 +15,7 @@ final class StorageMaintenanceCaptureReadTests: XCTestCase {
         defer { try? router.closeStore() }
         // A due cleanup job that cannot be decoded: a cleanup pass that reaches its jobs throws.
         try router.dbQueue.write {
-            try $0.execute(sql: "INSERT INTO records(id,project_id,type,revision,data) VALUES ('capture-read-job','capture-read-project','cleanup_job',1,'{\"state\":\"pending\"}')")
+            try $0.execute(sql: "INSERT INTO records(id,project_id,type,revision,data) VALUES ('capture-read-job','capture-read-project','cleanup_job',1,'{\"state\":\"queued\",\"not_before_ms\":0}')")
         }
         func underGate(_ body: (Database, ArchiveStoragePermit) throws -> Void) throws {
             try ArchiveStorageGate.withExclusive(root: router.root) { permit in
@@ -23,17 +23,18 @@ final class StorageMaintenanceCaptureReadTests: XCTestCase {
             }
         }
         try StorageSnapshotRetention.withCapture(root: router.root) { _ in
+            XCTAssertNoThrow(try router.runStorageMaintenance())
+            XCTAssertEqual(router.currentStorageMaintenanceWarning(), .backupCapture)
             try underGate { db, permit in
-                // The maintenance pass reads the hold and stops before its cleanup pass.
-                XCTAssertEqual(router.performStorageMaintenance(db, permit: permit), .backupCapture)
                 // A direct cleanup pass reads the hold by itself and returns before its jobs.
                 XCTAssertNoThrow(try router.processArchiveCleanupJobs(db, permit: permit, nowMS: .max))
             }
         }
         try underGate { db, permit in
-            // No capture: the direct pass and the maintenance pass reach the job.
+            // No capture: the direct pass reaches the malformed job.
             XCTAssertThrowsError(try router.processArchiveCleanupJobs(db, permit: permit, nowMS: .max))
-            XCTAssertEqual(router.performStorageMaintenance(db, permit: permit), .retryPending)
         }
+        XCTAssertThrowsError(try router.runStorageMaintenance())
+        XCTAssertEqual(router.currentStorageMaintenanceWarning(), .retryPending)
     }
 }

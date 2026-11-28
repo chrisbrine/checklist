@@ -9,14 +9,49 @@ import os
 final class ArchiveStoragePermit {
     fileprivate let files: StorageObjectFiles
     fileprivate var active = true
+    fileprivate var maintenanceDeadline: MaintenanceDeadline?
     fileprivate init(_ files: StorageObjectFiles) { self.files = files }
     func requireRoot(_ root: URL) throws {
         guard active,Data(files.root.path.utf8) == Data(root.standardizedFileURL.path.utf8) else { throw CoreError("STORAGE_GATE_REQUIRED", "Cleanup requires the current store's exclusive object gate.") }
     }
+    func checkMaintenanceDeadline() throws {try maintenanceDeadline?.check()}
 }
 enum ArchiveStorageGate {
     private static let logger = Logger(subsystem:"org.checklist.coordination",category:"archive-storage-gate")
+    private static let priority = NSLock()
+    nonisolated(unsafe) private static var foreground: [URL: Int] = [:]
+
     static func withExclusive<T>(root: URL,files pinned: StorageObjectFiles? = nil,file: StaticString = #fileID,line: UInt = #line,caller: StaticString = #function,_ body: (ArchiveStoragePermit) throws -> T) throws -> T {
+        let key = root.standardizedFileURL
+        priority.withLock { foreground[key, default: 0] += 1 }
+        defer {
+            priority.withLock {
+                if foreground[key] == 1 { foreground.removeValue(forKey: key) }
+                else { foreground[key, default: 1] -= 1 }
+            }
+        }
+        return try withGate(root: root, pinned: pinned, nonblocking: false, file: file, line: line,
+                            caller: caller, work: ServiceHoldWatchdog.workLabel(fallback: String(describing: caller)), body)
+    }
+
+    static func withMaintenanceAccess<T>(root: URL, work: String, file: StaticString = #fileID,
+                                         line: UInt = #line, caller: StaticString = #function,
+                                         _ body: (ArchiveStoragePermit, MaintenanceDeadline) throws -> T) throws -> T? {
+        guard priority.withLock({ foreground[root.standardizedFileURL] == nil }) else { return nil }
+        let deadline = MaintenanceDeadline()
+        do {
+            return try withGate(root: root, pinned: nil, nonblocking: true, file: file, line: line,
+                                caller: caller, work: work) { permit in
+                try deadline.check()
+                permit.maintenanceDeadline = deadline
+                return try body(permit, deadline)
+            }
+        } catch is MaintenanceStepDeferred { return nil }
+    }
+
+    private static func withGate<T>(root: URL, pinned: StorageObjectFiles?, nonblocking: Bool,
+                                    file: StaticString, line: UInt, caller: StaticString, work: String,
+                                    _ body: (ArchiveStoragePermit) throws -> T) throws -> T {
         let files: StorageObjectFiles
         if let pinned { try pinned.requireNamedRoot(root);files = pinned }
         else { files = try StorageObjectFiles(root:root) }
@@ -26,13 +61,28 @@ enum ArchiveStorageGate {
         var info = stat()
         guard fstat(fd,&info) == 0,info.st_mode & S_IFMT == S_IFREG,info.st_nlink == 1 else { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate is not a private regular file.") }
         let started = ProcessInfo.processInfo.systemUptime
-        while flock(fd,LOCK_EX) != 0 { if errno != EINTR { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate could not be acquired.") } }
+        if nonblocking {
+            try priority.withLock {
+                guard foreground[root.standardizedFileURL] == nil else { throw MaintenanceStepDeferred() }
+                guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+                    if errno == EWOULDBLOCK || errno == EINTR { throw MaintenanceStepDeferred() }
+                    throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate could not be acquired.")
+                }
+            }
+        } else {
+            while flock(fd,LOCK_EX) != 0 {
+                if errno != EINTR { throw CoreError("STORAGE_GATE_UNAVAILABLE", "The managed object gate could not be acquired.") }
+            }
+        }
         let acquired = ProcessInfo.processInfo.systemUptime
+        let watchdog = ServiceHoldWatchdog.shared
+        let hold = watchdog.begin(resource: "archive_storage_gate", work: work)
         let thread = pthread_mach_thread_np(pthread_self())
         logger.debug("acquired file=\(String(describing:file),privacy:.public) line=\(line) caller=\(String(describing:caller),privacy:.public) thread=\(thread) acquired_uptime=\(acquired) wait_ms=\((acquired-started)*1000)")
         let permit = ArchiveStoragePermit(files)
         defer {
             permit.active = false;_ = flock(fd,LOCK_UN)
+            watchdog.end(hold)
             let released = ProcessInfo.processInfo.systemUptime
             if acquired-started >= 0.1 || released-acquired >= 0.1 {
                 logger.notice("released file=\(String(describing:file),privacy:.public) line=\(line) caller=\(String(describing:caller),privacy:.public) thread=\(thread) acquired_uptime=\(acquired) released_uptime=\(released) wait_ms=\((acquired-started)*1000) hold_ms=\((released-acquired)*1000)")
@@ -104,6 +154,7 @@ extension ArchiveStoragePermit {
     /// intents also admit exact previews, capture files, sidecars and link text.
     /// No directory, followed link, external original or workspace is admitted.
     fileprivate func removeOriginal(relative: String,sha256: String,size: Int64,capturedSource: Bool = false,sourceBuildCache: Bool = false,linkTarget: String? = nil,verified: TicketObjectRemovalVerification? = nil,requirePreverified: Bool = false,trashPath: String? = nil) throws -> Bool {
+        try checkMaintenanceDeadline()
         try requireRoot(files.root)
         try StorageSnapshotRetention.requireNoCapture(root:files.root)
         let parts = try StorageObjectFiles.parts(relative)
@@ -162,6 +213,7 @@ extension ArchiveStoragePermit {
         var before = stat();guard fstat(fd,&before) == 0,before.st_mode & S_IFMT == S_IFREG,before.st_size == size else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original identity changed; bytes were retained.") }
         var hasher = SHA256(),buffer = [UInt8](repeating:0,count:65_536),counted: Int64 = 0
         while true {
+            try checkMaintenanceDeadline()
             let n = Darwin.read(fd,&buffer,buffer.count)
             if n < 0,errno == EINTR { continue }
             guard n >= 0 else { throw CoreError("CLEANUP_OBJECT_UNAVAILABLE", "Original verification failed; bytes were retained.") }
@@ -177,6 +229,9 @@ extension ArchiveStoragePermit {
               entry.st_mode & S_IFMT == S_IFREG,entry.st_dev == after.st_dev,entry.st_ino == after.st_ino else { throw CoreError("CLEANUP_IDENTITY_CHANGED", "Original changed during verification; bytes were retained.") }
         }
         }
+        // Reconcile/verify identity first, then check at the last boundary
+        // before admitting a rename or unlink.
+        try checkMaintenanceDeadline()
         if let trashFiles,let trashName {
             guard renameatx_np(directory,name,trashFiles.descriptor,trashName,UInt32(RENAME_EXCL)) == 0,fsync(directory) == 0 else {throw CoreError("CLEANUP_IO","The Trash move needs reconciliation before its outcome can be confirmed.")}
             try trashFiles.synchronizePublicationDirectory()
@@ -190,9 +245,15 @@ extension ArchiveStoragePermit {
 extension CommandRouter {
     private func archiveCleanupCursorID(_ job: ArchiveCleanupJob) -> String { "archive-cleanup-cursor:" + job.id.text }
     private func archiveCleanupIntentID(_ job: ArchiveCleanupJob,_ id: ArchiveAttachmentID) -> String { "archive-cleanup-delete:" + hash(Data((job.id.text + ":" + id.text).utf8)) }
-    private func archiveCleanupRelativePath(_ attachment: JSON) throws -> String {
+    func archiveCleanupRelativePath(_ attachment: JSON) throws -> String {
         guard attachment["mode"] as? String == "managed",let path = attachment["path"] as? String else { throw CoreError("CLEANUP_PATH_REFUSED", "External originals cannot be removed.") }
         return try managedRelative(path,family:"objects")
+    }
+    func archiveCleanupCursor(_ db: Database,job: ArchiveCleanupJob) throws -> JSON {
+        let id = archiveCleanupCursorID(job)
+        let cursor = try archiveCleanupRecordIfPresent(db,id,type:"storage_job") ?? ["id":id,"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_cursor","state":"idle","revision":0,"next_index":0]
+        guard cursor["kind"] as? String == "archive_cleanup_cursor",cleanupJobEqual(cursor["task_id"],job.taskID.text),cleanupJobEqual(cursor["project_id"],job.projectID.text) else { throw CoreError("CLEANUP_CURSOR_INVALID", "Cleanup cursor requires repair; originals retained.") }
+        return cursor
     }
     /// Internal synchronous service pump: at most eight metadata admissions and
     /// one exact original per call. The service schedules a one-shot continuation.
@@ -211,12 +272,15 @@ extension CommandRouter {
     /// later journal rows are its own bookkeeping writes. Without a read pool:
     /// the in-writer scan.
     private func archiveCleanupExecutorGraph(_ db: Database,job: ArchiveCleanupJob,task: JSON,prepared: PreparedArchiveCleanupScan?,fenced: inout Bool) throws -> ArchiveCleanupReferenceIndex? {
-        guard readers != nil else {return try ArchiveCleanupReferenceIndex(archiveCleanupReferenceRows(db))}
+        guard readers != nil else {
+            let attachments = try archiveCleanupJobAttachments(db,job:job,task:task)
+            return try archiveCleanupRelevantReferenceGraph(db,attachments:attachments,budget:.init(seconds:CleanupObservationDeadline.writerSeconds)).index
+        }
         guard let prepared,cleanupJobEqual(job.taskID.text,prepared.taskID) else {return nil}
         if let failure = prepared.failure {throw failure}
         try prepared.validate(db,tokens:archiveCleanupTokens(archiveCleanupJobAttachments(db,job:job,task:task)),journal:!fenced)
         fenced = true
-        return try prepared.index ?? ArchiveCleanupReferenceIndex(prepared.rows)
+        return prepared.index
     }
     /// `noCaptureUnderPermit` (CL-363): the caller read "no backup capture" for this root earlier in
     /// the same call that holds this permit. A permit never becomes active again, so a permit that
@@ -224,27 +288,34 @@ extension CommandRouter {
     /// object gate (`StorageSnapshotRetention.withCapture`), so no hold can start while the permit
     /// is active, and a second read cannot find one. Each unlink still reads the hold again
     /// (`removeOriginal`). Every other caller keeps the read here.
-    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64,prepared: PreparedArchiveCleanupScan? = nil,noCaptureUnderPermit: Bool = false) throws {
+    func processArchiveCleanupJobs(_ db: Database,permit: ArchiveStoragePermit,nowMS: Int64,prepared: PreparedArchiveCleanupScan? = nil,noCaptureUnderPermit: Bool = false,deadline: MaintenanceDeadline? = nil,dueIDs: [String]? = nil) throws {
         try permit.requireRoot(root)
         guard !db.isInsideTransaction else { throw CoreError("CLEANUP_TRANSACTION_REQUIRED", "Run cleanup after the semantic transaction commits.") }
         if !noCaptureUnderPermit { guard try !StorageSnapshotRetention.isActive(root:root) else {return} }
-        let ids = try dueArchiveCleanupJobIDs(db,nowMS:nowMS)
+        let ids = try dueIDs ?? dueArchiveCleanupJobIDs(db,nowMS:nowMS)
         var admissions = 0,fenced = false
         jobs: for id in ids {
+            try deadline?.check()
             var job = try cleanupJobDecode(record(db,id,type:"cleanup_job"))
             guard nowMS >= job.notBeforeMS else { continue }
-            var cursor: JSON = (try archiveCleanupRecordIfPresent(db,archiveCleanupCursorID(job),type:"storage_job")) ?? ["id":archiveCleanupCursorID(job),"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_cursor","state":"idle","revision":0,"next_index":0]
-            guard cursor["kind"] as? String == "archive_cleanup_cursor",cleanupJobEqual(cursor["task_id"],job.taskID.text),cleanupJobEqual(cursor["project_id"],job.projectID.text) else { throw CoreError("CLEANUP_CURSOR_INVALID", "Cleanup cursor requires repair; originals retained.") }
+            var cursor = try archiveCleanupCursor(db,job:job)
+            // Persist the cursor with its item. A later deadline can stop the
+            // turn without sending the next pass back over the held prefix.
+            func saveCursor() throws {
+                cursor = revised(cursor)
+                try save(db,cursor,type:"storage_job")
+            }
             let start = max(0,int(cursor,"next_index")) % job.items.count
             for offset in 0..<job.items.count where admissions < ArchiveCleanupJob.admissionStepLimit {
                 let index = (start + offset) % job.items.count,item = job.items[index]
                 if item.terminal { continue }; admissions += 1
+                try deadline?.check()
                 cursor["next_index"] = (index + 1) % job.items.count;cursor["checked_at_ms"] = nowMS
                 var precedingFailure: ArchiveCleanupJob.Failure?
                 var precedingFailureCount = 0
                 do {
                     var eligible = false,deferred = false
-                    try withValidatedDomainTransaction(db) {
+                    try withValidatedDomainTransaction(db,deadline:deadline) {
                         let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
                         if let previous = job.items.first(where: {$0.original.id == item.original.id}) { precedingFailure = previous.failure;precedingFailureCount = previous.sameFailureCount }
                         let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
@@ -264,6 +335,8 @@ extension CommandRouter {
                             let prior = try self.archiveCleanupRecordIfPresent(db,intentID,type:"storage_job")
                             let intent: JSON = ["id":intentID,"project_id":job.projectID.text,"task_id":job.taskID.text,"kind":"archive_cleanup_delete","state":"marked","revision":int(prior ?? [:],"revision") + 1,"cleanup_job_id":job.id.text,"attachment_id":item.original.id.text,"relative_path":relative,"sha256":item.original.sha256,"logical_bytes":item.original.logicalBytes]
                             try self.save(db,intent,type:"storage_job");eligible = true
+                        } else {
+                            try saveCursor()
                         }
                         return .commit
                     }
@@ -273,7 +346,7 @@ extension CommandRouter {
                         // Current complete graph inside an actual writer transaction,
                         // after the durable intent and immediately before unlink: the
                         // snapshot scan behind its fence (CL-345), or the in-writer scan.
-                        try withValidatedDomainTransaction(db) {
+                        try withValidatedDomainTransaction(db,deadline:deadline) {
                             let raw = try self.record(db,id,type:"cleanup_job");job = try self.cleanupJobDecode(raw)
                             guard ![.canceled,.completed,.suspended].contains(job.state),nowMS >= job.notBeforeMS else { return .commit }
                             let task = try self.scoped(db,job.taskID.text,job.projectID.text,type:"task")
@@ -284,24 +357,31 @@ extension CommandRouter {
                                   try self.completeArchiveCleanupHolds(db,attachment:a,task:task,currentGraph:graph.graph,currentIndex:graph).isEmpty,
                                   a["sha256"] as? String == item.original.sha256,try ArchiveCleanupJob.integer(a["revision"]) == item.original.attachmentRevision else { return .commit }
                             let relative = try self.archiveCleanupRelativePath(a)
-                            let removed = try permit.removeOriginal(relative:relative,sha256:item.original.sha256,size:item.original.logicalBytes)
+                            let verification = prepared?.originalProofs?[item.original.id]
+                            if deadline != nil && verification == nil {throw MaintenanceStepDeferred()}
+                            let verified = try verification?.get() ?? nil
+                            try deadline?.check()
+                            let removed = try permit.removeOriginal(relative:relative,sha256:item.original.sha256,size:item.original.logicalBytes,verified:verified,requirePreverified:verification != nil)
                             try job.recordDeletion(id:item.original.id,alreadyMissing:!removed)
                             a["availability"] = removed ? "original_cleaned" : "original_missing";a["cleanup_state"] = "complete";a["cleaned_at"] = now();a["cleanup_job_id"] = id
                             try self.save(db,self.revised(a),type:"attachment");try self.save(db,job.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job")
                             var intent = try self.record(db,self.archiveCleanupIntentID(job,item.original.id),type:"storage_job");intent["state"] = removed ? "removed" : "already_missing";try self.save(db,self.revised(intent),type:"storage_job")
                             try self.event(db,caller:Caller(role:"owner",installation:"storage",projectIDs:[]),project:job.projectID.text,entity:job.taskID.text,kind:removed ? "attachment_original_cleaned" : "attachment_original_missing",data:["attachment_id":item.original.id.text,"cleanup_job_id":id,"active_store_logical_bytes_removed":removed ? item.original.logicalBytes : 0,"physical_reclamation":"unmeasured","backup_retained_physical_bytes":NSNull()])
+                            try saveCursor()
                             return .commit
                         }
-                        try withValidatedDomainTransaction(db) { try self.save(db,self.revised(cursor),type:"storage_job");return .commit }
                         return
                     }
                 } catch {
+                    if error is MaintenanceStepDeferred {throw error}
+                    if let databaseError = error as? DatabaseError,
+                       [.SQLITE_BUSY,.SQLITE_LOCKED,.SQLITE_INTERRUPT].contains(databaseError.resultCode) {throw error}
                     // CL-345: a fence miss is not an item failure and never a hold.
                     // Nothing was deleted; the next turn rescans and retries this item.
                     if (error as? CoreError)?.code == "CLEANUP_CONCURRENT_WRITE" { return }
                     // A failure after unlink may have rolled its SQL outcome back.
                     // The durable marked intent is preserved; retry verifies absence.
-                    try withValidatedDomainTransaction(db) {
+                    try withValidatedDomainTransaction(db,deadline:deadline) {
                         let raw = try self.record(db,id,type:"cleanup_job");var current = try self.cleanupJobDecode(raw)
                         let code: ArchiveCleanupJob.Failure = (error as? CoreError)?.code == "CLEANUP_IDENTITY_CHANGED" ? .identityChanged : (error is DatabaseError ? .metadataUnavailable : .admissionUnavailable)
                         if ![.canceled,.completed,.suspended].contains(current.state) {
@@ -312,18 +392,22 @@ extension CommandRouter {
                             let existing = present?.failure == code ? (present?.sameFailureCount ?? 0) : 0
                             for _ in 0..<max(1,target - existing) { try current.recordFailure(id:item.original.id,code:code) }
                             try self.save(db,current.record(revision:self.nextCleanupJobRevision(raw)),type:"cleanup_job")
+                            try saveCursor()
                         }
                         return .commit
                     }
                 }
             }
-            try withValidatedDomainTransaction(db) { try self.save(db,self.revised(cursor),type:"storage_job");return .commit }
             if admissions >= ArchiveCleanupJob.admissionStepLimit { break }
         }
     }
     /// Service uses a one-shot deadline, never a polling/model timer. Held work
     /// resumes on a relevant command or an expiring actual reader/backup lease.
-    public func nextArchiveCleanupDeadline() throws -> Date? {
+    public func nextArchiveCleanupDeadline(recheckHeld: Bool = false) throws -> Date? {
+        try nextArchiveCleanupDeadline(recheckHeld:recheckHeld,observeRead:nil)
+    }
+
+    func nextArchiveCleanupDeadline(recheckHeld: Bool = false,observeRead: ((Database) -> Void)?) throws -> Date? {
         let lease = try storageAdmission.acquire();defer {lease.finish()}
         if try StorageSnapshotRetention.isActive(root:root) {return Date().addingTimeInterval(60)}
         // Pure scheduling metadata must not occupy the writer while retained
@@ -331,19 +415,22 @@ extension CommandRouter {
         // the service coalesces a fresh plan after concurrent command activity.
         // Enumerate each family through the covering scope index before loading
         // JSON; a type-only table scan also touches unrelated retained payloads.
-        return try readForPreparation { db in
+        return try readOnMaintenanceConnection { db in
+            observeRead?(db)
             let nowMS = self.archiveCleanupNowMS()
             let deadline = try Int64.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.not_before_ms') AS INTEGER)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(data) AND json_extract(data,'$.state') IN ('queued','ready')")
             let expiry = try Double.fetchOne(db,sql:"SELECT MIN(CAST(json_extract(data,'$.expires_at') AS REAL)) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_hold') AND json_valid(data) AND json_extract(data,'$.state')='active' AND CAST(json_extract(data,'$.expires_at') AS REAL)>?",arguments:[Date().timeIntervalSince1970])
-            let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))") ?? false
+            let more = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM records j,json_each(j.data,'$.items') i WHERE j.rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='cleanup_job') AND json_valid(j.data) AND json_extract(j.data,'$.state')='held' AND (? OR json_extract(i.value,'$.state')='waiting' OR json_extract(i.value,'$.same_failure_count')=1))",arguments:[recheckHeld]) ?? false
             let pendingProjects = try String.fetchAll(db,sql:"SELECT DISTINCT project_id FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='storage_job') AND ((" + Self.ticketObjectDeletionReadySQL + ") OR (" + TicketCleanupDescriptorPages.readySQL + "))")
             let deletionDeadline = try pendingProjects.map {max(Int64((try self.ticketCleanupProjectRetry(db,project:$0) ?? .distantPast).timeIntervalSince1970 * 1000),nowMS + 50)}.min()
             let lifecycle = try self.nextTicketCleanupDeadline(db)
             let evidenceBackup = try self.doneEvidenceBackupWake(db).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
+            let retention = try self.nextAutomaticBackupRetentionDeadline(db,at:Date()).map {max(Int64($0.timeIntervalSince1970 * 1000),nowMS + 50)}
             let retry = [self.ticketCleanupRetryAt,self.ticketCleanupYieldAt].compactMap {$0}.max().map {Int64($0.timeIntervalSince1970 * 1000)}
             let routineRetry = self.storageMaintenanceRetryAt.map {Int64($0.timeIntervalSince1970 * 1000)}
-            let importRecovery = self.commandOperations.mediaImportWaits.needsTurn ? max(routineRetry ?? 0,nowMS + 250) : nil
-            let next = [evidenceBackup,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64(($0 + 0.01) * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry,importRecovery].compactMap {$0}.min()
+            let importDue = try self.managedImportsNeedMaintenance(db)
+            let importRecovery = importDue || self.commandOperations.mediaImportWaits.needsTurn ? max(routineRetry ?? 0,nowMS + 250) : nil
+            let next = [evidenceBackup,retention,lifecycle.map { max(Int64($0.timeIntervalSince1970 * 1000),retry ?? 0,nowMS + 50) },deletionDeadline.map {max($0,retry ?? 0)},deadline.map { max($0,routineRetry ?? 0,nowMS + 50) },expiry.map { Int64(($0 + 0.01) * 1000) },more ? max(routineRetry ?? 0,nowMS + 1000) : nil,routineRetry,importRecovery].compactMap {$0}.min()
             return next.map { Date(timeIntervalSince1970:Double($0)/1000) }
         }
     }
@@ -356,20 +443,41 @@ extension CommandRouter {
     /// a batch; the writer yields after 128 objects or 25 ms of object work.
     @discardableResult
     func processTicketObjectDeletionIntents(_ db: Database,permit: ArchiveStoragePermit,prepared: TicketCleanupPreparedDeletion) throws -> JSON {
+        let check = permit.checkMaintenanceDeadline
+        try check()
         try permit.requireRoot(root)
         guard !db.isInsideTransaction else {throw CoreError("CLEANUP_TRANSACTION_REQUIRED","Run object deletion after the semantic transaction commits.")}
         guard try !StorageSnapshotRetention.isActive(root:root) else {return prepared.receipt}
         var receipt = prepared.receipt
-        guard var objects = receipt["objects"] as? [JSON],objects.count <= 100000,objects.contains(where: {$0["state"] as? String == "pending"}) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        guard var objects = receipt["objects"] as? [JSON],objects.count <= TicketCleanupDeletionCohort.objectLimit,try objects.contains(where: {
+            try check()
+            return $0["state"] as? String == "pending"
+        }) else {throw CoreError("CLEANUP_INTENT_INVALID","The deletion intent requires repair; bytes retained.")}
+        func updateLinkTargets(_ objects: inout [JSON]) throws -> Set<String> {
+            if let page = prepared.page {
+                page.links.apply(&objects)
+                return page.links.pendingTargets
+            }
+            guard prepared.hasInlineLinks else {return []}
+            return try Self.retainTicketObjectDeletionLinkTargets(&objects,check:check)
+        }
+        func checkFailureBudget(_ error: Error) throws {
+            if error is MaintenanceStepDeferred {throw error}
+            if permit.maintenanceDeadline != nil,let databaseError = error as? DatabaseError,
+               [.SQLITE_BUSY,.SQLITE_LOCKED,.SQLITE_INTERRUPT].contains(databaseError.resultCode) {throw MaintenanceStepDeferred()}
+            try check()
+        }
         if let reason = mediaCleanupTrashBindingFailure(receipt,allowUnboundPageTargets:prepared.page != nil && !bool(receipt,"descriptor_legacy_trash_binding")) {
             // A copied or unbound legacy destination is history, never a file
             // authority. Settle its pending moves without opening that folder.
-            for i in objects.indices where objects[i]["state"] as? String == "pending" && objects[i]["disposal"] as? String == "trash" {
+            for i in objects.indices {
+                try check()
+                guard objects[i]["state"] as? String == "pending",objects[i]["disposal"] as? String == "trash" else {continue}
                 objects[i]["state"] = "retained";objects[i]["reasons"] = [reason]
             }
             var outcome = receipt
             try withValidatedDomainTransaction(db) {
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page,check:check)
                 return .commit
             }
             return outcome
@@ -378,12 +486,10 @@ extension CommandRouter {
             // No old ownership fingerprint gains unlink authority. Keep every
             // byte, preserve all earlier outcomes, and request a fresh policy-v2
             // plan through the existing tokenized legacy completion wake.
-            for i in objects.indices where objects[i]["state"] as? String == "pending" {
-                objects[i]["state"] = "retained";objects[i]["reasons"] = ["legacy_replan_required"]
-            }
+            let settlement = prepared.legacySettlement ?? Self.ticketCleanupLegacySettlement(receipt)
             var outcome = receipt
             try withValidatedDomainTransaction(db) {
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:settlement.objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page,legacySummary:settlement.summary,check:check)
                 return .commit
             }
             return outcome
@@ -395,28 +501,37 @@ extension CommandRouter {
             try withValidatedDomainTransaction(db) {
                 if let page = prepared.page {receipt = try self.saveTicketBytePage(db,receipt:receipt,execution:page)}
                 else {try self.save(db,receipt,type:"storage_job")}
+                try check()
                 return .commit
             }
         }
-        receipt = try prepareMediaCleanupTrash(db,receipt:receipt,page:prepared.page)
+        receipt = try prepareMediaCleanupTrash(db,receipt:receipt,page:prepared.page,check:check)
         objects = receipt["objects"] as? [JSON] ?? objects
         var attempted: [Int] = [],outcome = receipt
         do {
             try withValidatedDomainTransaction(db) {
                 if let reason = try self.ticketCleanupDeletionBlocker(db,receipt:receipt) {
-                    for i in objects.indices where objects[i]["state"] as? String == "pending" {objects[i]["state"] = "retained";objects[i]["reasons"] = [reason]}
-                    outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page);return .commit
+                    for i in objects.indices {
+                        try check()
+                        if objects[i]["state"] as? String == "pending" {objects[i]["state"] = "retained";objects[i]["reasons"] = [reason]}
+                    }
+                    outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page,check:check);return .commit
                 }
                 let references = prepared.references,mediaAuthorityComplete = prepared.mediaAuthorityComplete,backup = prepared.backup
-                let workspaces = try self.ticketObjectDeletionWorkspaces(db,objects:objects,candidatePaths:prepared.candidatePaths)
-                for i in objects.indices where prepared.page == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
-                    let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
-                    if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
+                let workspaces = try self.ticketObjectDeletionWorkspaces(db,objects:objects,candidatePaths:prepared.candidatePaths,check:check)
+                if prepared.page == nil && prepared.hasInlineLinks {
+                    for i in objects.indices {
+                        try check()
+                        guard objects[i]["state"] as? String == "pending",objects[i]["kind"] as? String == "symlink" else {continue}
+                        let holds = try self.ticketObjectDeletionHolds(db,object:objects[i],references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge",check:check)
+                        if !holds.isEmpty {objects[i]["state"] = "retained";objects[i]["reasons"] = holds.sorted()}
+                    }
                 }
-                prepared.page?.links.apply(&objects)
-                var pendingTargets = prepared.page?.links.pendingTargets ?? Self.retainTicketObjectDeletionLinkTargets(&objects)
+                var pendingTargets = try updateLinkTargets(&objects)
                 let started = ProcessInfo.processInfo.systemUptime
-                for index in objects.indices where objects[index]["state"] as? String == "pending" {
+                for index in objects.indices {
+                    try check()
+                    guard objects[index]["state"] as? String == "pending" else {continue}
                     if prepared.page?.links.linksOnly == true,objects[index]["kind"] as? String != "symlink" {continue}
                     guard let path = objects[index]["relative_path"] as? String,prepared.candidatePaths.contains(path),!pendingTargets.contains(path) else {continue}
                     if attempted.count >= 128 || !attempted.isEmpty && ProcessInfo.processInfo.systemUptime-started >= 0.025 {break}
@@ -424,7 +539,7 @@ extension CommandRouter {
                     let object = objects[index]
                     var result = object
                     do {
-                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
+                        let holds = try self.ticketObjectDeletionHolds(db,object:object,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge",check:check)
                         if !holds.isEmpty {result["state"] = "retained";result["reasons"] = holds.sorted()}
                         else {
                             guard let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value,
@@ -437,12 +552,13 @@ extension CommandRouter {
                             if trashPath != nil {result["moved_to_trash"] = removed}
                         }
                     } catch {
+                        try checkFailureBudget(error)
                         let failures = int(object,"failures") + 1,code = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
                         result["failures"] = failures;result["last_failure"] = code
                         if failures >= 2 {result["state"] = "retained";result["reasons"] = [code]}
                     }
                     objects[index] = result
-                    if prepared.page == nil,object["kind"] as? String == "symlink" {pendingTargets = Self.retainTicketObjectDeletionLinkTargets(&objects)}
+                    if prepared.page == nil,object["kind"] as? String == "symlink" {pendingTargets = try updateLinkTargets(&objects)}
                     try self.recordTicketCleanupAvailability(db,receipt:receipt,object:result)
                     if prepared.page != nil,object["kind"] as? String == "symlink" {
                         // Any symlink outcome can change another page's closure.
@@ -450,34 +566,37 @@ extension CommandRouter {
                         break
                     }
                 }
-                if let page = prepared.page {page.links.apply(&objects)}
-                else {_ = Self.retainTicketObjectDeletionLinkTargets(&objects)}
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
+                _ = try updateLinkTargets(&objects)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page,check:check)
                 return .commit
             }
         } catch {
+            try checkFailureBudget(error)
             // A failed SQL outcome never invents committed removals. Retry the
             // original intent and observe any already absent paths honestly.
             try withValidatedDomainTransaction(db) {
                 objects = receipt["objects"] as? [JSON] ?? []
                 for index in attempted {
+                    try check()
                     let failures = int(objects[index],"failures") + 1,code = (error as? CoreError)?.code ?? "CLEANUP_UNAVAILABLE"
                     objects[index]["failures"] = failures;objects[index]["last_failure"] = code
                     if failures >= 2 {objects[index]["state"] = "retained";objects[index]["reasons"] = [code]}
                 }
-                if let page = prepared.page {page.links.apply(&objects)}
-                else {_ = Self.retainTicketObjectDeletionLinkTargets(&objects)}
-                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page)
+                _ = try updateLinkTargets(&objects)
+                outcome = try self.saveTicketObjectDeletionOutcome(db,receipt:receipt,objects:objects,backupGenerationRow:prepared.backupGenerationRow,page:prepared.page,check:check)
                 return .commit
             }
         }
         return outcome
     }
 
-    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON],backupGenerationRow: Int64,page: TicketBytePageExecution?) throws -> JSON {
+    private func saveTicketObjectDeletionOutcome(_ db: Database,receipt: JSON,objects: [JSON],backupGenerationRow: Int64,page: TicketBytePageExecution?,legacySummary: JSON? = nil,check: () throws -> Void) throws -> JSON {
+        try check()
         var receipt = receipt,objects = objects
         if receipt["cause"] as? String == "media_round_delete" {
-            for index in objects.indices where strings(objects[index],"reasons").contains("reader_lease") {
+            for index in objects.indices {
+                try check()
+                guard strings(objects[index],"reasons").contains("reader_lease") else {continue}
                 objects[index]["reader_hold_ids"] = try mediaRoundDeletionReaderHoldIDs(db,object:objects[index])
             }
         }
@@ -486,8 +605,9 @@ extension CommandRouter {
             receipt = try saveTicketBytePage(db,receipt:receipt,execution:page,generation:backupGenerationRow)
         } else {
             receipt["objects"] = objects
-            receipt["summary"] = Self.ticketObjectDeletionSummary(objects)
-            receipt["state"] = objects.contains {$0["state"] as? String == "pending"} ? "pending" : "completed"
+            let summary = try legacySummary ?? Self.ticketObjectDeletionSummary(objects,check:check)
+            receipt["summary"] = summary
+            receipt["state"] = int(summary,"pending_count") > 0 ? "pending" : "completed"
             receipt["checked_at"] = now()
             receipt = revised(receipt)
             try save(db,receipt,type:"storage_job")
@@ -509,6 +629,7 @@ extension CommandRouter {
             let previous = Double(try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key=?",arguments:["ticket-cleanup-next:" + project]) ?? "0") ?? 0
             try db.execute(sql:"INSERT OR REPLACE INTO metadata(key,value) VALUES (?,?)",arguments:["ticket-cleanup-next:" + project,String(min(previous,clock.timeIntervalSince1970))])
         }
+        try check()
         return receipt
     }
 }

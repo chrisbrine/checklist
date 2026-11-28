@@ -1,0 +1,12 @@
+{
+  "active": [],
+  "recent": [
+    {
+      "started_at": "2026-01-15T12:00:00.000Z",
+      "duration_ms": 1264.8,
+      "resource": "writer",
+      "work": "routine_prune_command_results",
+      "active": false
+    }
+  ]
+}

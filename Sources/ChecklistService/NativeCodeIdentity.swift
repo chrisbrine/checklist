@@ -3,10 +3,9 @@ import Security
 import Darwin
 import ChecklistIPC
 
-/// Queue-confined Security objects, not cached authorization decisions. Every
-/// use still checks dynamic code validity. Recreate the objects after executable
-/// metadata, PID generation or path changes; never reuse a negative result.
-final class NativeCodeIdentity {
+/// Cached Security objects, not authorization decisions. The lock only protects
+/// the caches. File observations and dynamic validation happen outside it.
+final class NativeCodeIdentity: @unchecked Sendable {
     private struct FileStamp: Equatable {
         let path: Data
         let metadata: [Int64]
@@ -38,37 +37,43 @@ final class NativeCodeIdentity {
         let stamp: FileStamp
         let identity: ClientBuildIdentity
     }
+    private let lock = NSLock()
     private var running: [pid_t:Running] = [:]
     private var executables: [Data:Executable] = [:]
 
     func executable(_ url: URL) -> ClientBuildIdentity? {
         let key = Data(url.path.utf8)
-        guard let stamp = FileStamp(url.path) else { executables.removeValue(forKey:key); return nil }
-        if let cached = executables[key], cached.stamp == stamp { return cached.identity }
-        executables.removeValue(forKey:key)
+        guard let stamp = FileStamp(url.path) else {return nil}
+        if let cached = lock.withLock({executables[key]}), cached.stamp == stamp {return cached.identity}
         guard let identity = ClientBuildIdentity.executable(url), FileStamp(url.path) == stamp else { return nil }
-        if executables.count >= 8 { executables.removeAll() }
-        executables[key] = Executable(stamp:stamp,identity:identity)
+        lock.withLock {
+            if executables.count >= 8 {executables.removeAll()}
+            executables[key] = Executable(stamp:stamp,identity:identity)
+        }
         return identity
     }
 
     func signingInfo(_ pid: pid_t) -> [String:Any]? {
-        guard let stamp = ProcessStamp(pid) else { running.removeValue(forKey:pid); return nil }
-        if let cached = running[pid], cached.stamp == stamp {
+        guard let stamp = ProcessStamp(pid) else {return nil}
+        if let cached = lock.withLock({running[pid]}), cached.stamp == stamp {
             guard SecCodeCheckValidity(cached.code, [], nil) == errSecSuccess, ProcessStamp(pid) == stamp else {
-                running.removeValue(forKey:pid); return nil
+                lock.withLock {
+                    if running[pid]?.stamp == stamp {running.removeValue(forKey:pid)}
+                }
+                return nil
             }
             return cached.information
         }
-        running.removeValue(forKey:pid)
         var code: SecCode?, staticCode: SecStaticCode?, information: CFDictionary?
         guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid as String:NSNumber(value:pid)] as CFDictionary, [], &code) == errSecSuccess, let code,
               SecCodeCheckValidity(code, [], nil) == errSecSuccess,
               SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
               SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue:kSecCSSigningInformation), &information) == errSecSuccess,
               let info = information as? [String:Any], ProcessStamp(pid) == stamp else { return nil }
-        if running.count >= 64 { running.removeAll() }
-        running[pid] = Running(stamp:stamp,code:code,information:info)
+        lock.withLock {
+            if running.count >= 64 {running.removeAll()}
+            running[pid] = Running(stamp:stamp,code:code,information:info)
+        }
         return info
     }
 }

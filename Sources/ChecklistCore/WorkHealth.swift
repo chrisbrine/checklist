@@ -305,11 +305,19 @@ extension CommandRouter {
         }
     }
 
+    static let workHealthChangeJournal = WorkHealthPreparationChanges()
+
     /// Prepare the page and progress clocks without the object gate or writer.
-    /// Restarting resets only the scan position; durable requests stay in SQL.
+    /// Commit one advisory candidate per writer turn. Restarting resets only
+    /// the scan position; durable requests stay in SQL.
     public func runWorkHealthChecks(at date: Date = Date()) throws -> [String: Any] {
         let lease = try storageAdmission.acquire(); defer { lease.finish() }
         workHealthPreparationLock.lock();defer {workHealthPreparationLock.unlock()}
+        let position = workHealthScanPosition
+        let fence = Self.workHealthChangeJournal
+        let deferred: JSON = ["scanned":0,"inspected":0,"changed":0,"has_more":false,"enabled":true,"deferred":true]
+        guard let version = try startWorkHealthJournal(fence) else {return deferred}
+        defer { _ = try? withMaintenanceWriter(label: "work_health_finish") {db,_ in try fence.stop(db)} }
         var configuration = Configuration();configuration.readonly = true
         configuration.prepareDatabase {db in
             try SchemaMigrations.installStorageCollation(db);Self.installTicketSearchFunctions(db)
@@ -318,52 +326,76 @@ extension CommandRouter {
         // unavailable or occupied by a cleanup deadline scan.
         let observer = try DatabaseQueue(path:root.appendingPathComponent("checklist.sqlite").path,configuration:configuration)
         defer {try? observer.close()}
-        let fence = WorkHealthPreparationChanges()
-        let (position,version) = try dbQueue.writeWithoutTransaction {db in
-            var version: Int64 = 0
-            try db.inSavepoint {version = try fence.install(db);return .commit}
-            return (workHealthScanPosition,version)
-        }
-        defer {try? dbQueue.writeWithoutTransaction {try fence.remove($0)}}
         let page = try observer.read {db in try autoreleasepool {
             let result = try prepareWorkHealthPage(db,after:position)
             try workHealthPreparationProbe?()
             return result
         }}
-        return try ArchiveStorageGate.withExclusive(root: root) { _ in
-            try dbQueue.writeWithoutTransaction { db in
-                var result: JSON = [:],advance = false
-                try withValidatedDomainTransaction(db) {
-                    guard let changes = try fence.read(db,version:version) else {
-                        // Keep the cursor and use the ordinary 30-second health
-                        // wake, rather than rescanning immediately under traffic.
-                        result = ["scanned":0,"inspected":0,"changed":0,"has_more":false,"enabled":true,"deferred":true]
-                        return .commit
+        enum CandidateOutcome {
+            case stale, journalRefused
+            case applied(inspected: Bool, changed: Bool)
+        }
+        var scanned = 0, inspected = 0, changed = 0, refused = 0
+        var blocked = false
+        var journal: WorkHealthPreparationChanges.Snapshot?
+        for item in page.items {
+            var admitted = false
+            let outcome = try withMaintenanceWriter(label: "work_health_apply") {db,deadline in
+                admitted = true
+                var result = CandidateOutcome.stale
+                try withValidatedDomainTransaction(db,deadline:deadline) {
+                    guard let current = try fence.readSnapshot(db,version:version,previous:journal) else {
+                        result = .journalRefused
+                        return .rollback
                     }
-                    var inspected = 0,changed = 0,processed = 0,refused = 0
-                    for item in page.items {
-                        guard try workHealthPreparationIsCurrent(db,changes:changes,dependencies:item.dependencies) else {refused += 1;continue}
-                        processed += 1
-                        switch item.action {
-                        case .unheld(let category):
-                            if try endUnheldWorkHealth(db,task:item.task,category:category) {changed += 1}
-                        case .inspect(let progress):
-                            if try checkWorkHealth(db,task:item.task,at:date,prepared:progress) {changed += 1}
-                            inspected += 1
-                        case .skip:break
-                        }
+                    journal = current
+                    guard try workHealthPreparationIsCurrent(db,changes:current.changes,dependencies:item.dependencies) else {return .rollback}
+                    try fence.stop(db)
+                    switch item.action {
+                    case .unheld(let category):
+                        result = .applied(inspected:false,changed:try endUnheldWorkHealth(db,task:item.task,category:category))
+                    case .inspect(let progress):
+                        result = .applied(inspected:true,changed:try checkWorkHealth(db,task:item.task,at:date,prepared:progress))
+                    case .skip:
+                        result = .applied(inspected:false,changed:false)
                     }
-                    // A known stale item is revisited on the next sweep. Even
-                    // a full stale page must yield to quiet tickets after it.
-                    advance = true
-                    result = ["scanned":page.items.count,"inspected":inspected,"changed":changed,"has_more":page.hasMore,"enabled":page.enabled,"deferred_count":refused]
-                    if processed == 0 && refused > 0 {result["deferred"] = true}
+                    try fence.resume(db)
                     return .commit
                 }
-                if advance {workHealthScanPosition = page.nextPosition}
                 return result
             }
+            if case .journalRefused? = outcome {blocked = true;break}
+            if outcome == nil && !admitted {blocked = true;break}
+            scanned += 1
+            // A stale candidate or a rolled-back timed-out candidate is tried
+            // on the next sweep, so a repeatedly slow ticket cannot starve peers.
+            workHealthScanPosition = item.position
+            if case .applied(let inspectedItem,let changedItem)? = outcome {
+                if inspectedItem {inspected += 1}
+                if changedItem {changed += 1}
+            } else {refused += 1}
         }
+        if !blocked {workHealthScanPosition = page.nextPosition}
+        var result: JSON = ["scanned":scanned,"inspected":inspected,"changed":changed,"has_more":!blocked && page.hasMore,"enabled":page.enabled,"deferred_count":refused]
+        if blocked || (scanned == refused && refused > 0) {result["deferred"] = true}
+        return result
+    }
+
+    private func startWorkHealthJournal(_ fence: WorkHealthPreparationChanges) throws -> Int64? {
+        func activate() throws -> Int64?? {
+            try withMaintenanceWriter(label:"work_health_prepare") {db,deadline in
+                try fence.startIfPrepared(db,deadline:deadline)
+            }
+        }
+        guard let ready = try activate() else {return nil}
+        if let ready {return ready}
+        for step in fence.installationSteps {
+            let installed: Void? = try withMaintenanceWriter(label:"work_health_prepare_schema") {db,deadline in
+                try fence.prepareStep(db,step,deadline:deadline)
+            }
+            guard installed != nil else {return nil}
+        }
+        return try activate() ?? nil
     }
 
     private func prepareWorkHealthPage(_ db: Database,after position: Int64) throws -> WorkHealthPreparedPage {
@@ -403,7 +435,7 @@ extension CommandRouter {
             if dependencyRows + dependencies.ids.count > 32768 || dependencyBytes + dependencies.bytes > 4*1024*1024 {
                 dependencies.refuse()
             } else {dependencyRows += dependencies.ids.count;dependencyBytes += dependencies.bytes}
-            return .init(task:task,action:action,dependencies:dependencies)
+            return .init(position:row["position"],task:task,action:action,dependencies:dependencies)
         }
         let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='project') AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
         return .init(items:items,nextPosition:rows.count < pageLimit ? 0 : (rows.last?["position"] as Int64? ?? 0),hasMore:rows.count == pageLimit,enabled:enabled > 0)

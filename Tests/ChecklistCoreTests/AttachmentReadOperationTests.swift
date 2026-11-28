@@ -131,9 +131,9 @@ final class AttachmentReadOperationTests: XCTestCase {
             let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT m.value,c.result FROM metadata m JOIN commands c ON c.command_id=json_extract(m.value,'$.command_id') AND c.principal=json_extract(m.value,'$.principal') WHERE m.key GLOB 'command-operation:*' AND json_extract(m.value,'$.finished_at')=? LIMIT 1",arguments:[oldDate]))
             XCTAssertThrowsError(try router.attachmentOperationResult(db,jsonObject(row["result"]),operation:jsonObject(row["value"]),caller:caller)) {XCTAssertEqual(($0 as? CoreError)?.code,"ATTACHMENT_READ_EXPIRED")}
         }
-        XCTAssertEqual(try router.dbQueue.write {try router.pruneAttachmentReadResults($0)},4)
-        XCTAssertEqual(try router.dbQueue.write {try router.pruneAttachmentReadResults($0)},2)
-        XCTAssertEqual(try router.dbQueue.write {try router.pruneAttachmentReadResults($0)},0)
+        XCTAssertEqual(try router.pruneRoutineRecords().attachmentReadResults,4)
+        XCTAssertEqual(try router.pruneRoutineRecords().attachmentReadResults,2)
+        XCTAssertEqual(try router.pruneRoutineRecords().attachmentReadResults,0)
         try router.dbQueue.read {db in
             XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE json_extract(result,'$.attachment_read_expired')=1"),6)
             XCTAssertEqual(try Int.fetchOne(db,sql:"SELECT count(*) FROM commands WHERE json_type(result,'$.data.content_base64')='text'"),1)

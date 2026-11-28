@@ -486,7 +486,7 @@ extension CommandRouter {
                     WHERE predecessor.id=CAST(? AS TEXT) AND predecessor.type='media_round'
                       AND predecessor.project_id=CAST(? AS TEXT)
                       AND i.type='media_intake' AND i.project_id=predecessor.project_id
-                      AND json_extract(i.data,'$.round_id')=predecessor.id COLLATE BINARY
+                      AND predecessor.id=json_extract(i.data,'$.round_id')
                       AND json_type(i.data,'$.attachment_owner_id')='text'
                     GROUP BY owner_id COLLATE BINARY
                 )
@@ -494,24 +494,24 @@ extension CommandRouter {
                        CAST(owner.id AS BLOB) AS owner_id,CAST(intake.intake_id AS BLOB) AS intake_id,
                        CAST(job.id AS BLOB) AS import_id
                 FROM json_each(?) member
-                CROSS JOIN records a ON a.id=member.value COLLATE BINARY
+                CROSS JOIN records a ON a.id=member.value
                 LEFT JOIN records job ON json_type(a.data,'$.attachment_owner_id') IS NULL
                     AND json_type(a.data,'$.storage_job_id')='text'
-                    AND job.id=json_extract(a.data,'$.storage_job_id') COLLATE BINARY
+                    AND job.id=json_extract(a.data,'$.storage_job_id')
                     AND job.type='storage_job' AND job.project_id=a.project_id
                     AND json_extract(job.data,'$.kind')='attachment_import'
                     AND json_extract(job.data,'$.state') IN ('committed','settled','repair_required')
                     AND json_extract(job.data,'$.settled_reason') IS NOT 'canceled_media_staging'
                     AND json_extract(job.data,'$.attachment_owner_kind')='media_intake'
                     AND json_type(job.data,'$.attachment_owner_id')='text'
-                    AND json_extract(job.data,'$.attachment_id')=a.id COLLATE BINARY
+                    AND a.id=json_extract(job.data,'$.attachment_id')
                 JOIN records owner ON owner.id=CASE
                     WHEN json_type(a.data,'$.attachment_owner_id')='text' THEN json_extract(a.data,'$.attachment_owner_id')
-                    ELSE json_extract(job.data,'$.attachment_owner_id') END COLLATE BINARY
+                    ELSE json_extract(job.data,'$.attachment_owner_id') END
                     AND owner.type='storage_job' AND owner.project_id=a.project_id
                     AND json_extract(owner.data,'$.kind')='media_attachment_owner'
                     AND json_extract(owner.data,'$.owner_kind')='media_intake'
-                JOIN predecessor_intakes intake ON intake.owner_id=owner.id COLLATE BINARY
+                JOIN predecessor_intakes intake ON owner.id=intake.owner_id
                 WHERE a.project_id=CAST(? AS TEXT) AND a.type='attachment'
                   AND json_extract(a.data,'$.mode')='managed'
                   AND json_extract(a.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY

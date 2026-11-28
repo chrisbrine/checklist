@@ -40,17 +40,23 @@ public enum ManagedPaths {
 /// content proof; disagreement or absent proof leaves the old value unavailable.
 enum ManagedPathRelocation {
     static let captureBindingsKey = "managed-capture-paths-v3"
-    static func captureBindings(_ db: Database, root: URL) throws -> [Data: String] {
+    static func captureBindings(_ db: Database, root: URL, budget: StorageSnapshotBudget = .production()) throws -> [Data: String] {
         guard (try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0) >= 3 else { return [:] }
-        guard let raw = try String.fetchOne(db, sql: "SELECT value FROM metadata WHERE key=?", arguments: [captureBindingsKey]) else { return [:] }
+        let working = StorageSnapshotWorkingBytes(budget)
+        guard let row = try Row.fetchOne(db, sql: "SELECT value,length(CAST(value AS BLOB)) AS snapshot_envelope_bytes FROM metadata WHERE key=?", arguments: [captureBindingsKey]) else { return [:] }
+        try working.requireEnvelope(row)
+        let raw: String = row["value"]
         guard let entries = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [JSON] else { throw StorageSnapshotFailure.unsupportedAuthority }
         var result: [Data: String] = [:]
+        var retained = working
         for entry in entries {
+            try budget.check()
             guard Set(entry.keys) == ["stored", "relative"], let stored = entry["stored"] as? String, let relative = entry["relative"] as? String,
                   !relative.hasPrefix("/"), try ManagedPaths.relative(relative, family: "source-captures", root: root) == relative else { throw StorageSnapshotFailure.unsupportedAuthority }
             _ = try ManagedPaths.relative(stored, family: "source-captures", root: root)
             let key = Data(stored.utf8)
             guard result[key] == nil else { throw StorageSnapshotFailure.unsupportedAuthority }
+            try retained.retain(96 + key.count + relative.utf8.count)
             result[key] = relative
         }
         return result
@@ -70,6 +76,11 @@ enum ManagedPathRelocation {
     struct Decision { let relative: String?; let reason: String? }
     struct Plan {
         var decisions: [Data: Decision]
+        var workingBytes: Int {
+            decisions.reduce(0) { total, pair in
+                total + 96 + pair.key.count + (pair.value.relative?.utf8.count ?? 0) + (pair.value.reason?.utf8.count ?? 0)
+            }
+        }
         func decision(_ stored: String, family: String, root: URL) throws -> Decision {
             if let local = try ManagedPaths.relative(stored, family: family, root: root) { return .init(relative: local, reason: nil) }
             return decisions[Data(stored.utf8)] ?? .init(relative: nil, reason: "outside_store_root")
@@ -148,46 +159,69 @@ enum ManagedPathRelocation {
     /// and decoding the entire database here would produce the same bindings.
     static func snapshotPlan(_ db: Database,root: URL,budget: StorageSnapshotBudget,objectRoot: URL? = nil) throws -> Plan {
         if (try Int.fetchOne(db,sql:"PRAGMA user_version") ?? 0) >= 3 {
-            return Plan(decisions:try captureBindings(db,root:root).mapValues { Decision(relative:$0,reason:nil) })
+            return Plan(decisions:try captureBindings(db,root:root,budget:budget).mapValues { Decision(relative:$0,reason:nil) })
         }
         return try plan(db,root:root,budget:budget,objectRoot:objectRoot)
     }
 
     static func plan(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil) throws -> Plan {
         var localFiles: StorageObjectFiles?
-        let bindings = try captureBindings(db, root: root)
+        let bindings = try captureBindings(db, root: root, budget: budget)
         let mayRelocateLegacy = (try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0) < 3
-        var all: [Field] = [], prefixes: Set<Data>?
-        let rows = try Row.fetchCursor(db, sql: "SELECT " + CommandRouter.canonicalRecordColumns + " FROM records ORDER BY rowid")
-        var count = 0
-        while let row = try rows.next() {
-            try budget.check(); count += 1
-            guard count <= budget.maximumRecords else { throw StorageSnapshotFailure.limit }
-            let record = try GRDBRecordEnvelopeAdapter.decode(row)
-            let fields = try fields(record.object, type: record.type)
-            for field in fields where field.stored.hasPrefix("/") && bindings[Data(field.stored.utf8)] == nil {
-                let candidates: Set<Data>
-                if try ManagedPaths.relative(field.stored, family: field.family, root: root) != nil { candidates = [Data(root.standardizedFileURL.path.utf8)] }
-                else { candidates = try originCandidates(field.stored, family: field.family) }
-                prefixes = prefixes.map { $0.intersection(candidates) } ?? candidates
-            }
-            all += fields
-        }
+        var working = StorageSnapshotWorkingBytes(budget)
         var decisions = bindings.mapValues { Decision(relative: $0, reason: nil) }
-        // Prove captures before execution working-directory references.
-        for field in all where field.keys.last != "working_directory" {
+        try working.retain(Plan(decisions: decisions).workingBytes)
+        var prefixes: Set<Data>?
+        func visitFields(_ visit: (Field) throws -> Void) throws {
+            let query = "SELECT " + CommandRouter.canonicalRecordColumns + ", " + StorageSnapshotWorkingBytes.envelopeLength +
+                " FROM records WHERE type IN ('attachment','project','source_capture','manifest','source_execution') ORDER BY rowid"
+            let rows = try Row.fetchCursor(db, sql: query)
+            while let row = try rows.next() {
+                try budget.check()
+                try autoreleasepool {
+                    try working.requireEnvelope(row)
+                    let record = try GRDBRecordEnvelopeAdapter.decode(row)
+                    for field in try fields(record.object, type: record.type) {
+                        try visit(field)
+                    }
+                }
+            }
+        }
+        func remember(_ key: Data, _ decision: Decision) throws {
+            try working.retain(96 + key.count + (decision.relative?.utf8.count ?? 0) + (decision.reason?.utf8.count ?? 0))
+            decisions[key] = decision
+        }
+        try visitFields { field in
+            guard field.stored.hasPrefix("/"), bindings[Data(field.stored.utf8)] == nil else { return }
+            let candidates: Set<Data>
+            if try ManagedPaths.relative(field.stored, family: field.family, root: root) != nil {
+                candidates = [Data(root.standardizedFileURL.path.utf8)]
+            } else {
+                candidates = try originCandidates(field.stored, family: field.family)
+            }
+            prefixes = prefixes.map { $0.intersection(candidates) } ?? candidates
+            try working.requireInput(candidates.reduce(0) { $0 + 64 + $1.count })
+        }
+        // Prove captures before execution working-directory references. Defer
+        // the latter by path instead of retaining every decoded proof.
+        var workingDirectories: Set<Data> = []
+        try visitFields { field in
             let key = Data(field.stored.utf8)
-            if bindings[key] != nil { continue }
-            if try ManagedPaths.relative(field.stored, family: field.family, root: root) != nil { continue }
+            if try ManagedPaths.relative(field.stored, family: field.family, root: root) != nil { return }
+            if field.keys.last == "working_directory" {
+                if workingDirectories.insert(key).inserted { try working.retain(64 + key.count) }
+                return
+            }
+            if bindings[key] != nil { return }
             // Only a protected legacy upgrade may establish a new binding.
             // Unproved leftovers in protocol 3 cannot silently become available.
-            guard mayRelocateLegacy else { decisions[key] = .init(relative: nil, reason: "outside_store_root"); continue }
-            guard let prefixes, prefixes.count == 1, let origin = prefixes.first else { decisions[key] = .init(relative: nil, reason: "ambiguous_origin_root"); continue }
+            guard mayRelocateLegacy else { try remember(key, .init(relative: nil, reason: "outside_store_root")); return }
+            guard let prefixes, prefixes.count == 1, let origin = prefixes.first else { try remember(key, .init(relative: nil, reason: "ambiguous_origin_root")); return }
             let originPath = String(decoding: origin, as: UTF8.self)
             let prefix = originPath == "/" ? "/" : originPath + "/"
             guard field.stored.utf8.starts(with: prefix.utf8),
                   let relative = try ManagedPaths.relative(String(field.stored.dropFirst(prefix.count)), family: field.family, root: root) else {
-                decisions[key] = .init(relative: nil, reason: "ambiguous_origin_root"); continue
+                try remember(key, .init(relative: nil, reason: "ambiguous_origin_root")); return
             }
             var reason: String?
             do {
@@ -214,27 +248,35 @@ enum ManagedPathRelocation {
             }
             let decision = Decision(relative: reason == nil ? relative : nil, reason: reason)
             // Repeated manifest authority must agree, never let a weaker proof win.
-            if let prior = decisions[key], prior.relative == nil { continue }
-            decisions[key] = decision
+            if let prior = decisions[key], prior.relative == nil { return }
+            try remember(key, decision)
         }
-        for field in all where field.keys.last == "working_directory" {
-            let key = Data(field.stored.utf8)
-            if try ManagedPaths.relative(field.stored, family: field.family, root: root) != nil { continue }
-            if decisions[key] == nil { decisions[key] = .init(relative: nil, reason: "capture_not_proven") }
+        for key in workingDirectories where decisions[key] == nil {
+            try remember(key, .init(relative: nil, reason: "capture_not_proven"))
         }
         return Plan(decisions: decisions)
     }
     static func apply(_ db: Database, root: URL, plan: Plan) throws {
-        let rows = try Row.fetchAll(db, sql: "SELECT rowid,type,data FROM records WHERE type IN ('attachment','project','source_capture','manifest','source_execution')")
+        let budget = StorageSnapshotBudget.production()
+        var working = StorageSnapshotWorkingBytes(budget)
+        let rows = try Row.fetchCursor(db, sql: "SELECT rowid,type,data, " + StorageSnapshotWorkingBytes.envelopeLength +
+            " FROM records WHERE type IN ('attachment','project','source_capture','manifest','source_execution') ORDER BY rowid")
         var bindings = try captureBindings(db, root: root)
-        for row in rows {
+        try working.retain(plan.workingBytes)
+        while let row = try rows.next() {
+            try budget.check()
+            try working.requireEnvelope(row)
             let raw: String = row["data"], type: String = row["type"], rowID: Int64 = row["rowid"]
             var value = jsonObject(raw)
             if type == "manifest" {
                 // Evidence and whole-manifest digests are immutable review authority.
                 // Store only the proved local descriptor outside those bytes.
                 for field in try fields(value, type: type) {
-                    if let relative = try plan.decision(field.stored, family: field.family, root: root).relative { bindings[Data(field.stored.utf8)] = relative }
+                    if let relative = try plan.decision(field.stored, family: field.family, root: root).relative {
+                        let key = Data(field.stored.utf8)
+                        try working.retain(96 + key.count + relative.utf8.count)
+                        bindings[key] = relative
+                    }
                 }
                 continue
             }

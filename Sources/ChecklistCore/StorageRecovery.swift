@@ -168,7 +168,7 @@ extension CommandRouter {
         var timingOutcome = "failed"
         defer { budget.finishTiming(outcome: timingOutcome) }
         do {
-            try dbQueue.read { try authorizeStorageBackup($0,params:params,caller:caller) }
+            try readForPreparation { try authorizeStorageBackup($0,params:params,caller:caller) }
             try backupWrites.beginCapture()
             defer {backupWrites.endBackup(router:self)}
             var budget = budget
@@ -179,13 +179,15 @@ extension CommandRouter {
                 try observe(event)
                 try executionProbe?(event)
             }
-            var result = try StorageSnapshotRetention.withCapture(root:root) { retention in
-                try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
-            }
-            if let data = result["data"] as? JSON,let operation = data["operation_id"] as? String {
-                try budget.notify("retention_begin")
-                result["backup_retention"] = applyAutomaticBackupRetention(after:operation,observe:{try budget.notify("retention_" + $0)})
-                try budget.notify("retention_end")
+            let result: JSON
+            do {
+                result = try StorageSnapshotRetention.withCapture(root:root) { retention in
+                    try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
+                }
+            } catch {
+                let reported = budget.reporting(error)
+                recordBackupCapacityAttention(command:params["command_id"] as? String,error:reported)
+                throw reported
             }
             timingOutcome = "complete"
             return result
@@ -226,33 +228,31 @@ extension CommandRouter {
         let digest = hash(Data(("backup_create" + (try jsonString(params))).utf8))
         let destination = try storageBackupDestination(params:params,caller:caller,command:command)
         let key = try pendingStorageCommandKey(principal:caller.principal,command:command)
-        let (identity, operation, replay) = try ArchiveStorageGate.withExclusive(root:root) { _ in
-            try dbQueue.writeWithoutTransaction { db in
-                try authorizeStorageBackup(db,params:params,caller:caller)
-                guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
-                let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
-                // Parent ownership remains principal+UUID in this store; physical stage
-                // names additionally bind store incarnation/root, avoiding collisions
-                // between independently owned stores using the same owner command UUID.
-                let physical = try jsonString(["parent":key,"store_id":identity.logical_store_id,"incarnation":identity.incarnation,"source_root":root.path])
-                let seed = hash(Data(physical.utf8)), chars = Array(seed.prefix(32))
-                let operationText = String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
-                let operation = UUID(uuidString:operationText)!
-                var replay: JSON?
-                try withValidatedDomainTransaction(db) {
-                    try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
-                    if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
-                        guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID already belongs to another original intent.") }
-                        replay = jsonObject(row["result"])
-                        if Self.isPrunedResult(replay ?? [:]) { throw Self.expiredCommandError(command) }
-                        return .commit
-                    }
-                    let pending: JSON = ["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"pending"]
-                    try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[key,try jsonString(pending)])
+        let (identity, operation, replay) = try withBackupWriterStep(label:"backup_capture_intent",budget:budget) { db,_,deadline in
+            try authorizeStorageBackup(db,params:params,caller:caller)
+            guard let identityRaw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'") else {throw StoreRecovery.required("missing_migration_identity")}
+            let identity = try StoreIdentityReceipt.decode(Data(identityRaw.utf8))
+            // Parent ownership remains principal+UUID in this store; physical stage
+            // names additionally bind store incarnation/root, avoiding collisions
+            // between independently owned stores using the same owner command UUID.
+            let physical = try jsonString(["parent":key,"store_id":identity.logical_store_id,"incarnation":identity.incarnation,"source_root":root.path])
+            let seed = hash(Data(physical.utf8)), chars = Array(seed.prefix(32))
+            let operationText = String(chars[0..<8]) + "-" + String(chars[8..<12]) + "-" + String(chars[12..<16]) + "-" + String(chars[16..<20]) + "-" + String(chars[20..<32])
+            let operation = UUID(uuidString:operationText)!
+            var replay: JSON?
+            try withValidatedDomainTransaction(db,deadline:deadline) {
+                try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
+                if let row = try Row.fetchOne(db,sql:"SELECT digest,result FROM commands WHERE principal=? AND command_id=?",arguments:[caller.principal,command]) {
+                    guard row["digest"] as String == digest else { throw CoreError("IDEMPOTENCY_CONFLICT","This command ID already belongs to another original intent.") }
+                    replay = jsonObject(row["result"])
+                    if Self.isPrunedResult(replay ?? [:]) { throw Self.expiredCommandError(command) }
                     return .commit
                 }
-                return (identity, operation, replay)
+                let pending: JSON = ["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"pending"]
+                try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",arguments:[key,try jsonString(pending)])
+                return .commit
             }
+            return (identity, operation, replay)
         }
         if var replay { replay["replayed"] = true;return replay }
         guard destination.path != root.standardizedFileURL.path,
@@ -261,13 +261,21 @@ extension CommandRouter {
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
         func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
             try budget.notify("receipt_prepare_begin")
-            let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,budget:budget)
+            let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,params:params,caller:caller,command:command,budget:budget)
+            let receiptReader = try? openMaintenanceReader()
+            defer { try? receiptReader?.close() }
+            let doneWake = try? receiptReader?.read { try self.prepareDoneEvidenceBackupWake($0) }
             try budget.notify("receipt_prepare_end")
-            return try ArchiveStorageGate.withExclusive(root:root) { permit in
-                try dbQueue.writeWithoutTransaction { db in
-                    try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary,projectIDs:prepared.projectIDs)
-                }
+            let output = try withBackupWriterStep(label:"backup_capture_receipt",budget:budget) { db,permit,deadline in
+                try self.commitStorageBackupReceipt(db,params:params,caller:caller,permit:permit,command:command,digest:digest,key:key,destination:destination,receipt:receipt,identity:identity,generation:prepared.generation,summary:prepared.summary,eventData:prepared.eventData,deadline:deadline)
             }
+            try budget.notify("receipt_committed")
+            if let doneWake { wakeDoneEvidenceForBackup(doneWake) }
+            else { fputs("Done evidence wake deferred to the daily sweep.\n",stderr) }
+            return (try? receiptReader?.read { db in
+                do { return try self.addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
+                catch { return self.addingHumanAnswerNoticeFailure(db,output,caller:caller) }
+            }) ?? output
         }
         let receipt: StorageSnapshotReceipt
         do {
@@ -299,10 +307,10 @@ extension CommandRouter {
         } catch {
             // Best effort error metadata cannot turn an unsuccessful copy into
             // success, and may itself fail on a full or inaccessible volume.
-            try? ArchiveStorageGate.withExclusive(root:root) { _ in
-                try dbQueue.writeWithoutTransaction { db in
-                    try self.withValidatedDomainTransaction(db) {
-                        try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"incomplete","error_code":"BACKUP_INCOMPLETE"]),key]);return .commit
+            _ = try? ArchiveStorageGate.withMaintenanceAccess(root:root,work:"backup_capture_incomplete") { _, deadline in
+                try dbQueue.tryMaintenanceWrite(label:"backup_capture_incomplete",deadline:deadline) { db, deadline in
+                    try deadline.transaction(db) {
+                        try db.execute(sql:"UPDATE metadata SET value=? WHERE key=?",arguments:[try jsonString(["kind":"backup_create","intent_digest":digest,"operation_id":operation.uuidString.lowercased(),"state":"incomplete","error_code":"BACKUP_INCOMPLETE"]),key])
                     }
                 }
             }
@@ -310,13 +318,28 @@ extension CommandRouter {
         }
         return try commitBackup(receipt)
     }
+    private func withBackupWriterStep<T>(label: String, budget: StorageSnapshotBudget,
+                                         _ body: (Database, ArchiveStoragePermit, MaintenanceDeadline) throws -> T) throws -> T {
+        // The backup worker releases both resources before retrying a deferred step.
+        while true {
+            try budget.check()
+            let result = try ArchiveStorageGate.withMaintenanceAccess(root:root,work:label) { permit, deadline in
+                try dbQueue.tryMaintenanceWrite(label:label,deadline:deadline) { db, deadline in
+                    try body(db,permit,deadline)
+                }
+            } ?? nil
+            if let result { return result }
+            Thread.sleep(forTimeInterval:0.025)
+        }
+    }
+
     private func currentBackupManifest(_ directory: URL,identity: StoreIdentityReceipt,folderAccess: StorageFolderAccess = .init()) throws -> StorageSnapshotManifest {
         let bytes = try StorageObjectFiles(root:directory,folderAccess:folderAccess).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes)
         guard manifest.storeID.utf8.elementsEqual(identity.logical_store_id.utf8),manifest.sourceRoot.utf8.elementsEqual(root.path.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This backup belongs to another logical store or source root.")}
         return manifest
     }
-    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,budget: StorageSnapshotBudget) throws -> (generation: String,summary: JSON,projectIDs: [String]) {
+    private func prepareStorageBackupReceipt(destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,params: JSON,caller: Caller,command: String,budget: StorageSnapshotBudget) throws -> (generation: String,summary: JSON,eventData: Data) {
         let manifestBytes = try StorageObjectFiles(root:destination).read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
         guard hash(manifestBytes) == receipt.manifestSHA256 else {throw StorageSnapshotFailure.sourceChanged}
         let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:manifestBytes)
@@ -324,12 +347,22 @@ extension CommandRouter {
         var config = Configuration();config.readonly = true;config.prepareDatabase {try SchemaMigrations.installStorageCollation($0)}
         let copy = try DatabaseQueue(path:destination.appendingPathComponent("database.sqlite").path,configuration:config)
         var projectIDs: [String] = []
+        let eventByteLimit = 1_048_576
         do {
             try copy.read { db in
-                projectIDs = try String.fetchAll(db,sql:"SELECT id FROM records WHERE type='project' ORDER BY id")
                 guard case .current(let captured) = try SchemaMigrations.inspect(db),
                       captured.logical_store_id.utf8.elementsEqual(identity.logical_store_id.utf8),
                       captured.incarnation.utf8.elementsEqual(identity.incarnation.utf8) else {throw CoreError("BACKUP_TARGET_MISMATCH","This captured database belongs to another store generation.")}
+                if caller.isOwner {
+                    let cursor = try String.fetchCursor(db,sql:"SELECT id FROM records WHERE type='project' ORDER BY id")
+                    var bytes = 0
+                    while let id = try cursor.next() {
+                        try budget.check()
+                        bytes += id.utf8.count + 3
+                        guard bytes <= eventByteLimit else {throw budget.capacityFailure("snapshot_receipt_capacity")}
+                        projectIDs.append(id)
+                    }
+                }
             }
             try copy.close()
         } catch {try? copy.close();throw error}
@@ -345,31 +378,35 @@ extension CommandRouter {
             "writer_lease_seconds":budget.measurement.writerLeaseSeconds > 0 ? budget.measurement.writerLeaseSeconds as Any : NSNull()]
         let generation: JSON = ["summary":summary,"format":2,"state":"complete","operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"known_at":now(),"current_physical_verified":false,"object_count":manifest.objects.count,"object_bytes":manifest.objects.reduce(Int64(0)) {$0 + $1.size},"manifest_index":manifestIndex]
         _ = try StorageBackupManifestIndex.generation(generation,root:root)
-        return (try jsonString(generation),summary,projectIDs)
+        let event: JSON = ["origin":caller.isOwner ? (caller.installation == Self.doneEvidenceBackupInstallation ? "service" : "human_ui") : "agent",
+            "session_id":caller.sessionID ?? "","command_id":command,"operation_id":receipt.operationID.uuidString.lowercased(),
+            "manifest_sha256":receipt.manifestSHA256,"captured_at":summary["captured_at"] ?? NSNull(),
+            "verified_at":summary["verified_at"] ?? NSNull(),"project_ids":projectIDs,"reason":try text(params,"reason",max:4000,required:false)]
+        let eventData = Data((try jsonString(event)).utf8)
+        guard eventData.count <= eventByteLimit else {throw budget.capacityFailure("snapshot_receipt_capacity")}
+        try budget.check()
+        return (try jsonString(generation),summary,eventData)
     }
-    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String,summary: JSON,projectIDs: [String]) throws -> JSON {
+    private func commitStorageBackupReceipt(_ db: Database,params: JSON,caller: Caller,permit: ArchiveStoragePermit,command: String,digest: String,key: String,destination: URL,receipt: StorageSnapshotReceipt,identity: StoreIdentityReceipt,generation: String,summary: JSON,eventData: Data,deadline: MaintenanceDeadline) throws -> JSON {
         try permit.requireRoot(root)
         guard let raw = try String.fetchOne(db,sql:"SELECT value FROM metadata WHERE key='store_identity'"),
               try StoreIdentityReceipt.decode(Data(raw.utf8)) == identity else {throw CoreError("BACKUP_TARGET_MISMATCH","The store generation changed during backup.")}
         var output: JSON = [:]
-        try withValidatedDomainTransaction(db) {
+        try withValidatedDomainTransaction(db,deadline:deadline) {
             try authorizeStorageBackup(db,params:params,caller:caller)
             try self.requirePendingCommandIntent(db,command:command,digest:digest,caller:caller)
             let data: JSON = ["path":destination.path,"format":"checklist-store-snapshot","manifest_sha256":receipt.manifestSHA256,"operation_id":receipt.operationID.uuidString.lowercased(),"restore_supported":true,"status":"complete","writer_lease_seconds":summary["writer_lease_seconds"] ?? NSNull()]
-            try event(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:["origin":caller.isOwner ? (caller.installation == Self.doneEvidenceBackupInstallation ? "service" : "human_ui") : "agent","session_id":caller.sessionID ?? "","command_id":command,"operation_id":receipt.operationID.uuidString.lowercased(),"manifest_sha256":receipt.manifestSHA256,"captured_at":summary["captured_at"] ?? NSNull(),"verified_at":summary["verified_at"] ?? NSNull(),"project_ids":caller.isOwner ? projectIDs : [],"reason":try text(params,"reason",max:4000,required:false)])
+            try appendEncodedEvent(db,caller:caller,project:params["project_id"] as? String,entity:nil,kind:"backup_created",data:eventData)
             output = ["data":data,"command_id":command,"event_cursor":try self.cursor(db,caller:caller,scope:self.authorizationScope(db,caller))]
             try db.execute(sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(output)])
-            wakeDoneEvidenceForBackup(db)
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])
             if caller.isOwner,caller.installation == Self.doneEvidenceBackupInstallation {try recordDoneEvidenceBackupCompletion(db,command:command,summary:summary)}
             try recordStorageCopyObservation(db,key:"backup",summary:summary)
+            try clearBackupCapacityAttention(db)
             try Self.enqueueAutomaticBackupRetention(db,root:root,incarnation:identity.incarnation,operation:receipt.operationID.uuidString.lowercased())
             try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key]);return .commit
         }
-        let warning = performStorageMaintenance(db,permit:permit)
-        do { output = try addingHumanAnswerNotices(db,output:output,params:params,caller:caller) }
-        catch { output = addingHumanAnswerNoticeFailure(db,output,caller:caller) }
-        return addingStorageMaintenanceNotice(output,warning:warning)
+        return output
     }
 
     /// One bounded native-service continuation. The service schedules the next
@@ -415,19 +452,17 @@ extension CommandRouter {
                 else {try deletion();if !prepared {try lifecycle()}}
             } catch {
                 observe?(["phase":"failure","code":(error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE","error":String(describing:error)])
-                dbQueue.writeWithoutTransaction {_ in
-                    self.ticketCleanupRetryAt = Date().addingTimeInterval(60)
-                    self.ticketCleanupFailure = self.ticketCleanupFailure ?? (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
-                }
+                self.ticketCleanupRetryAt = Date().addingTimeInterval(60)
+                self.ticketCleanupFailure = self.ticketCleanupFailure ?? (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
                 throw error
             }
         }
         // CL-345: the archive cleanup reference scan reads a snapshot before the
         // object gate and the writer; the executor's transactions check its fence.
-        let archiveScan = (storageMaintenanceRetryAt.map {$0 > Date()} ?? false) ? nil : prepareArchiveCleanupJobScan(nowMS:archiveCleanupNowMS())
-        defer {finishArchiveCleanupScan(archiveScan)}
-        try ArchiveStorageGate.withExclusive(root:root) { permit in
-            dbQueue.writeWithoutTransaction { _ = self.performStorageMaintenance($0,permit:permit,archiveScan:archiveScan) }
+        try runArchiveStorageMaintenance()
+        let time = Date()
+        if let due = try readOnMaintenanceConnection({try self.nextAutomaticBackupRetentionDeadline($0,at:time)}),due <= time {
+            applyAutomaticBackupRetention()
         }
     }
 }

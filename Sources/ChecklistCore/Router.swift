@@ -4,6 +4,32 @@ import ChecklistProviders
 import GRDB
 
 extension CommandRouter {
+    private func baseServiceInfo(_ caller: Caller) -> JSON {
+        var callerInfo: JSON = ["session_id":caller.sessionID ?? "","role":caller.role,"installation":caller.installation,
+                                "orchestrated_triage":NSNull()]
+        if caller.role == "worker", caller.sessionID?.isEmpty != false {
+            callerInfo["thread_binding"] = ["state":"unbound","reason":"native_thread_identity_unavailable",
+                "message":"This worker connection is not bound to a native thread because no supported native thread identity has been verified. Thread-scoped tools and pending notes are unavailable. Codex MCP can supply its host-authored tools/call _meta.threadId; a signed host or project folder alone does not identify a conversation."]
+        }
+        return ["session_id":caller.sessionID ?? "","caller":callerInfo,"name":"Checklist",
+            "version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,
+            "build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":caller.role,
+            "project_ids":caller.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts",
+                "human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages",
+                "triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],
+            "provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,
+            "native_routes":NativeCommunicationRoutes.serviceInfo,"native_reply_listener":nativeReplyListenerStatus.serviceInfo,
+            "busy_periods":ServiceHoldWatchdog.shared.status,
+            "unsupported":["automatic_model_launch","native_idle_push","MCP_events"]]
+    }
+
+    /// This diagnostic exposes process state while the unbound reader restarts.
+    func unboundServiceInfo(_ caller: Caller) -> JSON {
+        var info = baseServiceInfo(caller)
+        info["read_state"] = "reader_opening"
+        return info
+    }
+
     func dispatch(_ db: Database, method: String, p: JSON, c: Caller) throws -> JSON {
         // A purged id remains readable for references but never becomes writable again.
         if !Self.readMethods.contains(method),let tid = p["task_id"] as? String,let pid = p["project_id"] as? String,
@@ -12,13 +38,8 @@ extension CommandRouter {
         }
         switch method {
         case "service_info":
-            var info: JSON = ["session_id":c.sessionID ?? "","caller":["session_id":c.sessionID ?? "","role":c.role,"installation":c.installation],"name":"Checklist","version":ChecklistBuildVersion.current.version,"build_id":ChecklistBuildVersion.current.buildID,"build_number":ChecklistBuildVersion.current.buildNumber,"store_incarnation":incarnation,"role":c.role,"project_ids":c.projectIDs,"capabilities":["durable_store","project_isolation","pickup_inbox","named_contacts","human_requests","managed_attachments","scope_reservations","captured_source_review","triage_batches","phase_triages","triage_orchestration","typed_relations","policy_reconciliation","request_revisions"],"provider_plugins":providerPlugins.summaries,"native_push":false,"native_push_status":NativeCommunicationRoutes.summary,"native_routes":NativeCommunicationRoutes.serviceInfo,"unsupported":["automatic_model_launch","native_idle_push","MCP_events"]]
+            var info = baseServiceInfo(c)
             var callerInfo = info["caller"] as? JSON ?? [:]
-            if c.role == "worker", c.sessionID?.isEmpty != false {
-                callerInfo["thread_binding"] = ["state": "unbound", "reason": "native_thread_identity_unavailable",
-                    "message": "This worker connection is not bound to a native thread because no supported native thread identity has been verified. Thread-scoped tools and pending notes are unavailable. Codex MCP can supply its host-authored tools/call _meta.threadId; a signed host or project folder alone does not identify a conversation."]
-            }
-            callerInfo["orchestrated_triage"] = NSNull()
             // A workspace-less connection must select its project explicitly. Never
             // substitute the app selection or the service working directory.
             let boundProject: String?
@@ -56,8 +77,8 @@ extension CommandRouter {
                 callerInfo["orchestrated_triage"] = orchestrated
             }
             info["caller"] = callerInfo
-            info["native_reply_listener"] = nativeReplyListenerStatus.serviceInfo
             info["native_recovery"] = try nativeResumptionRecovery(db,caller:c,projects:c.projectIDs)
+            if c.isOwner {info["backup_capacity_attention"] = try backupCapacityAttention(db) as Any? ?? NSNull()}
             if let version = readSnapshotCache.readVersion(db) {info["read_version"] = version}
             return info
         case "tool_catalog": return ["tools":toolCatalog(c)]

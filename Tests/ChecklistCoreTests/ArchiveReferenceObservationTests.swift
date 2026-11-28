@@ -9,6 +9,8 @@ final class ArchiveReferenceObservationTests: XCTestCase {
         let created = try f.call("task_create",["project_id":project["id"]!,"title":"Reference fixture"])
         let foreignProject = try f.call("project_create",["name":"Foreign references","key_prefix":"FR"])
         let other = try f.call("task_create",["project_id":foreignProject["id"]!,"title":"Other fixture"])
+        let unrelatedTask = try f.call("task_create",["project_id":foreignProject["id"]!,"title":"Unrelated fixture"])
+        let unrelatedTaskID = try XCTUnwrap(unrelatedTask["id"] as? String)
         var task = created;task["archived"] = false
         var archived = other;archived["archived"] = true
         let path = r.root.appendingPathComponent("objects/original-é").path
@@ -41,8 +43,8 @@ final class ArchiveReferenceObservationTests: XCTestCase {
         try r.dbQueue.write { db in
             try db.execute(sql:"UPDATE records SET data=replace(data,'é','\\u00e9')")
         }
-        try r.dbQueue.read { db in
-            let full = try r.archiveCleanupReferenceRows(db)
+        try r.dbQueue.writeWithoutTransaction { db in
+            let full = try legacyArchiveCleanupReferenceRows(db)
             let relevant = try r.archiveCleanupRelevantReferenceRows(db,attachments:[attachment])
             XCTAssertFalse(relevant.contains { $0["id"] as? String == "unrelated" })
             for archiving in [false,true] {
@@ -51,6 +53,26 @@ final class ArchiveReferenceObservationTests: XCTestCase {
                 XCTAssertEqual(before,after)
                 XCTAssertTrue(after.isSuperset(of:[.sharedLiveReference,.currentReview,.activeBuild,.pendingHumanInspection,.pendingImport,.activeReader]))
                 XCTAssertFalse(after.contains(.backupCapture))
+            }
+            // Vary direct/indirect references independently. The writer's
+            // reduced executor graph must give the same holds as the full graph.
+            let optionalRows = ["obs-shared","obs-review","obs-build","import","obs-reader","obs-request"]
+            for bits in 0..<(1 << optionalRows.count) {
+                try db.inSavepoint {
+                    for (position, id) in optionalRows.enumerated() where bits & (1 << position) == 0 {
+                        try db.execute(sql:"DELETE FROM records WHERE id=?",arguments:[id])
+                    }
+                    let full = try legacyArchiveCleanupReferenceRows(db)
+                    let prepared = try r.scanArchiveCleanupSnapshot(db,taskID:tid,attachments:[attachment],generation:nil)
+                    XCTAssertNil(prepared.failure)
+                    let relevant = try XCTUnwrap(prepared.index)
+                    XCTAssertFalse(relevant.graph.contains { $0["id"] as? String == "unrelated" })
+                    XCTAssertFalse(relevant.graph.contains { $0["id"] as? String == unrelatedTaskID })
+                    let before = try r.completeArchiveCleanupHolds(db,attachment:attachment,task:task,currentGraph:full)
+                    let after = try r.completeArchiveCleanupHolds(db,attachment:attachment,task:task,currentIndex:relevant)
+                    XCTAssertEqual(before,after,"reference combination \(bits)")
+                    return .rollback
+                }
             }
         }
     }
@@ -64,6 +86,7 @@ final class ArchiveReferenceObservationTests: XCTestCase {
             ("message",#"{"id":"different","project_id":"p","revision":1}"#,"identityMismatch"),
             ("message",#"{"id":"unrelated","project_id":"p","revision":1.00000000000000001}"#,"jsonRevision"),
             ("message",#"{"id":"unrelated","project_id":"p","revision":1,"nested":[}"#,"jsonObject"),
+            ("message",#"{"id":"unrelated","project_id":"p","revision":1,"nested":["\ud800"]}"#,"jsonObject"),
             ("unknown",#"{"id":"unrelated","project_id":"p","revision":1}"#,"unsupportedFamily"),
             ("session",#"{"id":"unrelated","project_id":"p","revision":1,"project_ids":[1]}"#,"ownershipShape"),
             ("storage_hold",#"{"id":"unrelated","project_id":"p","revision":1,"kind":"media_reference","owner_id":"owner","owner_kind":"media_target","attachment_id":"a","expires_at":0}"#,"ownershipShape")
@@ -72,7 +95,7 @@ final class ArchiveReferenceObservationTests: XCTestCase {
             for (type,data,reason) in cases {
                 try db.execute(sql:"UPDATE records SET type=?,data=? WHERE id='unrelated'",arguments:[type,data])
                 var fullError: CoreError?,limitedError: CoreError?
-                do { _ = try r.archiveCleanupReferenceRows(db) } catch { fullError = error as? CoreError }
+                do { _ = try legacyArchiveCleanupReferenceRows(db) } catch { fullError = error as? CoreError }
                 do { _ = try r.archiveCleanupRelevantReferenceRows(db,attachments:[]) } catch { limitedError = error as? CoreError }
                 XCTAssertEqual(fullError?.code,"CANONICAL_RECORD_INVALID",reason)
                 XCTAssertEqual(limitedError?.code,fullError?.code,reason)
@@ -85,4 +108,36 @@ final class ArchiveReferenceObservationTests: XCTestCase {
 
         }
     }
+
+    func testObservationRefusesExpiredAndOverBudgetProofsWithoutPoisoningReader() throws {
+        let f = try ReadPerformanceFixture("CL-150"),r = f.router
+        let project = try f.call("project_create",["name":"Archive proof limits","key_prefix":"AP"])
+        _ = try f.call("task_create",["project_id":project["id"]!,"title":"Retained task projection"])
+        try r.dbQueue.read {db in
+            let attachment: JSON = ["id":"original"]
+            func assertLimit(_ budget: ArchiveCleanupObservationBudget,_ limit: String) {
+                XCTAssertThrowsError(try r.archiveCleanupRelevantReferenceRows(db,attachments:[attachment],budget:budget)) {error in
+                    XCTAssertEqual((error as? CoreError)?.code,"REFERENCE_GRAPH_LIMIT")
+                    XCTAssertEqual((error as? CoreError)?.details["limit"] as? String,limit)
+                }
+            }
+            assertLimit(.init(seconds:0),"observation_seconds")
+            assertLimit(.init(byteLimit:1),"retained_bytes")
+            XCTAssertNoThrow(try r.archiveCleanupRelevantReferenceRows(db,attachments:[attachment]))
+        }
+    }
+}
+
+/// The complete pre-CL-514 reader used as a differential oracle.
+func legacyArchiveCleanupReferenceRows(_ db: Database) throws -> [JSON] {
+    var graph: [JSON] = []
+    let cursor = try Row.fetchCursor(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records ORDER BY rowid")
+    while let row = try cursor.next() {
+        guard graph.count < 250_000 else {throw CoreError("REFERENCE_GRAPH_LIMIT","The current reference graph exceeds the cleanup safety bound; originals are retained.")}
+        let decoded = try GRDBRecordEnvelopeAdapter.decode(row)
+        var value = decoded.object
+        value["record_type"] = decoded.type
+        graph.append(value)
+    }
+    return graph
 }

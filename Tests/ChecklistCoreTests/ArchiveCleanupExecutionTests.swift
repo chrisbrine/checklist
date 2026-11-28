@@ -63,6 +63,12 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func exists(_ file: JSON) -> Bool { FileManager.default.fileExists(atPath:file["path"] as! String) }
 
+    /// Tests advance the owned retry clock to the service's next turn.
+    func runNextMaintenanceTurn() throws {
+        if router.storageMaintenanceRetryAt != nil {router.storageMaintenanceRetryAt = .distantPast}
+        try router.runStorageMaintenance()
+    }
+
     func testBackupCaptureDefersCleanupWithoutFailuresAndProtectsManagedUnlinks() throws {
         let f = try fixture(),job = try archive(f)
         try makeDue(job)
@@ -232,11 +238,17 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
         }
         try makeDue(job);try router.runStorageMaintenance()
         let first = try ArchiveCleanupJob(record:record(job["id"] as! String,"cleanup_job"))
-        XCTAssertEqual(first.state,.held);XCTAssertEqual(first.items.filter {$0.state == .waiting}.count,1)
-        XCTAssertEqual(first.items.filter {$0.state == .held}.count,8)
+        let heldCount = first.items.filter {$0.state == .held}.count
+        XCTAssertGreaterThanOrEqual(first.items.filter {$0.state == .waiting}.count,1)
+        XCTAssertLessThanOrEqual(heldCount,ArchiveCleanupJob.admissionStepLimit)
+        let firstCursor = try router.dbQueue.read {try router.archiveCleanupCursor($0,job:first)}
+        XCTAssertEqual(int(firstCursor,"next_index"),heldCount,"The cursor must preserve progress if the turn was interrupted")
         XCTAssertEqual(router.storageMaintenanceFallbackFailures,0)
         XCTAssertNotNil(try router.nextArchiveCleanupDeadline())
-        try router.runStorageMaintenance()
+        for _ in f.files {
+            guard try router.nextArchiveCleanupDeadline() != nil else {break}
+            try runNextMaintenanceTurn()
+        }
         let final = try ArchiveCleanupJob(record:record(job["id"] as! String,"cleanup_job"))
         XCTAssertEqual(final.state,.held);XCTAssertTrue(final.items.allSatisfy {$0.state == .held && $0.holds.contains(.keepOriginal)})
         XCTAssertEqual(router.storageMaintenanceFallbackFailures,0)
@@ -244,8 +256,9 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func testChangedBytesSuspendAfterTwoSameFailuresAndExplicitRetryAddsUndoWindow() throws {
         let f = try fixture(),job = try archive(f),a = f.files[0]
+        try router.runArchiveStorageMaintenance() // Settle the import before simulating damage.
         try Data(repeating:1,count:64).write(to:URL(fileURLWithPath:a["path"] as! String))
-        try makeDue(job);try router.runStorageMaintenance();try router.runStorageMaintenance()
+        try makeDue(job);try runNextMaintenanceTurn();try runNextMaintenanceTurn()
         let suspended = try record(job["id"] as! String,"cleanup_job");XCTAssertEqual(suspended["state"] as? String,"suspended");XCTAssertTrue(exists(a))
         let retried = try call("cleanup_job_retry",["project_id":f.project["id"]!,"cleanup_job_id":job["id"]!,"expected_revision":suspended["revision"]!])
         XCTAssertEqual(retried["state"] as? String,"queued");XCTAssertGreaterThan(try ArchiveCleanupJob.integer(retried["not_before_ms"]),router.archiveCleanupNowMS())
@@ -253,6 +266,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func testLateHumanReviewBackupAndReceiptlessImportReferencesRetainQueuedOriginal() throws {
         let f = try fixture(),a = f.files[0],job = try archive(f)
+        try router.runArchiveStorageMaintenance()
         let requestID = UUID().uuidString,manifestID = UUID().uuidString,reviewID = UUID().uuidString,holdID = UUID().uuidString
         let originalImport = try record(a["storage_job_id"] as! String,"storage_job")
         // Owned record fixtures exercise real graph families, not a claimed
@@ -265,7 +279,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
             var pending = originalImport;pending["parent_command_id"] = UUID().uuidString
             try router.save(db,router.revised(pending),type:"storage_job")
         }
-        try makeDue(job);try router.runStorageMaintenance()
+        try makeDue(job);try runNextMaintenanceTurn()
         XCTAssertTrue(exists(a))
         let held = try record(job["id"] as! String,"cleanup_job")
         let reasons = Set((held["items"] as? [JSON])?.first?["holds"] as? [String] ?? [])
@@ -277,7 +291,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
             var committed = originalImport;committed["revision"] = try ArchiveCleanupJob.integer(router.record(db,originalImport["id"] as! String,type:"storage_job")["revision"]) + 1
             try router.save(db,committed,type:"storage_job")
         }
-        try router.runStorageMaintenance();XCTAssertFalse(exists(a))
+        try runNextMaintenanceTurn();XCTAssertFalse(exists(a))
         // Exact-original verification rejects the retained metadata/preview.
         XCTAssertThrowsError(try router.dbQueue.read { db in
             var task = try router.record(db,f.task["id"] as! String,type:"task");task["current_manifest_id"] = manifestID

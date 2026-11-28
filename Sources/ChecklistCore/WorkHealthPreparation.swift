@@ -16,6 +16,7 @@ struct WorkHealthPreparedPage {
         case skip
     }
     struct Item {
+        let position: Int64
         let task: JSON
         let action: Action
         let dependencies: WorkHealthPreparationDependencies

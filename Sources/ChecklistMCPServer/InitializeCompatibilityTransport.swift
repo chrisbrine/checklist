@@ -10,6 +10,8 @@ import MCP
 actor InitializeCompatibilityTransport: Transport {
     nonisolated let logger: Logger
     private let base: any Transport
+    private var sending = false
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(_ base: any Transport) async {
         self.base = base
@@ -18,7 +20,21 @@ actor InitializeCompatibilityTransport: Transport {
 
     func connect() async throws { try await base.connect() }
     func disconnect() async { await base.disconnect() }
-    func send(_ data: Data) async throws { try await base.send(data) }
+    func send(_ data: Data) async throws {
+        // The SDK's stdio send can suspend between partial writes. Keep the
+        // full JSON-RPC line together while other requests continue to execute.
+        if sending {
+            await withCheckedContinuation { sendWaiters.append($0) }
+        } else {
+            sending = true
+        }
+        defer {
+            if sendWaiters.isEmpty { sending = false }
+            else { sendWaiters.removeFirst().resume() }
+        }
+        try Task.checkCancellation()
+        try await base.send(data)
+    }
 
     func receive() -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in

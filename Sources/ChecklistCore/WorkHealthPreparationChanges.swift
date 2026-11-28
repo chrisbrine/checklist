@@ -11,31 +11,110 @@ struct WorkHealthPreparationChanges {
         let task: Data
     }
 
+    struct InstallationStep {
+        let object: String?
+        let sql: String
+    }
+
+    struct Snapshot {
+        fileprivate let units: Int
+        let changes: [Change]
+    }
+
     let name = "work_health_changes_" + UUID().uuidString.replacingOccurrences(of:"-",with:"")
     private static let rowLimit = 4096
     private static let byteLimit = 1024 * 1024
     private static let families = ["task", "attempt", "project", "group", "status"]
+    private static let definitionSuffixes = ["", "_state", "_count", "_insert", "_update_conflict", "_update", "_delete"]
     private var familySQL: String { Self.families.map {"CAST('\($0)' AS BLOB)"}.joined(separator:",") }
 
-    func install(_ db: Database) throws -> Int64 {
-        try db.execute(sql:"""
-            CREATE TEMP TABLE \(name)(id BLOB NOT NULL,type BLOB NOT NULL,project BLOB NOT NULL,task BLOB NOT NULL,PRIMARY KEY(id,type,project,task)) WITHOUT ROWID;
-            CREATE TEMP TABLE \(name)_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),units INTEGER NOT NULL,bytes INTEGER NOT NULL,refused INTEGER NOT NULL) WITHOUT ROWID;
-            INSERT INTO \(name)_state VALUES(1,0,0,0);
-            CREATE TEMP TRIGGER \(name)_count AFTER INSERT ON \(name) BEGIN
-                UPDATE \(name)_state SET units=units+1,bytes=bytes+length(NEW.id)+length(NEW.type)+length(NEW.project)+length(NEW.task);
-            END;
-            """)
+    /// Construct these SQL strings before asking for the writer. Each item can
+    /// commit on its own while all capture triggers remain inactive.
+    var installationSteps: [InstallationStep] {
         // BEFORE INSERT sees a replaced row even when recursive_triggers is OFF.
         let prior = capture("SELECT id AS source_id,type AS source_type,project_id AS source_project,data AS source_data FROM main.records WHERE id=NEW.id AND CAST(type AS BLOB) IN (\(familySQL))")
         let inserted = capture(source("NEW"))
-        try db.execute(sql:"CREATE TEMP TRIGGER \(name)_insert BEFORE INSERT ON main.records BEGIN \(prior) \(inserted) END")
+        let active = "(SELECT active FROM \(name)_state)=1"
         // UPDATE OR REPLACE suppresses the displaced row's DELETE trigger too.
         // Ordinary same-ID updates need no extra conflict observation.
-        try db.execute(sql:"CREATE TEMP TRIGGER \(name)_update_conflict BEFORE UPDATE ON main.records WHEN typeof(OLD.id)!=typeof(NEW.id) OR CAST(OLD.id AS BLOB) IS NOT CAST(NEW.id AS BLOB) BEGIN \(prior) END")
-        try db.execute(sql:"CREATE TEMP TRIGGER \(name)_update AFTER UPDATE ON main.records BEGIN \(capture(source("OLD"))) \(capture(source("NEW"))) END")
-        try db.execute(sql:"CREATE TEMP TRIGGER \(name)_delete AFTER DELETE ON main.records BEGIN \(capture(source("OLD"))) END")
-        return try Int64.fetchOne(db,sql:"PRAGMA data_version")!
+        return [
+            .init(object:name,sql:"CREATE TEMP TABLE \(name)(id BLOB NOT NULL,type BLOB NOT NULL,project BLOB NOT NULL,task BLOB NOT NULL,PRIMARY KEY(id,type,project,task)) WITHOUT ROWID"),
+            .init(object:name+"_state",sql:"CREATE TEMP TABLE \(name)_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),units INTEGER NOT NULL,bytes INTEGER NOT NULL,refused INTEGER NOT NULL,active INTEGER NOT NULL) WITHOUT ROWID"),
+            .init(object:nil,sql:"INSERT INTO \(name)_state VALUES(1,0,0,0,0)"),
+            .init(object:name+"_count",sql:"""
+                CREATE TEMP TRIGGER \(name)_count AFTER INSERT ON \(name) BEGIN
+                    UPDATE \(name)_state SET units=units+1,bytes=bytes+length(NEW.id)+length(NEW.type)+length(NEW.project)+length(NEW.task);
+                END
+                """),
+            .init(object:name+"_insert",sql:"CREATE TEMP TRIGGER \(name)_insert BEFORE INSERT ON main.records WHEN \(active) BEGIN \(prior) \(inserted) END"),
+            .init(object:name+"_update_conflict",sql:"CREATE TEMP TRIGGER \(name)_update_conflict BEFORE UPDATE ON main.records WHEN \(active) AND (typeof(OLD.id)!=typeof(NEW.id) OR CAST(OLD.id AS BLOB) IS NOT CAST(NEW.id AS BLOB)) BEGIN \(prior) END"),
+            .init(object:name+"_update",sql:"CREATE TEMP TRIGGER \(name)_update AFTER UPDATE ON main.records WHEN \(active) BEGIN \(capture(source("OLD"))) \(inserted) END"),
+            .init(object:name+"_delete",sql:"CREATE TEMP TRIGGER \(name)_delete AFTER DELETE ON main.records WHEN \(active) BEGIN \(capture(source("OLD"))) END")
+        ]
+    }
+
+    func prepareStep(_ db: Database, _ step: InstallationStep, deadline: MaintenanceDeadline? = nil) throws {
+        let exists: Bool?
+        if let object = step.object {
+            exists = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE name=?)",arguments:[object])
+        } else {
+            exists = try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(name)_state)")
+        }
+        guard exists != true else {return}
+        // Only TEMP schema or state changes. There is no need to reserve the
+        // main SQLite write lock with BEGIN IMMEDIATE for these steps.
+        try withTempTransaction(db,deadline:deadline) {try db.execute(sql:step.sql)}
+    }
+
+    func install(_ db: Database) throws -> Int64 {
+        for step in installationSteps {try prepareStep(db,step)}
+        return try recordChanges(db,deadline:nil)
+    }
+
+    /// Reuse the writer's TEMP schema so health wakes do not repeatedly compile
+    /// triggers or invalidate the SQLite statement cache used by commands.
+    func start(_ db: Database) throws -> Int64 {
+        if let version = try startIfPrepared(db) {return version}
+        return try install(db)
+    }
+
+    func startIfPrepared(_ db: Database, deadline: MaintenanceDeadline? = nil) throws -> Int64? {
+        let expected = Self.definitionSuffixes.map { name + $0 }
+        let placeholders = Array(repeating:"?",count:expected.count).joined(separator:",")
+        guard try Int.fetchOne(db,sql:"SELECT COUNT(*) FROM temp.sqlite_schema WHERE name IN (\(placeholders))",arguments:StatementArguments(expected)) == expected.count,
+              try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(name)_state)") == true else {return nil}
+        return try recordChanges(db,deadline:deadline)
+    }
+
+    private func recordChanges(_ db: Database, deadline: MaintenanceDeadline?) throws -> Int64 {
+        var version: Int64?
+        try withTempTransaction(db,deadline:deadline) {
+            try db.execute(sql:"DELETE FROM \(name); UPDATE \(name)_state SET units=0,bytes=0,refused=0,active=1")
+            version = try Int64.fetchOne(db,sql:"PRAGMA data_version")
+        }
+        return version!
+    }
+
+    private func withTempTransaction(_ db: Database, deadline: MaintenanceDeadline?, _ body: () throws -> Void) throws {
+        func commit() throws -> Database.TransactionCompletion {
+            try deadline?.check()
+            try body()
+            try deadline?.check()
+            return .commit
+        }
+        if db.isInsideTransaction {try db.inSavepoint(commit)}
+        else {try db.inTransaction(.deferred,commit)}
+    }
+
+    /// At rest ordinary commands pay only the trigger's active check.
+    func stop(_ db: Database) throws {
+        try db.execute(sql:"UPDATE \(name)_state SET active=0")
+    }
+
+    /// The health worker checks changes before it applies any advisory state.
+    /// Its own successful writes must not invalidate later candidates in the page.
+    func resume(_ db: Database) throws {
+        try db.execute(sql:"UPDATE \(name)_state SET active=1")
     }
 
     private func source(_ row: String) -> String {
@@ -81,10 +160,19 @@ struct WorkHealthPreparationChanges {
     /// Only other connections advance this writer's data_version. Its ordinary
     /// writes are instead checked through the bounded identifier journal.
     func read(_ db: Database,version: Int64) throws -> [Change]? {
+        try readSnapshot(db,version:version,previous:nil)?.changes
+    }
+
+    /// Between the start and end of one observation the journal only adds
+    /// distinct rows. Compare the sticky refusal flag even if the count stayed
+    /// the same, and validate external writes on every candidate's transaction.
+    func readSnapshot(_ db: Database,version: Int64,previous: Snapshot?) throws -> Snapshot? {
         guard try Int64.fetchOne(db,sql:"PRAGMA data_version") == version,
-              try Int.fetchOne(db,sql:"SELECT refused FROM \(name)_state") == 0 else {return nil}
+              let state = try Row.fetchOne(db,sql:"SELECT units,refused FROM \(name)_state"),state["refused"] as Int == 0 else {return nil}
+        let units: Int = state["units"]
+        if let previous,previous.units == units {return previous}
         let rows = try Row.fetchAll(db,sql:"SELECT id,type,project,task FROM \(name) ORDER BY id,type,project,task")
-        guard rows.count<=Self.rowLimit else {return nil}
+        guard rows.count == units,rows.count<=Self.rowLimit else {return nil}
         let families = Set(Self.families.map {Data($0.utf8)})
         var changes: [Change] = [],bytes = 0
         for row in rows {
@@ -98,7 +186,7 @@ struct WorkHealthPreparationChanges {
             }
             changes.append(.init(id:id,type:type,project:project,task:task))
         }
-        return changes
+        return Snapshot(units:units,changes:changes)
     }
 
     func remove(_ db: Database) throws {

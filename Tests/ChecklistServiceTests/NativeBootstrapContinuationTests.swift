@@ -117,6 +117,20 @@ final class NativeBootstrapContinuationTests: XCTestCase {
             }
             return (done, result)
         }
+        func startAfterClosure(_ continuation: NativeBootstrapContinuation, interpose: () throws -> Void) throws
+            -> (DispatchSemaphore, ResultBox<Result<Coordinator.BootstrapResult, Error>>) {
+            let paused = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            defer { release.signal() }
+            // Pause the synthetic proof retry after the worker commits closure.
+            evidence.refusedScans = [3]
+            evidence.pause = { paused.signal(); _ = release.wait(timeout: .now() + 15) }
+            let work = start(continuation)
+            guard paused.wait(timeout: .now() + 10) == .success else {
+                throw CoreError("TEST_CLOSURE_TIMEOUT", "The continuation did not reach its post-closure proof retry.")
+            }
+            try interpose()
+            return work
+        }
         func session() throws -> JSON {
             try XCTUnwrap(router.connectionSession(sessionID: original.sessionID, project: project, caller: owner))
         }
@@ -227,13 +241,14 @@ final class NativeBootstrapContinuationTests: XCTestCase {
         let fixture = try Fixture()
         defer { XCTAssertNoThrow(try fixture.close()) }
         let continuation = try fixture.continuation()
-        let closureID = try XCTUnwrap(try fixture.session()["native_closure_ref"] as? String)
-        try fixture.router.dbQueue.write { db in
-            var closure = try fixture.router.record(db, closureID, type: "native_closure")
-            closure["state"] = "release_pending"
-            try fixture.router.save(db, fixture.router.revised(closure), type: "native_closure")
+        let (done, result) = try fixture.startAfterClosure(continuation) {
+            let closureID = try XCTUnwrap(try fixture.session()["native_closure_ref"] as? String)
+            try fixture.router.dbQueue.write { db in
+                var closure = try fixture.router.record(db, closureID, type: "native_closure")
+                closure["state"] = "release_pending"
+                try fixture.router.save(db, fixture.router.revised(closure), type: "native_closure")
+            }
         }
-        let (done, result) = fixture.start(continuation)
         XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
         XCTAssertThrowsError(try XCTUnwrap(result.value).get()) { XCTAssertEqual(($0 as? CoreError)?.code, "NATIVE_CLOSURE_PENDING") }
         let local = try fixture.coordinator.queue.sync { try XCTUnwrap(fixture.coordinator.enrollments[fixture.original.installation]) }
@@ -247,9 +262,10 @@ final class NativeBootstrapContinuationTests: XCTestCase {
         defer { XCTAssertNoThrow(try fixture.close()) }
         let continuation = try fixture.continuation()
         let enrollmentFile = fixture.coordinator.enrollmentFile
-        try FileManager.default.moveItem(at: enrollmentFile, to: fixture.root.appendingPathComponent("saved-connections.json"))
-        try FileManager.default.createDirectory(at: enrollmentFile, withIntermediateDirectories: false)
-        let (done, result) = fixture.start(continuation)
+        let (done, result) = try fixture.startAfterClosure(continuation) {
+            try FileManager.default.moveItem(at: enrollmentFile, to: fixture.root.appendingPathComponent("saved-connections.json"))
+            try FileManager.default.createDirectory(at: enrollmentFile, withIntermediateDirectories: false)
+        }
         XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
         XCTAssertThrowsError(try XCTUnwrap(result.value).get()) { error in
             XCTAssertEqual((error as? ChecklistError)?.code, "CONNECTION_RECOVERY_REQUIRED")
@@ -294,20 +310,21 @@ final class NativeBootstrapContinuationTests: XCTestCase {
         let continuation = try fixture.continuation(), hookFailure = ResultBox<Error>()
         // Register after closure. This runs after the actual resumption COMMIT,
         // before its worker returns, and creates a later independent owner fence.
-        fixture.router.dbQueue.writeWithoutTransaction { db in
-            db.afterNextTransaction { committed in
-                do {
-                    try committed.inTransaction {
-                        var session = try fixture.router.record(committed, fixture.original.sessionID, type: "session")
-                        session["state"] = "revoked"; session["owner_revoked"] = true
-                        session["authorization_generation"] = UUID().uuidString
-                        try fixture.router.save(committed, fixture.router.revised(session), type: "session")
-                        return .commit
-                    }
-                } catch { hookFailure.set(error) }
+        let (done, result) = try fixture.startAfterClosure(continuation) {
+            fixture.router.dbQueue.writeWithoutTransaction { db in
+                db.afterNextTransaction { committed in
+                    do {
+                        try committed.inTransaction {
+                            var session = try fixture.router.record(committed, fixture.original.sessionID, type: "session")
+                            session["state"] = "revoked"; session["owner_revoked"] = true
+                            session["authorization_generation"] = UUID().uuidString
+                            try fixture.router.save(committed, fixture.router.revised(session), type: "session")
+                            return .commit
+                        }
+                    } catch { hookFailure.set(error) }
+                }
             }
         }
-        let (done, result) = fixture.start(continuation)
         XCTAssertEqual(done.wait(timeout: .now() + 20), .success)
         XCTAssertNil(hookFailure.value)
         XCTAssertThrowsError(try XCTUnwrap(result.value).get()) { XCTAssertEqual(($0 as? ChecklistError)?.code, "CONNECTION_REVOKED") }

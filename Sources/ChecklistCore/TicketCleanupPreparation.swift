@@ -22,6 +22,8 @@ struct TicketCleanupPreparedDeletion: TicketCleanupPrepared {
     let verifications: [String:TicketObjectRemovalVerification]
     let verificationFailures: [String:Error]
     var page: TicketBytePageExecution? = nil
+    var hasInlineLinks = true
+    var legacySettlement: (objects: [JSON], summary: JSON)? = nil
 }
 
 extension CommandRouter {
@@ -41,16 +43,32 @@ extension CommandRouter {
                 catch {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup is deferred until a separate read lane can open.")}
             }
             guard let readers = ticketCleanupNeedsReader ? ticketCleanupReaders : (readers ?? ticketCleanupReaders) else {throw CoreError("CLEANUP_READ_LANE_UNAVAILABLE","Cleanup needs a separate read lane.")}
-            let generation = try dbQueue.writeWithoutTransaction {db -> Int? in
-                try db.inSavepoint {try TicketCleanupChanges.install(db);return .commit}
-                return try Int.fetchOne(db,sql:"PRAGMA data_version")
+            let activity = CleanupJournalActivity()
+            let installed = try withMaintenanceWriter(label:"ticket_cleanup.prepare") {db,deadline -> Int in
+                let generation = try Int.fetchOne(db,sql:"PRAGMA data_version") ?? 0
+                try activity.install(db) {
+                    try TicketCleanupChanges.install(db,activity:activity)
+                    try deadline.check()
+                }
+                return generation
             }
-            defer {try? dbQueue.writeWithoutTransaction {try TicketCleanupChanges.remove($0)}}
+            guard let generation = installed else {return}
+            defer {
+                activity.stop()
+                _ = try? withMaintenanceWriter(label:"ticket_cleanup.prepare_remove") {db,deadline in
+                    try db.inSavepoint {
+                        try TicketCleanupChanges.remove(db)
+                        try deadline.check()
+                        return .commit
+                    }
+                }
+            }
             var prepared: T
             do {guard let value = try readers.read({db in try autoreleasepool {try prepare(db)}}) else {
-                if let project = ticketCleanupPreparingProject {try dbQueue.writeWithoutTransaction {db in
+                if let project = ticketCleanupPreparingProject {_ = try withMaintenanceWriter(label:"ticket_cleanup.state") {db,_ in
                     var state = try self.ticketCleanupPreparationState(db,project:project);state["state"] = "idle"
                     try self.saveTicketCleanupPreparationState(db,project:project,state:state)
+                    return true
                 }}
                 return
             };prepared = value}
@@ -63,36 +81,40 @@ extension CommandRouter {
                 var hold: TimeInterval?, committed = false
                 do {
                     defer {if let hold {writerTiming?(prepared,hold,committed)}}
-                    try ArchiveStorageGate.withExclusive(root:root) {permit in
-                        try dbQueue.writeWithoutTransaction {db in
-                            let started = ProcessInfo.processInfo.systemUptime
-                            defer {hold = ProcessInfo.processInfo.systemUptime - started}
-                            try autoreleasepool {
-                                guard try Int.fetchOne(db,sql:"PRAGMA data_version") == generation else {throw CoreError("CLEANUP_CONCURRENT_WRITE","An external writer changed the cleanup snapshot.")}
-                                guard try !StorageSnapshotRetention.isActive(root:root) else {throw CoreError("BACKUP_CAPTURE_ACTIVE","Cleanup deferred for a backup capture.")}
-                                prepared = try prepared.revalidated(db,router:self)
-                                try commit(db,permit,prepared)
-                                var state = try self.ticketCleanupPreparationState(db,project:prepared.fence.projectID)
-                                state["state"] = bool(state,"attempt_refused") ? "deferred" : "committed";state["committed_at"] = now()
-                                if !bool(state,"attempt_refused") {state["next_attempt_at"] = NSNull()}
-                                try self.saveTicketCleanupPreparationState(db,project:prepared.fence.projectID,state:state)
-                                self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil
-                            }
+                    let admitted = try withMaintenanceGateAndWriter(label:"ticket_cleanup.commit") {db,permit,deadline in
+                        let started = ProcessInfo.processInfo.systemUptime
+                        defer {hold = ProcessInfo.processInfo.systemUptime - started}
+                        return try autoreleasepool {
+                            guard try Int.fetchOne(db,sql:"PRAGMA data_version") == generation else {throw CoreError("CLEANUP_CONCURRENT_WRITE","An external writer changed the cleanup snapshot.")}
+                            guard try !StorageSnapshotRetention.isActive(root:self.root) else {throw MaintenanceStepDeferred()}
+                            prepared = try prepared.revalidated(db,router:self)
+                            try deadline.check()
+                            try commit(db,permit,prepared)
+                            try deadline.check()
+                            var state = try self.ticketCleanupPreparationState(db,project:prepared.fence.projectID)
+                            state["state"] = bool(state,"attempt_refused") ? "deferred" : "committed";state["committed_at"] = now()
+                            if !bool(state,"attempt_refused") {state["next_attempt_at"] = NSNull()}
+                            try self.saveTicketCleanupPreparationState(db,project:prepared.fence.projectID,state:state)
+                            self.ticketCleanupRetryAt = nil;self.ticketCleanupFailure = nil
+                            return true
                         }
                     }
+                    guard admitted == true else {return}
                     committed = true
                 }
                 guard let continuing,let next = try readers.read({db in try autoreleasepool {try continuing(db,prepared)}}) else {break}
                 prepared = next
             }
-        } catch {
+        } catch is MaintenanceStepDeferred {return}
+        catch {
             let retry = Date().addingTimeInterval(60),reason = (error as? CoreError)?.details["reason"] as? String ?? (error as? CoreError)?.code ?? "CLEANUP_PREPARATION_UNAVAILABLE"
             if (error as? CoreError)?.code != "CLEANUP_CONCURRENT_WRITE" {ticketCleanupRetryAt = retry;ticketCleanupFailure = reason}
-            if let project = ticketCleanupPreparingProject {try dbQueue.writeWithoutTransaction {db in
+            if let project = ticketCleanupPreparingProject {_ = try withMaintenanceWriter(label:"ticket_cleanup.state") {db,_ in
                 var state = try self.ticketCleanupPreparationState(db,project:project)
                 state["state"] = "deferred";state["last_failed_at"] = now();state["last_failure_reason"] = reason;state["next_attempt_at"] = ISO8601DateFormatter().string(from:retry)
                 state["last_failure"] = TicketCleanupFailureDiagnostics.details(error)
                 try self.saveTicketCleanupPreparationState(db,project:project,state:state)
+                return true
             }}
             // A fenced attempt is an expected refusal, never a successful pass.
             if (error as? CoreError)?.code != "CLEANUP_CONCURRENT_WRITE" {throw error}
@@ -100,14 +122,20 @@ extension CommandRouter {
     }
     func beginTicketCleanupPreparation(project: String) throws {
         ticketCleanupPreparingProject = project
-        try dbQueue.writeWithoutTransaction {db in
+        let admitted = try withMaintenanceWriter(label:"ticket_cleanup.state") {db,_ in
             var state = try self.ticketCleanupPreparationState(db,project:project)
             state["attempted_at"] = now();state["state"] = "preparing";state["attempt_count"] = int(state,"attempt_count") + 1;state.removeValue(forKey:"attempt_refused")
             try self.saveTicketCleanupPreparationState(db,project:project,state:state)
+            return true
         }
+        guard admitted == true else {throw MaintenanceStepDeferred()}
     }
     func recordTicketCleanupPreparationRefusal(project: String,reason: String) throws {
-        try dbQueue.writeWithoutTransaction {db in try self.recordTicketCleanupPreparationRefusal(db,project:project,reason:reason)}
+        let admitted = try withMaintenanceWriter(label:"ticket_cleanup.state") {db,_ in
+            try self.recordTicketCleanupPreparationRefusal(db,project:project,reason:reason)
+            return true
+        }
+        guard admitted == true else {throw MaintenanceStepDeferred()}
     }
     func recordTicketCleanupPreparationRefusal(_ db: Database,project: String,reason: String) throws {
         var state = try ticketCleanupPreparationState(db,project:project)
@@ -126,7 +154,7 @@ extension CommandRouter {
     }
     func scheduleTicketCleanupRest(since started: Date,at time: Date = Date()) {
         let rest = time.addingTimeInterval(max(0.05,time.timeIntervalSince(started) * 4))
-        let projectRetry = try? dbQueue.read {db -> Date? in
+        let projectRetry = try? readForPreparation {db -> Date? in
             guard let project = self.ticketCleanupPreparingProject else {return nil}
             return try self.ticketCleanupProjectRetry(db,project:project)
         }
@@ -169,9 +197,10 @@ extension CommandRouter {
 
     func prepareTicketObjectDeletionCandidates(_ db: Database,receipt: JSON,reactivated: Bool,backupGenerationRow: Int64,references: TicketObjectDeletionReferenceIndex,backup: inout StorageBackupRetentionIndex?,mediaComplete: Bool,fence: TicketCleanupFence,pageLinks: TicketBytePageLinks? = nil) throws -> TicketCleanupPreparedDeletion {
         if Self.isLegacyDoneEvidenceDeletion(receipt) {
-            return .init(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:nil,mediaAuthorityComplete:mediaComplete,candidatePaths:[],verifications:[:],verificationFailures:[:])
+            return .init(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:nil,mediaAuthorityComplete:mediaComplete,candidatePaths:[],verifications:[:],verificationFailures:[:],legacySettlement:Self.ticketCleanupLegacySettlement(receipt))
         }
         var objects = receipt["objects"] as? [JSON] ?? []
+        let hasInlineLinks = pageLinks == nil && objects.contains {$0["kind"] as? String == "symlink"}
         let workspaces = try ticketObjectDeletionWorkspaces(db,objects:objects)
         for i in objects.indices where pageLinks == nil && objects[i]["state"] as? String == "pending" && objects[i]["kind"] as? String == "symlink" {
             let holds = try ticketObjectDeletionHolds(db,object:objects[i],references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:receipt["cause"] as? String != "task_purge")
@@ -207,6 +236,6 @@ extension CommandRouter {
                 }
             } catch {failures[path] = error}
         }
-        return TicketCleanupPreparedDeletion(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,candidatePaths:candidates,verifications:verifications,verificationFailures:failures)
+        return TicketCleanupPreparedDeletion(fence:fence,receipt:receipt,reactivated:reactivated,backupGenerationRow:backupGenerationRow,references:references,backup:backup,mediaAuthorityComplete:mediaComplete,candidatePaths:candidates,verifications:verifications,verificationFailures:failures,hasInlineLinks:hasInlineLinks)
     }
 }
