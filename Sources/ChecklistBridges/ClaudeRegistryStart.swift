@@ -60,6 +60,18 @@ public struct ClaudeRegistryStart {
         startedAt = now(); elapsed = 0; attemptCount = 0
         firstReason = nil; lastReason = nil; reasonChanged = false; hasRecoverySummary = false
         let deadline = startedAt + Self.waitLimit
+        let timing = command == "call" && CallTimingLog.enabled
+        var discoveryTime: TimeInterval = 0
+        var retrySleepTime: TimeInterval = 0
+        defer {
+            if timing, let lastReason {
+                var fields: [String: Any] = ["scope": "claude_registry_start", "attempts": attemptCount,
+                    "last_reason": lastReason.rawValue, "discovery_ms": discoveryTime * 1000,
+                    "retry_sleep_ms": retrySleepTime * 1000, "total_ms": (now() - startedAt) * 1000]
+                if let error = error as? ChecklistError { fields["error_code"] = error.code }
+                CallTimingLog.write(fields)
+            }
+        }
         while true {
             if attemptCount > 0, let error {
                 elapsed = max(0, now() - startedAt)
@@ -68,7 +80,9 @@ public struct ClaudeRegistryStart {
                     throw error
                 }
             }
+            let discoveryStarted = timing ? now() : nil
             let discovery = discover()
+            if let discoveryStarted { discoveryTime += now() - discoveryStarted }
             var timeBudget: TimeInterval?
             if attemptCount > 0, let error {
                 elapsed = max(0, now() - startedAt)
@@ -81,12 +95,17 @@ public struct ClaudeRegistryStart {
             do { return try attempt(assistantRelay: assistantRelay, timeBudget: timeBudget, now: now, discovery: discovery, bootstrap: bootstrap) }
             catch {
                 guard mayRetry, ["mcp", "tools", "call", "connect"].contains(command) else { throw error }
+                // The registry already supplies a workspace that excludes this one-shot
+                // caller's cwd. MCP startup can still wait for spare-process assignment.
+                if command == "call", discovery.registryReason == .outsideWorkspace { throw error }
                 let remaining = deadline - now()
                 guard remaining > 0 else {
                     if command == "mcp" { return nil }
                     throw error
                 }
+                let sleepStarted = timing ? now() : nil
                 sleep(min(Self.retryInterval, remaining))
+                if let sleepStarted { retrySleepTime += now() - sleepStarted }
             }
         }
     }

@@ -831,6 +831,22 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
     }
 
+    func testCallRefusesRegistryWorkspaceMismatchBeforeIPC() async throws {
+        let fixture = try Fixture()
+        fixture.setDiscoveries([.claudeRegistryNotReady(.outsideWorkspace), .available(fixture.context)])
+        let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath, command: "call"), environment: fixture.environment)
+        do {
+            _ = try await bridge.connect()
+            XCTFail("The current registry puts this caller outside its workspace")
+        } catch let error as ChecklistError {
+            XCTAssertEqual(error.code, ClaudeRegistryStart.errorCode)
+            XCTAssertEqual(error.message, ClaudeRegistryStart.registryMessage)
+        }
+        XCTAssertEqual(fixture.time, 0)
+        XCTAssertTrue(fixture.attempts.isEmpty)
+        XCTAssertTrue(fixture.calls.isEmpty)
+    }
+
     // CL-346: a service that does not answer never ends MCP startup or needs a manual reconnect.
     private func assertWaitedCall(_ session: Session, _ fixture: Fixture, file: StaticString = #filePath, line: UInt = #line) async throws {
         let limited = try await session.client.listTools()

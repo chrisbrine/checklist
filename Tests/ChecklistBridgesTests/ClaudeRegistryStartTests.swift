@@ -31,9 +31,10 @@ final class ClaudeRegistryStartTests: XCTestCase {
         catch { XCTFail(error.localizedDescription) }
     }
 
-    private func discover(_ directory: URL, provider: String = "claude", environment: [String: String]? = nil) -> NativeSessionDiscovery {
+    private func discover(_ directory: URL, provider: String = "claude", environment: [String: String]? = nil,
+                          workspace: String = "/tmp/project") -> NativeSessionDiscovery {
         NativeSessionContext.discovery(host: (provider, pid), environment: environment ?? ["CLAUDE_SESSION_ID": session],
-            currentDirectory: "/tmp/project", registryDirectory: directory)
+            currentDirectory: workspace, registryDirectory: directory)
     }
 
     private var mismatch: ChecklistError { ChecklistError(ClaudeRegistryStart.errorCode, ClaudeRegistryStart.registryMessage) }
@@ -213,6 +214,76 @@ final class ClaudeRegistryStartTests: XCTestCase {
         try writeRegistry(directory, session: session)
         XCTAssertNil(discover(directory).registryReason)
         XCTAssertNotNil(discover(directory).context)
+    }
+
+    func testCallRefusesExistingRegistryOutsideWorkspaceWithoutWaiting() throws {
+        let directory = try registryDirectory()
+        try writeRegistry(directory, session: session, workspace: "/var")
+        for command in ["call", "tools"] {
+            let clock = Clock()
+            var state = ClaudeRegistryStart()
+            XCTAssertThrowsError(try state.start(command: command, assistantRelay: false, now: { clock.elapsed }, sleep: clock.sleep,
+                discover: {
+                    clock.elapsed += 0.002
+                    return self.discover(directory)
+                }, bootstrap: { _, _ -> String? in
+                    XCTFail("An out-of-scope caller must not bootstrap")
+                    return nil
+                })) { error in
+                XCTAssertEqual((error as? ChecklistError)?.code, ClaudeRegistryStart.errorCode)
+                XCTAssertEqual(error.localizedDescription, self.mismatch.localizedDescription)
+            }
+            XCTAssertEqual(state.lastReason, .outsideWorkspace)
+            if command == "call" {
+                XCTAssertEqual(state.attemptCount, 1)
+                XCTAssertTrue(clock.waits.isEmpty)
+                XCTAssertEqual(clock.elapsed, 0.002)
+            } else {
+                // `tools` still uses the former shared retry policy for this refusal.
+                XCTAssertEqual(state.attemptCount, 40)
+                XCTAssertEqual(clock.elapsed, 10, accuracy: 0.000_001)
+            }
+        }
+    }
+
+    func testMatchingCallUsesSameBootstrapAsUnchangedStartupPath() throws {
+        let directory = try registryDirectory()
+        for index in 0..<8 {
+            let root = directory.appendingPathComponent("project-\(index)").path
+            let workspace = index.isMultiple(of: 2) ? root : root + "/child"
+            let session = UUID().uuidString.lowercased()
+            try writeRegistry(directory, session: session, workspace: root)
+            let expected = try XCTUnwrap(discover(directory, environment: ["CLAUDE_CODE_SESSION_ID": session], workspace: workspace).context)
+            var contexts: [NativeSessionContext] = []
+            for command in ["tools", "call"] {
+                let clock = Clock()
+                var state = ClaudeRegistryStart()
+                let result = try state.start(command: command, assistantRelay: false, now: { clock.elapsed }, sleep: clock.sleep,
+                    discover: { self.discover(directory, environment: ["CLAUDE_CODE_SESSION_ID": session], workspace: workspace) },
+                    bootstrap: { context, budget -> NativeSessionContext in
+                        XCTAssertNil(budget)
+                        return try XCTUnwrap(context)
+                    })
+                contexts.append(try XCTUnwrap(result))
+                XCTAssertEqual(state.attemptCount, 1)
+                XCTAssertTrue(clock.waits.isEmpty)
+            }
+            XCTAssertEqual(contexts, [expected, expected])
+            XCTAssertEqual(expected.nativeSessionID, session)
+            XCTAssertEqual(expected.workspacePath, URL(fileURLWithPath: workspace).resolvingSymlinksInPath().path)
+        }
+    }
+
+    func testCallWaitsWhenRegistryIsMissingAndBootstrapsAfterItAppears() throws {
+        let directory = try registryDirectory(), clock = Clock()
+        var state = ClaudeRegistryStart()
+        let result = try state.start(command: "call", assistantRelay: false, now: { clock.elapsed }, sleep: {
+            clock.sleep($0)
+            self.writeDuringWait(directory)
+        }, discover: { self.discover(directory) }, bootstrap: { context, _ in context?.nativeSessionID })
+        XCTAssertEqual(result, session)
+        XCTAssertEqual(clock.waits, [0.25])
+        XCTAssertEqual(state.attemptCount, 2)
     }
 
     func testServiceMismatchHasDistinctDiagnosticReason() throws {
