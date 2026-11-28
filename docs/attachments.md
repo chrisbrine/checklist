@@ -59,6 +59,14 @@ The installed catalog is authoritative for caller-visible tools. Implemented loc
 
 Release checks include both human/agent local image and file imports, changing/interrupted source capture, hash/type mismatch, exact image/build target approval, changed target with saved answer draft, shared blob references, active-reader hold, large-file and aggregate-budget cleanup, Undo before/after deletion, failed cleanup retry, cleaned-original task restore, and proof that no external original is changed.
 
+### Missing managed originals
+
+Use `attachment_missing_list` with `project_id` to check originals without reading file contents or changing attachment records. It returns the project-wide `missing_count`, `unsettled_count` and `uncheckable_count`. An absent original with a recorded loss still counts as missing. Originals intentionally cleaned or pending an authorized cleanup are excluded. An unsafe path, nonregular entry or failed inspection is uncheckable. Issue rows contain the attachment ID, the ticket ID when present, revision and state. Pass `next_after_attachment_id` as `after_attachment_id` to read the next page. Each call takes a fresh observation.
+
+An authorized worker or owner can record an unexplained absence with `attachment_missing_settle` using `project_id`, `attachment_id` and `command_id`. Use the reported revision as `expected_revision` to guard the observation. The service checks absence without following links, records `original_loss` with the last known SHA-256, size in bytes and the UTC time it observed the loss, and sets availability to `original_missing`. The attachment, its metadata and its preview stay in place. An existing original or uncertain filesystem result refuses settlement. Repeating a successful settlement preserves the first receipt.
+
+Recoverable originals can be recovered from a verified backup. A loss record lets a new backup account for an absent original when recovery is unavailable or the loss is accepted. Original-byte reads continue to report the missing file. Previews remain subject to their own backup verification.
+
 Project icons use separate project-settings asset references, not ticket links. Their bounded normalized thumbnail remains held while selected by project settings; archiving a ticket cannot clean the current icon. The [customization](project-customization.md) and [storage](database-storage.md) contracts define replacement, Undo/backup holds and export.
 
 ## Internal media ownership foundation (20 October 2026)

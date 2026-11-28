@@ -332,7 +332,9 @@ extension CommandRouter {
 
 extension CommandRouter {
     func contributionHistory(_ db: Database, attempt: JSON) throws -> [JSON] {
-        try records(db,type:"attempt",project:attempt["project_id"] as? String).filter {$0["task_id"] as? String == attempt["task_id"] as? String && $0["phase"] as? String == "implementation"}.map { row in
+        let stored = try StoredAttemptRecord(attempt)
+        let task: JSON = ["project_id": stored.projectID, "id": stored.taskID]
+        return try scopedTaskRows(db,type:"attempt",task:task).filter {$0["phase"] as? String == "implementation"}.map { row in
             var identity: JSON = ["attempt_id":(try StoredRecord(row, family: "WorkAuthority").requiredValue("id")),
             "principal":(try StoredRecord(row, family: "WorkAuthority").requiredValue("principal")),
             "session_id":(try StoredRecord(row, family: "WorkAuthority").requiredValue("session_id")),

@@ -326,13 +326,29 @@ final class StorageObjectFiles {
     }
 
     func regularOrLinkExists(_ path: String) throws -> Bool {
+        try entryExists(path,allowSymlink:true)
+    }
+
+    func regularFileExists(_ path: String) throws -> Bool {
+        try entryExists(path,allowSymlink:false)
+    }
+
+    private func entryExists(_ path: String, allowSymlink: Bool) throws -> Bool {
+        func parentIsMissing(_ error: Error) -> Bool {
+            if allowSymlink {return StorageFolderAccess.isMissing(error)}
+            if let failure = error as? StorageSnapshotFailure,case .systemCall(let system) = failure {
+                return system.code == ENOENT
+            }
+            return ((error as? CoreError)?.details["posix_errno"] as? NSNumber)?.int32Value == ENOENT
+        }
         func exists(_ directory: Int32, _ name: String) throws -> Bool {
             var info = stat()
             if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0 {
                 if errno == ENOENT { return false }
                 throw StorageSnapshotFailure.failed("fstatat",path:path,root:root.path)
             }
-            guard [S_IFREG,S_IFLNK].contains(info.st_mode & S_IFMT) else { throw StorageSnapshotFailure.unsupportedAuthority }
+            let type = info.st_mode & S_IFMT
+            guard type == S_IFREG || (allowSymlink && type == S_IFLNK) else { throw StorageSnapshotFailure.unsupportedAuthority }
             return true
         }
         if walkDirectories {
@@ -341,14 +357,14 @@ final class StorageObjectFiles {
             if walk == nil { walk = StorageObjectWalk(root:descriptor,rootPath:root.path) }
             let directory: Int32?
             do { directory = try walk!.pinnedParent(parts, create: false) }
-            catch where StorageFolderAccess.isMissing(error) { return false }
+            catch where parentIsMissing(error) { return false }
             // The walk is operation-local. This synchronous leaf check never
             // retains the borrowed descriptor or moves the walk to another path.
             if let directory { return try exists(directory, name) }
         }
         let parentFD: Int32, name: String
         do { (parentFD, name) = try parent(path) }
-        catch { if StorageFolderAccess.isMissing(error) { return false }; throw error }
+        catch { if parentIsMissing(error) { return false }; throw error }
         defer { Darwin.close(parentFD) }
         return try exists(parentFD, name)
     }

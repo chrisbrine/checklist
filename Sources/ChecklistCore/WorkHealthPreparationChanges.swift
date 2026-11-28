@@ -19,12 +19,13 @@ struct WorkHealthPreparationChanges {
     struct Snapshot {
         fileprivate let units: Int
         let changes: [Change]
+        let changedIDs: Set<Data>
     }
 
     let name = "work_health_changes_" + UUID().uuidString.replacingOccurrences(of:"-",with:"")
     private static let rowLimit = 4096
     private static let byteLimit = 1024 * 1024
-    private static let families = ["task", "attempt", "project", "group", "status"]
+    private static let families = ["task", "attempt", "project", "group", "status", "tag"]
     private static let definitionSuffixes = ["", "_state", "_count", "_insert", "_update_conflict", "_update", "_delete"]
     private var familySQL: String { Self.families.map {"CAST('\($0)' AS BLOB)"}.joined(separator:",") }
 
@@ -174,7 +175,7 @@ struct WorkHealthPreparationChanges {
         let rows = try Row.fetchAll(db,sql:"SELECT id,type,project,task FROM \(name) ORDER BY id,type,project,task")
         guard rows.count == units,rows.count<=Self.rowLimit else {return nil}
         let families = Set(Self.families.map {Data($0.utf8)})
-        var changes: [Change] = [],bytes = 0
+        var changes: [Change] = [],changedIDs = Set<Data>(),bytes = 0
         for row in rows {
             guard let id = row["id"] as Data?,let type = row["type"] as Data?,
                   let project = row["project"] as Data?,let task = row["task"] as Data?,
@@ -185,8 +186,9 @@ struct WorkHealthPreparationChanges {
                 guard bytes<=Self.byteLimit else {return nil}
             }
             changes.append(.init(id:id,type:type,project:project,task:task))
+            changedIDs.insert(id)
         }
-        return Snapshot(units:units,changes:changes)
+        return Snapshot(units:units,changes:changes,changedIDs:changedIDs)
     }
 
     func remove(_ db: Database) throws {

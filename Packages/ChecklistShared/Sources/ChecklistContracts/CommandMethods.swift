@@ -66,6 +66,7 @@ public enum CommandMethods {
         "message_delivery_list",
         "history_list",
         "attachment_list",
+        "attachment_missing_list",
         "attachment_read",
         "attachment_cleanup_preview",
         "agent_resolve",

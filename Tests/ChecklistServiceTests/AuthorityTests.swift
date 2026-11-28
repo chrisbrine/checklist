@@ -249,6 +249,7 @@ final class AuthorityTests: XCTestCase {
         XCTAssertEqual(wakes,1,"Mutation hooks remain active")
         XCTAssertTrue(Peer.requiresAfterCommand("message_send"))
         XCTAssertTrue(Peer.requiresAfterCommand("attachment_read"),"Availability repairs and managed leases keep hooks")
+        XCTAssertFalse(Peer.requiresAfterCommand("attachment_missing_list"),"Missing-original census is read-only")
         XCTAssertFalse(Peer.requiresAfterCommand("tool_catalog"))
         coordinator.workHealthWake?.cancel()
     }

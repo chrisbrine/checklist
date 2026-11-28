@@ -8,11 +8,15 @@ extension CommandRouter {
     /// their original location for reconciliation; no earlier copy is removed.
     func quarantineFailedBackupPublication(params: JSON,caller: Caller,error: Error,retention: StorageSnapshotRetention) {
         if let failure = error as? CoreError {
-            guard ["BACKUP_DEADLINE_EXCEEDED","BACKUP_CAPACITY_EXCEEDED"].contains(failure.code) else {return}
+            let namedMissing = failure.code == "BACKUP_IO_ERROR" && failure.details["reason"] as? String == "file_missing"
+            guard namedMissing || ["BACKUP_DEADLINE_EXCEEDED","BACKUP_CAPACITY_EXCEEDED"].contains(failure.code) else {return}
         } else if let failure = error as? StorageSnapshotFailure {
             switch failure {case .deadline,.canceled,.io,.systemCall,.incomplete,.sourceChanged:break;default:return}
         } else {return}
         guard let command = params["command_id"] as? String else {return}
+        let watchdog = ServiceHoldWatchdog.shared
+        var leaseHold: UInt64?
+        defer {watchdog.end(leaseHold)}
         do {
             // The capture lease orders this read against backup commit/replay and
             // retirement. The snapshot's manifest lease fences proof and restore.
@@ -45,6 +49,7 @@ extension CommandRouter {
             guard fstatat(parent.descriptor,destination.lastPathComponent,&destinationInfo,AT_SYMLINK_NOFOLLOW) == 0,
                   destinationInfo.st_mode & S_IFMT == S_IFDIR else {return}
             let use = try StorageBackupUseLease(root:destination,exclusive:true)
+            leaseHold = watchdog.begin(resource:"snapshot_lease",work:"backup_publication_quarantine")
             defer {withExtendedLifetime(use) {}}
             let bytes = try use.files.read("manifest.json",maximum:StorageSnapshotBudget.manifestByteLimit)
             let manifest = try JSONDecoder().decode(StorageSnapshotManifest.self,from:bytes)

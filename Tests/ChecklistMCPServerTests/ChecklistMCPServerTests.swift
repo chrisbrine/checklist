@@ -184,8 +184,7 @@ final class ChecklistMCPServerTests: XCTestCase {
             return ["data":["build_id":"current-service"],"_checklist_timing":["total_ms":1.5]]
         }
         let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:"call"),environment:fixture.environment)
-        _ = try await bridge.connect()
-        try await bridge.verifySession()
+        try await bridge.prepareDirectCall()
         let reply = try await bridge.call("service_info",.object(["unexpected":.string("preserve for service validation")]))
         let object = try XCTUnwrap(try jsonObject(reply) as? [String:Any])
         XCTAssertEqual((object["data"] as? [String:Any])?["build_id"] as? String,"current-service")
@@ -216,10 +215,45 @@ final class ChecklistMCPServerTests: XCTestCase {
         let fixture = try Fixture(provider:"codex")
         fixture.setDiscoveries([.available(fixture.context)])
         let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,expectedSession:"different-session",command:"call"),environment:fixture.environment)
-        _ = try await bridge.connect()
-        do { try await bridge.verifySession(); XCTFail("An expected-session mismatch must still stop the CLI") }
+        do { try await bridge.prepareDirectCall(); XCTFail("An expected-session mismatch must still stop the CLI") }
         catch { XCTAssertTrue(error.localizedDescription.contains("SESSION_MISMATCH")) }
         XCTAssertEqual(fixture.calls.map {$0.0},["service_info"])
+    }
+
+    func testBenchmarkDirectCallPreparationHandoffs() async throws {
+        guard ProcessInfo.processInfo.environment["CHECKLIST_P522D_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set CHECKLIST_P522D_BENCHMARK=1 for the paired component measurement.")
+        }
+        let callsPerPath = 120
+        var elapsed: [UInt64] = [0, 0]
+        var cpu: [UInt64] = [0, 0]
+        for index in 0..<callsPerPath {
+            for variant in index.isMultiple(of: 2) ? [0, 1] : [1, 0] {
+                let fixture = try Fixture(provider: "codex")
+                fixture.setDiscoveries([.available(fixture.context)])
+                let bridge = Bridge(configuration: .init(workspace: fixture.context.workspacePath, command: "call"),
+                                    environment: fixture.environment)
+                let start = DispatchTime.now().uptimeNanoseconds
+                let cpuStart = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)
+                if variant == 0 {
+                    _ = try await bridge.connect()
+                    try await bridge.verifySession()
+                } else {
+                    try await bridge.prepareDirectCall()
+                }
+                let reply = try await bridge.call("service_info", .object([:]))
+                cpu[variant] += clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID) - cpuStart
+                elapsed[variant] += DispatchTime.now().uptimeNanoseconds - start
+                XCTAssertEqual(reply, .object(["data": .object(["service": .string("synthetic"),
+                               "session_id": .string(fixture.context.nativeSessionID)])]))
+                XCTAssertEqual(fixture.attempts.count, 1)
+                XCTAssertEqual(fixture.calls.map(\.0), ["service_info"])
+            }
+        }
+        for (variant, label) in ["before", "after"].enumerated() {
+            let divisor = Double(callsPerPath) * 1e3
+            print("CL-522 mock authenticated CLI \(label): \(callsPerPath) calls, wall \(Double(elapsed[variant]) / divisor) µs/call, CPU \(Double(cpu[variant]) / divisor) µs/call")
+        }
     }
 
     func testDirectCLIServiceInfoKeepsLimitedWorkspaceNoticeAndOtherMethodGuard() async throws {

@@ -306,6 +306,9 @@ extension CommandRouter {
         }
         try observe("captured")
         let path = canonical(try text(p,"path")),destination = URL(fileURLWithPath:path),parent = destination.deletingLastPathComponent()
+        guard exportDestinationOutsideStore(destination) else {
+            throw CoreError("EXPORT_PATH_REFUSED","Choose an export directory outside the Checklist store.")
+        }
         let partial = parent.appendingPathComponent("." + destination.lastPathComponent + ".checklist-export-" + uuid())
         let publication = ExportPublication(destination:destination,principal:c.principal,command:command,digest:digest,partial:partial,journal:"staging/pending-exports/" + uuid() + ".json")
         if FileManager.default.fileExists(atPath:path) {
@@ -359,6 +362,10 @@ extension CommandRouter {
     /// A destination whose ownership cannot be read (for example an unreadable marker) also
     /// keeps its record; nothing is removed until the marker can be read (finding 4b933bf0).
     func reconcileExport(_ export: ExportPublication,committed: Bool) {
+        // A legacy pending journal may predate destination validation. Its
+        // marker gives no authority over a directory in the managed store.
+        guard exportDestinationOutsideStore(export.destination),
+              export.partial.map(exportDestinationOutsideStore) != false else {return}
         var complete = true
         if committed {
             switch export.ownership() { case .own: complete = removeExportItem(export.marker); case .unknown: complete = false; case .foreign: break }
@@ -377,6 +384,10 @@ extension CommandRouter {
             switch export.ownership() { case .own: complete = removeExportItem(export.destination); case .unknown: complete = false; case .foreign: break }
         }
         if complete { export.forgetPending(root:root) }
+    }
+    private func exportDestinationOutsideStore(_ destination: URL) -> Bool {
+        let path = reservationKey(destination.path), store = reservationKey(root.path)
+        return !containsPath(store,path) && !containsPath(path,store)
     }
     /// True when nothing is left at `item`.
     private func removeExportItem(_ item: URL) -> Bool {

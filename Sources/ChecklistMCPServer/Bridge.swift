@@ -9,7 +9,7 @@ func jsonData(_ value: Any, pretty: Bool = false) throws -> Data {
 }
 
 /// The direct walk covers JSON object trees; other input takes the decoder (CL-444).
-func mcpValue(_ value: Any) throws -> Value {
+package func mcpValue(_ value: Any) throws -> Value {
     if let converted = JSONValueConversion.value(value) { return converted }
     return try mcpValueByDecoding(value)
 }
@@ -415,6 +415,12 @@ public actor Bridge {
         catch { recordConnectionFailure(error); return serviceError }
         serviceError = nil; startupError = nil; codexRestartError = nil
         return nil
+    }
+
+    /// A one-shot CLI connects and verifies on one actor turn.
+    package func prepareDirectCall() throws {
+        _ = try connect()
+        try verifySession()
     }
 
     public func verifySession(replyTimeout: TimeInterval? = nil) throws {

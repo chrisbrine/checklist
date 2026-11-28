@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Managed original loss commands and backup attention",
+  "type": "object",
+  "required": ["list", "listing", "settle", "settlement", "backup_missing_attachment_attention"],
+  "additionalProperties": false,
+  "properties": {
+    "list": {"$ref": "#/$defs/list"},
+    "listing": {"$ref": "#/$defs/listing"},
+    "settle": {"$ref": "#/$defs/settle"},
+    "settlement": {"$ref": "#/$defs/settlement"},
+    "backup_missing_attachment_attention": {"$ref": "#/$defs/attention"}
+  },
+  "$defs": {
+    "uuid": {"type": "string", "format": "uuid"},
+    "nullable_ticket": {"type": ["string", "null"], "format": "uuid"},
+    "loss": {
+      "type": "object",
+      "required": ["last_known_sha256", "last_known_size", "found_at"],
+      "additionalProperties": false,
+      "properties": {
+        "last_known_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "last_known_size": {"type": "integer", "minimum": 0},
+        "found_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "list": {
+      "type": "object",
+      "required": ["project_id"],
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "after_attachment_id": {"type": "string", "minLength": 1, "maxLength": 100},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+      }
+    },
+    "listing": {
+      "type": "object",
+      "required": ["project_id", "checked_at", "missing_count", "unsettled_count", "uncheckable_count", "attachments", "next_after_attachment_id"],
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "checked_at": {"type": "string", "format": "date-time"},
+        "missing_count": {"type": "integer", "minimum": 0},
+        "unsettled_count": {"type": "integer", "minimum": 0},
+        "uncheckable_count": {"type": "integer", "minimum": 0},
+        "attachments": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "required": ["attachment_id", "task_id", "revision", "state"],
+            "additionalProperties": false,
+            "properties": {
+              "attachment_id": {"$ref": "#/$defs/uuid"},
+              "task_id": {"$ref": "#/$defs/nullable_ticket"},
+              "revision": {"type": "integer", "minimum": 1},
+              "state": {"enum": ["settled", "unsettled", "uncheckable"]}
+            }
+          }
+        },
+        "next_after_attachment_id": {"type": ["string", "null"], "format": "uuid"}
+      }
+    },
+    "settle": {
+      "type": "object",
+      "required": ["project_id", "attachment_id", "command_id"],
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "attachment_id": {"$ref": "#/$defs/uuid"},
+        "command_id": {"$ref": "#/$defs/uuid"},
+        "expected_revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "settlement": {
+      "type": "object",
+      "required": ["project_id", "attachment_id", "task_id", "availability", "revision", "original_loss"],
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "attachment_id": {"$ref": "#/$defs/uuid"},
+        "task_id": {"$ref": "#/$defs/nullable_ticket"},
+        "availability": {"const": "original_missing"},
+        "revision": {"type": "integer", "minimum": 1},
+        "original_loss": {"$ref": "#/$defs/loss"}
+      }
+    },
+    "attention": {
+      "type": "object",
+      "required": ["command_id", "error_code", "failed_at", "reason", "next_step", "project_id", "project_name", "attachment_id", "attachment_name", "representation"],
+      "additionalProperties": false,
+      "properties": {
+        "command_id": {"$ref": "#/$defs/uuid"},
+        "error_code": {"const": "BACKUP_IO_ERROR"},
+        "failed_at": {"type": "string", "format": "date-time"},
+        "reason": {"const": "file_missing"},
+        "next_step": {"type": "string", "minLength": 1},
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "project_name": {"type": "string"},
+        "task_id": {"$ref": "#/$defs/uuid"},
+        "ticket_key": {"type": "string"},
+        "attachment_id": {"$ref": "#/$defs/uuid"},
+        "attachment_name": {"type": "string"},
+        "representation": {"enum": ["original", "preview"]}
+      },
+      "dependentRequired": {"ticket_key": ["task_id"]}
+    }
+  }
+}

@@ -6,6 +6,78 @@ import GRDB
 @testable import ChecklistCore
 
 final class WorkHealthPreparationTests: XCTestCase {
+    func testPreparedHealthReferenceTargetsMatchOrdinaryCommitChecks() throws {
+        let fixture = try StorageFixture(fast:true), project = try fixture.project()
+        let task = try fixture.task(project), router = try XCTUnwrap(fixture.router)
+        let projectID = try XCTUnwrap(project["id"] as? String)
+        let taskID = try XCTUnwrap(task["id"] as? String)
+        let tag = try XCTUnwrap(fixture.call("tag_create",["project_id":projectID,"name":"Valid tag"])["data"] as? JSON)
+        let tagID = try XCTUnwrap(tag["id"] as? String)
+        let triage = try XCTUnwrap(fixture.call("triage_create",["project_id":projectID,"name":"Wrong group kind"])["data"] as? JSON)
+        let triageID = try XCTUnwrap(triage["id"] as? String)
+        let proof = try router.dbQueue.read { db in
+            let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT " + CommandRouter.canonicalRecordColumns + " FROM records WHERE id=?",arguments:[taskID]))
+            return try router.prepareTaskReferences(db,task:GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task"))
+        }
+        let bodyVariants: [(JSON, String?)] = [
+            (["title":"Changed without relinking"],nil),
+            (["tag_ids":[tagID,tagID]],nil),
+            (["tag_ids":[uuid()]],"reference_unavailable"),
+            (["status_id":tagID],"reference_unavailable"),
+            (["epic_id":triageID],"epic_kind")
+        ]
+        for (patch, expectedFailure) in bodyVariants {
+            var readCounts: [Int] = []
+            for candidate in [nil,proof] {
+                let outcome = try router.dbQueue.writeWithoutTransaction { db -> (String?, Int) in
+                    var value = try router.record(db,taskID,type:"task")
+                    value["tag_ids"] = task["tag_ids"]
+                    for (key, replacement) in patch {value[key] = replacement}
+                    var targetReads = 0
+                    db.trace { event in
+                        if case .statement(let statement) = event,
+                           statement.sql.contains("type=CAST(? AS TEXT) AND id IN") {targetReads += 1}
+                    }
+                    defer {db.trace(nil)}
+                    do {
+                        try router.withValidatedDomainTransaction(db,preparedReferences:{candidate}) {
+                            try router.save(db,router.revised(value),type:"task")
+                            return .commit
+                        }
+                        return (nil, targetReads)
+                    } catch let error as CoreError {
+                        XCTAssertEqual(error.code,"TASK_REFERENCE_INVALID")
+                        return (error.details["reason"] as? String, targetReads)
+                    }
+                }
+                XCTAssertEqual(outcome.0,expectedFailure)
+                readCounts.append(outcome.1)
+            }
+            if patch["title"] != nil {
+                XCTAssertGreaterThan(readCounts[0],0)
+                XCTAssertEqual(readCounts[1],0,"A matching proof avoids the target envelope reads")
+            } else {
+                XCTAssertEqual(readCounts[1],readCounts[0],"A changed edge falls back to ordinary target validation")
+            }
+        }
+        let epicID = try XCTUnwrap(task["epic_id"] as? String)
+        for candidate in [nil,proof] {
+            XCTAssertThrowsError(try router.dbQueue.writeWithoutTransaction { db in
+                try router.withValidatedDomainTransaction(db,preparedReferences:{candidate}) {
+                    var epic = try router.record(db,epicID,type:"group")
+                    epic["kind"] = "triage"
+                    try router.save(db,router.revised(epic),type:"group")
+                    var value = try router.record(db,taskID,type:"task")
+                    value["tag_ids"] = task["tag_ids"]
+                    try router.save(db,router.revised(value),type:"task")
+                    return .commit
+                }
+            }) { error in
+                XCTAssertEqual((error as? CoreError)?.details["reason"] as? String,"epic_kind")
+            }
+        }
+    }
+
     func testHealthPreparationKeepsRestoreDrainAdmissionUntilItsCommitFinishes() throws {
         let f = try StorageFixture(fast:true),router = f.router!
         let entered = DispatchSemaphore(value:0),release = DispatchSemaphore(value:0)
@@ -163,6 +235,87 @@ final class WorkHealthPreparationTests: XCTestCase {
 }
 
 extension EvidenceAuthorityTests {
+    func testWorkHealthPreparationSkipsLegacyMissingEpicAndAppliesFollowingCandidate() throws {
+        let project = try project()
+        let legacy = [try ready(project),try ready(project)]
+        let valid = try ready(project)
+        for (index, task) in (legacy + [valid]).enumerated() {
+            let worker = try native(project,"health-legacy-epic-\(index)",domain:"health-legacy-epic-\(index)")
+            _ = try claim(project,task,caller:worker)
+        }
+        let firstID = try XCTUnwrap(legacy[0]["id"] as? String)
+        let secondID = try XCTUnwrap(legacy[1]["id"] as? String)
+        let validID = try XCTUnwrap(valid["id"] as? String)
+        try router.dbQueue.writeWithoutTransaction {db in
+            // Reproduce owned fixture rows written before Epic was required.
+            try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.epic_id') WHERE id=?",arguments:[firstID])
+            try db.execute(sql:"UPDATE records SET data=json_set(data,'$.epic_id',NULL) WHERE id=?",arguments:[secondID])
+        }
+        func legacyRows() throws -> [(revision: Int64, bytes: Data)] {
+            try router.dbQueue.read {db in
+                try [firstID,secondID].map { id in
+                    let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT revision, CAST(data AS BLOB) AS bytes FROM records WHERE id=?",arguments:[id]))
+                    return (row["revision"],row["bytes"])
+                }
+            }
+        }
+        let before = try legacyRows()
+        let pass = try router.runWorkHealthChecks()
+        XCTAssertEqual(pass["scanned"] as? Int,3)
+        XCTAssertEqual(pass["inspected"] as? Int,1)
+        XCTAssertEqual(pass["changed"] as? Int,1)
+        XCTAssertNil(pass["deferred"])
+        for (old, current) in zip(before,try legacyRows()) {
+            XCTAssertEqual(current.revision,old.revision)
+            XCTAssertEqual(current.bytes,old.bytes)
+        }
+        let applied = try router.dbQueue.read {db in try router.record(db,validID,type:"task")}
+        XCTAssertNotNil(applied["work_health"])
+    }
+
+    func testWorkHealthPreparationRevalidatesChangedReferenceTargets() throws {
+        let project = try project(), task = try ready(project)
+        let projectID = try XCTUnwrap(project["id"] as? String)
+        let taskID = try XCTUnwrap(task["id"] as? String)
+        let tag = try call("tag_create",["project_id":projectID,"name":"Referenced tag"])
+        let other = try call("tag_create",["project_id":projectID,"name":"Unrelated tag"])
+        let tagged = try call("task_edit",["project_id":projectID,"task_id":taskID,"expected_revision":task["revision"]!,"patch":["tag_ids":[tag["id"]!]]])
+        let worker = try native(project,"health-tag",domain:"health-tag")
+        _ = try claim(project,tagged,caller:worker)
+
+        let tagID = try XCTUnwrap(tag["id"] as? String)
+        router.workHealthPreparationProbe = { [self] in
+            _ = try call("tag_edit",["project_id":projectID,"tag_id":tagID,"expected_revision":tag["revision"]!,"name":"Changed referenced tag"])
+            _ = try call("tag_edit",["project_id":projectID,"tag_id":other["id"]!,"expected_revision":other["revision"]!,"name":"Changed unrelated tag"])
+        }
+        defer {router.workHealthPreparationProbe = nil}
+        let date = Date()
+        let fresh = try router.runWorkHealthChecks(at:date)
+        XCTAssertNil(fresh["deferred"])
+        XCTAssertEqual(fresh["inspected"] as? Int,1)
+        XCTAssertEqual(fresh["changed"] as? Int,1)
+
+        func capture() throws -> (task: String, messageCount: Int) {
+            try router.dbQueue.read {db in
+                let current = try router.record(db,taskID,type:"task")
+                return (try jsonString(current),try router.scopedTaskRows(db,type:"message",task:current).count)
+            }
+        }
+        let before = try capture()
+        router.workHealthPreparationProbe = { [self] in
+            // Emulate an invalid retained target after the read snapshot.
+            try router.dbQueue.writeWithoutTransaction {db in
+                try db.execute(sql:"UPDATE records SET data=json_remove(data,'$.project_id') WHERE id=?",arguments:[tagID])
+            }
+        }
+        XCTAssertThrowsError(try router.runWorkHealthChecks(at:date.addingTimeInterval(1205))) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"CANONICAL_RECORD_INVALID")
+        }
+        let after = try capture()
+        XCTAssertEqual(after.task,before.task)
+        XCTAssertEqual(after.messageCount,before.messageCount)
+    }
+
     func testWorkHealthPreparationFullStalePageDoesNotStarveFollowingQuietTicket() throws {
         let p = try project()
         var attempts: [String] = []

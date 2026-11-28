@@ -410,7 +410,7 @@ extension CommandRouter {
     private func ticketCleanupOwnerFingerprint(_ value: JSON,type: String) throws -> String {
         var value = value;value.removeValue(forKey:"record_type")
         if type == "attachment" {
-            for key in ["revision","updated_at","availability","cleanup_receipt_id"] {value.removeValue(forKey:key)}
+            for key in ["revision","updated_at","availability","availability_error","cleanup_receipt_id","original_removal_receipt_id"] {value.removeValue(forKey:key)}
         }
         return hash(Data(try jsonString(value).utf8))
     }
@@ -425,13 +425,23 @@ extension CommandRouter {
                 "receipt_id": (try StoredRecord(receipt, family: "receipt").requiredValue("id")), "state": (try StoredRecord(object, family: "object").requiredValue("state")),
                 "removed_bytes": object["state"] as? String == "removed" ? object["size"] ?? 0 : 0,
             ])
-        guard object["representation"] as? String == "original" else {return}
-        for id in strings(object,"owner_ids") {
-            if var attachment = try? record(db,id,type:"attachment"),attachment["sha256"] as? String == object["sha256"] as? String {
-                attachment["availability"] = object["state"] as? String == "removed" ? "original_cleaned" : "original_missing"
-                attachment["cleanup_receipt_id"] = (try StoredRecord(receipt, family: "receipt").requiredValue("id"))
-                try save(db,revised(attachment),type:"attachment")
-            }
+        guard let relative = object["relative_path"] as? String,relative.hasPrefix("objects/") else {return}
+        let receiptID = try StoredRecord(receipt,family:"receipt").string("id")
+        let ownerIDs = Set(strings(object,"owner_ids")), removed = object["state"] as? String == "removed"
+        for var attachment in try attachmentReferencesToObject(db,relative:relative) {
+            guard let id = attachment["id"] as? String, ownerIDs.contains(id),
+                  attachment["mode"] as? String == "managed",
+                  let path = attachment["path"] as? String,
+                  try ManagedPaths.relative(path,family:"objects",root:root) == relative,
+                  attachment["sha256"] as? String == object["sha256"] as? String,
+                  try ArchiveCleanupJob.integer(attachment["size"]) == ArchiveCleanupJob.integer(object["size"]),
+                  try AttachmentOriginalLoss.recorded(in:attachment) == nil else {continue}
+            if attachment["availability"] as? String == Self.originalCleanupPending,
+               attachment["original_removal_receipt_id"] as? String != receiptID {continue}
+            if !removed && attachment["availability"] as? String == "original_cleaned" {continue}
+            try recordOriginalRemovalOutcome(&attachment,receiptID:receiptID,removed:removed)
+            attachment["cleanup_receipt_id"] = receiptID
+            try save(db,revised(attachment),type:"attachment")
         }
     }
 }

@@ -85,13 +85,13 @@ extension CommandRouter {
 
     /// nil means generic query fallback; [] is a complete empty selection.
     /// At most 4096 row IDs are retained across all selected families.
-    func selectedTaskRecordIDs(_ db: Database, type: String, task: JSON) throws -> [Int64]? {
+    func selectedTaskRecordIDs(_ db: Database, type: String, task: JSON, prepareIfNeeded: Bool = true) throws -> [Int64]? {
         guard let frame = Self.taskRecordSelectionFrame,
               frame.database === db,let project = task["project_id"] as? String,let taskID = task["id"] as? String,
               frame.project == SnapshotRecordIdentity(project),frame.taskIDs.contains(SnapshotRecordIdentity(taskID)) else {return nil}
         let family = SnapshotRecordIdentity(type), identity = SnapshotRecordIdentity(taskID)
         if let selected = frame.families[family] {return selected[identity] ?? []}
-        guard let serializedTaskIDs = frame.serializedTaskIDs,serializedTaskIDs.utf8.count <= 4*1024*1024,
+        guard prepareIfNeeded,let serializedTaskIDs = frame.serializedTaskIDs,serializedTaskIDs.utf8.count <= 4*1024*1024,
               !frame.unavailable.contains(family) else {return nil}
         guard frame.families.count + frame.unavailable.count < 64 else {return nil}
         let remaining = 4096-frame.rowCount

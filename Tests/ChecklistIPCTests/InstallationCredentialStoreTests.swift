@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 @testable import ChecklistIPC
@@ -51,6 +53,43 @@ final class InstallationCredentialStoreTests: XCTestCase {
     }
     private func mode(_ url: URL) throws -> Int {
         (try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)?.intValue ?? -1
+    }
+
+    private func legacyFileName(_ installation: String) -> String {
+        "installation_credential-" + SHA256.hash(data: Data(installation.utf8)).map { String(format: "%02x", $0) }.joined() + ".json"
+    }
+
+    func testCredentialFilenameMatchesLegacyDigestForGeneratedInputs() throws {
+        let store = try store()
+        for name in ["", "default", "a", "codex.123", "🛠", "e\u{301}"] + (0..<128).map({ "synthetic_\($0)" }) {
+            XCTAssertEqual(store.fileName(name), legacyFileName(name))
+        }
+    }
+
+    func testBenchmarkCredentialFilenamePreparation() throws {
+        guard ProcessInfo.processInfo.environment["CHECKLIST_P522D_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set CHECKLIST_P522D_BENCHMARK=1 for the paired component measurement.")
+        }
+        let store = try store()
+        let rounds = 1_000
+        var elapsed: [UInt64] = [0, 0]
+        var cpu: [UInt64] = [0, 0]
+        for index in 0..<rounds {
+            let name = "synthetic_\(index)"
+            var result = ["", ""]
+            for variant in index.isMultiple(of: 2) ? [0, 1] : [1, 0] {
+                let start = DispatchTime.now().uptimeNanoseconds
+                let cpuStart = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)
+                result[variant] = variant == 0 ? legacyFileName(name) : store.fileName(name)
+                cpu[variant] += clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID) - cpuStart
+                elapsed[variant] += DispatchTime.now().uptimeNanoseconds - start
+            }
+            XCTAssertEqual(result[0], result[1])
+        }
+        for (variant, label) in ["before", "after"].enumerated() {
+            let divisor = Double(rounds) * 1e3
+            print("CL-522 credential path \(label): \(rounds) lookups, wall \(Double(elapsed[variant]) / divisor) µs/lookup, CPU \(Double(cpu[variant]) / divisor) µs/lookup")
+        }
     }
 
     func testCredentialOnlyInTheOldStoreMigratesOnceAndStaysInTheOldStore() throws {

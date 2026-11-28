@@ -330,6 +330,11 @@ extension CommandRouter {
                 let prior = raw["availability"] as? String ?? "unavailable"
                 attachment["availability"] = ["original_cleaned","original_missing","unavailable","damaged"].contains(prior) ? prior : "unavailable"
                 attachment["source_reference_unavailable"] = true
+                if let loss = try AttachmentOriginalLoss.recorded(in:raw) {
+                    attachment["sha256"] = loss.sha256
+                    attachment["size"] = loss.size
+                    attachment["original_loss"] = loss.json
+                }
             }
             if let preview = bundle.files.first(where:{$0.path == raw["preview_path"] as? String}),preview.bytes != nil {attachment["preview_path"] = "objects/import-" + preview.sha256!}
             for field in ["description","content_type","media_type"] {attachment[field] = raw[field]}

@@ -35,6 +35,7 @@ public struct InstallationCredentialStore: Sendable {
     }
     private static let kind = "installation_credential"
     private static let maximumBytes = 64 * 1024
+    private static let hexDigits = Array("0123456789abcdef".utf8)
 
     public let directory: URL
     private let binding: String
@@ -69,7 +70,14 @@ public struct InstallationCredentialStore: Sendable {
     }
 
     func fileName(_ installation: String) -> String {
-        Self.kind + "-" + SHA256.hash(data: Data(installation.utf8)).map { String(format: "%02x", $0) }.joined() + ".json"
+        let digest = SHA256.hash(data: Data(installation.utf8))
+        var hex = [UInt8]()
+        hex.reserveCapacity(64)
+        for byte in digest {
+            hex.append(Self.hexDigits[Int(byte >> 4)])
+            hex.append(Self.hexDigits[Int(byte & 0x0f)])
+        }
+        return Self.kind + "-" + String(decoding: hex, as: UTF8.self) + ".json"
     }
 
     /// The file decides when it exists. An untrusted or foreign file throws and never falls

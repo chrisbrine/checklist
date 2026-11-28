@@ -146,13 +146,37 @@ extension CommandRouter {
         return result
     }
 
+    func activeBatchTaskIDs(_ db: Database,batch: JSON,phase: String) throws -> Set<String> {
+        let stored = StoredRecord(batch, family: "batch")
+        let batchID = try stored.string("id"), projectID = try stored.string("project_id")
+        // One selected batch can still have extra corrupt or legacy claims. Inspect
+        // all of its candidates, without assuming only frozen members are active.
+        // json_each admits duplicate legacy keys; canonical decoding and the
+        // exact predicates below still decide whether a claim belongs.
+        let rows = try fetchStoreRows(db,sql:"""
+            SELECT \(Self.canonicalRecordColumns) FROM records
+            WHERE type='attempt' AND project_id=CAST(? AS TEXT)
+              AND CASE WHEN json_valid(data) THEN EXISTS (
+                SELECT 1 FROM json_each(records.data)
+                WHERE key='batch_id' AND type='text' AND value=CAST(? AS TEXT) COLLATE BINARY
+              ) ELSE 1 END
+            ORDER BY rowid
+            """,arguments:[Data(projectID.utf8),Data(batchID.utf8)])
+        let digest = batch["digest"] as? String
+        let attempts = try rows.map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        return Set(attempts.filter {
+            $0["state"] as? String == "active" && $0["batch_id"] as? String == batchID
+                && $0["batch_digest"] as? String == digest && $0["phase"] as? String == phase
+        }.compactMap {$0["task_id"] as? String})
+    }
+
     /// The complete active frozen set continues atomically. A batch ID alone never retains an individual ticket.
     func batchWork(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true),batch = try scoped(db,try text(p,"batch_id"),pid,type:"batch");try revision(p,batch)
         let action = method == "batch_submit" ? "work_submit" : "review_record"
         let requiredPhase = method == "batch_submit" ? "implementation" : "review"
         guard batch["phase"] as? String == requiredPhase,let inputs = p["members"] as? [JSON],!inputs.isEmpty,inputs.count <= 200 else { throw CoreError("INVALID_TRANSITION","Supply every active member of the matching frozen batch phase.") }
-        let expectedIDs = Set(try records(db,type:"attempt",project:pid).filter {$0["state"] as? String == "active" && $0["batch_id"] as? String == batch["id"] as? String && $0["batch_digest"] as? String == batch["digest"] as? String && $0["phase"] as? String == requiredPhase}.compactMap {$0["task_id"] as? String})
+        let expectedIDs = try activeBatchTaskIDs(db,batch:batch,phase:requiredPhase)
         var attempts: [JSON] = []
         for input in inputs {
             let attempt = try claimAttempt(db,input,c,pid)

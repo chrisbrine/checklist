@@ -19,8 +19,9 @@ public final class ChecklistClient: @unchecked Sendable {
     /// No caller-selected role, profile or credential is accepted by this path.
     public func bootstrap(_ nativeContext: [String: Any], timeBudget: TimeInterval? = nil) throws -> [String: Any] {
         let started = ProcessInfo.processInfo.systemUptime
-        var preparationMS: Double = 0
-        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"client", "method":"connection_bootstrap", "preparation_ms":preparationMS, "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
+        let timed = CallTimingLog.enabled
+        var phases: [String: Double] = [:]
+        defer { if timed { Self.logCallTiming(method: "connection_bootstrap", started: started, phases: phases) } }
         if let timeBudget, !timeBudget.isFinite || timeBudget < 0 {
             throw ChecklistError("INVALID_INPUT", "The bootstrap time budget must be a finite, nonnegative number of seconds.")
         }
@@ -32,11 +33,18 @@ public final class ChecklistClient: @unchecked Sendable {
             return min(limit, left)
         }
         _ = try remaining()
+        let lifecycleStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
         try platformServices.lifecycle.prepare()
+        let encodingStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
         var request: [String: Any] = ["method": "connection_bootstrap", "params": nativeContext, "installation": "automatic", "owner_channel": false]
-        if CallTimingLog.enabled { request["diagnostics_timing"] = true }
+        if timed { request["diagnostics_timing"] = true }
         let bytes = try JSONSerialization.data(withJSONObject: request)
-        preparationMS = (ProcessInfo.processInfo.systemUptime-started)*1000
+        if timed {
+            let prepared = ProcessInfo.processInfo.systemUptime
+            phases["lifecycle_prepare_ms"] = (encodingStarted - lifecycleStarted) * 1000
+            phases["request_encode_ms"] = (prepared - encodingStarted) * 1000
+            phases["preparation_ms"] = (prepared - started) * 1000
+        }
         do { return try requestOnce(bytes, replyTimeout: remaining()) }
         catch let error as ChecklistError where error.code == "SERVICE_UNAVAILABLE" {
             if let deadline {
@@ -56,10 +64,12 @@ public final class ChecklistClient: @unchecked Sendable {
     /// supply a timeout; expiry does not cancel the command or authorize a new UUID.
     public func call(_ method: String, _ params: [String: Any] = [:], replyTimeout: TimeInterval? = nil) throws -> [String: Any] {
         let started = ProcessInfo.processInfo.systemUptime
-        var preparationMS: Double = 0
-        defer { if CallTimingLog.enabled { CallTimingLog.write(["scope":"client", "method":method, "preparation_ms":preparationMS, "total_ms":(ProcessInfo.processInfo.systemUptime-started)*1000]) } }
+        let timed = CallTimingLog.enabled
+        var phases: [String: Double] = [:]
+        defer { if timed { Self.logCallTiming(method: method, started: started, phases: phases) } }
         try platformServices.lifecycle.prepare()
         if owner { try platformServices.lifecycle.registerInstalledBuild() }
+        if timed { phases["lifecycle_prepare_ms"] = (ProcessInfo.processInfo.systemUptime - started) * 1000 }
         var command = params
         if command["command_id"] == nil && CommandReply.expectsMutation(method) { command["command_id"] = UUID().uuidString.lowercased() }
         var request: [String: Any] = ["method": method, "params": command, "installation": installation]
@@ -67,15 +77,33 @@ public final class ChecklistClient: @unchecked Sendable {
         request["owner_channel"] = owner
         if let workspace { request["workspace"] = workspace }
         if let nativeContext, !owner { request["native_context"] = nativeContext }
-        if !owner, usesStoredCredential, let token = try platformServices.credentials.readInstallationCredential(installation) { request["credential"] = token }
-        if CallTimingLog.enabled { request["diagnostics_timing"] = true }
+        if !owner, usesStoredCredential {
+            let credentialStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
+            if let token = try platformServices.credentials.readInstallationCredential(installation) { request["credential"] = token }
+            if timed { phases["credential_read_ms"] = (ProcessInfo.processInfo.systemUptime - credentialStarted) * 1000 }
+        }
+        let encodingStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
+        if timed { request["diagnostics_timing"] = true }
         let bytes = try JSONSerialization.data(withJSONObject: request)
-        preparationMS = (ProcessInfo.processInfo.systemUptime-started)*1000
+        if timed {
+            let prepared = ProcessInfo.processInfo.systemUptime
+            phases["request_encode_ms"] = (prepared - encodingStarted) * 1000
+            phases["preparation_ms"] = (prepared - started) * 1000
+        }
         do { return try requestOnce(bytes, replyTimeout: replyTimeout) }
         catch let error as ChecklistError where error.code == "SERVICE_UNAVAILABLE" {
             try platformServices.lifecycle.startService(timeLimit: 8)
             return try requestOnce(bytes, replyTimeout: replyTimeout)
         }
+    }
+
+    private static func logCallTiming(method: String, started: TimeInterval, phases: [String: Double]) {
+        var fields: [String: Any] = phases
+        fields["preparation_ms"] = phases["preparation_ms"] ?? 0
+        fields["scope"] = "client"
+        fields["method"] = method
+        fields["total_ms"] = (ProcessInfo.processInfo.systemUptime - started) * 1000
+        CallTimingLog.write(fields)
     }
 
     // The connection argument preserves the anonymous-listener qualification seam.

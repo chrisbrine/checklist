@@ -49,9 +49,15 @@ extension CommandRouter {
 
     func directionCursorScope(_ db: Database, task: JSON, caller: Caller, attempt: JSON? = nil) throws -> String {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), project = try record(db,pid,type:"project")
-        let directions = try ownerDirections(db,task:task).map { ["id":(try StoredRecord($0, family: "record").requiredValue("id")),"revision":int($0,"revision"),"addressed":bool($0,
+        return try directionCursorScope(db,task:task,caller:caller,attempt:attempt,projectID:pid,project:project,directions:ownerDirections(db,task:task))
+    }
+
+    private func directionCursorScope(
+        _ db: Database, task: JSON, caller: Caller, attempt: JSON?, projectID pid: String, project: JSON, directions: [JSON]
+    ) throws -> String {
+        let directionScope = try directions.map { ["id":(try StoredRecord($0, family: "record").requiredValue("id")),"revision":int($0,"revision"),"addressed":bool($0,
             "addressed")] as JSON }
-        let relevant: JSON = ["brief":project["brief"] ?? "","brief_revision":project["brief_revision"] ?? 0,"decisions":applicableDecisions(project,task:task),"directions":directions]
+        let relevant: JSON = ["brief":project["brief"] ?? "","brief_revision":project["brief_revision"] ?? 0,"decisions":applicableDecisions(project,task:task),"directions":directionScope]
         let round: String
         if let explicitID = attempt?["id"] as? String {round = explicitID}
         else {
@@ -65,13 +71,14 @@ extension CommandRouter {
     func validateDirectionCursor(_ db: Database, params: JSON, task: JSON, caller: Caller, attempt: JSON? = nil) throws {
         let directions = try ownerDirections(db,task:task)
         guard !directions.contains(where: {!bool($0,"addressed")}) else { throw CoreError("USER_DIRECTION_PENDING","An owner direction still needs a permitted response, checkpoint, evidence or explicit attributed waiver.") }
-        let project = try record(db,(try StoredRecord(task, family: "task").string("project_id")),type:"project")
-        let hasContext = !(project["brief"] as? String ?? "").isEmpty || !applicableDecisions(project,task:task).isEmpty || !directions.isEmpty
+        let pid = (try StoredRecord(task, family: "task").string("project_id")), project = try record(db,pid,type:"project")
         guard let supplied = params["direction_cursor"] as? String else {
+            let hasContext = !(project["brief"] as? String ?? "").isEmpty || !applicableDecisions(project,task:task).isEmpty || !directions.isEmpty
             if hasContext { throw CoreError("DIRECTION_CURSOR_REQUIRED","Refresh task context and include its direction cursor before changing the work phase.") }
             return
         }
-        _ = try cursorSequence(db,["cursor":supplied],caller:caller,scope:directionCursorScope(db,task:task,caller:caller,attempt:attempt))
+        let scope = try directionCursorScope(db,task:task,caller:caller,attempt:attempt,projectID:pid,project:project,directions:directions)
+        _ = try cursorSequence(db,["cursor":supplied],caller:caller,scope:scope)
     }
 
     func compactTaskContext(_ db: Database, task: JSON, caller: Caller, directionAttempt: JSON? = nil) throws -> JSON {
@@ -148,7 +155,11 @@ extension CommandRouter {
         result["prior_handler"] = attempts.last(where: {$0["id"] as? String != task["active_attempt_id"] as? String}).map {contextRecord($0,type:"attempt",caller:caller)} ?? NSNull()
         result["handler_recipients"] = try relevantHandlerRecipients(db,task:task)
         result["relation_context"] = try scopedRelationContext(db,task:task)
-        let batches = try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY) ORDER BY rowid DESC LIMIT 11",arguments:[Data(pid.utf8),Data(tid.utf8)]).map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        let batchWindowLimit = 11
+        let batchScope = " FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)"
+        let batchArguments: StatementArguments = [Data(pid.utf8),Data(tid.utf8)]
+        let batches = try self.fetchStoreRows(db,sql:"SELECT " + Self.canonicalRecordColumns + batchScope + " ORDER BY rowid DESC LIMIT \(batchWindowLimit)",arguments:batchArguments)
+            .map { try GRDBRecordEnvelopeAdapter.decode($0).object }
         result["batches"] = try batches.prefix(10).reversed().map {batch -> JSON in
             var reference:JSON=[:]
             for key in ["id","project_id","triage_id","triage_key","triage_name","phase","revision","created_at","digest"] {reference[key]=batch[key]}
@@ -164,7 +175,8 @@ extension CommandRouter {
             reference["snapshot_ref"]=["method":"batch_get","project_id":pid,"batch_id":(try StoredRecord(batch, family: "record").requiredValue("id"))]
             return reference
         }
-        result["batch_count"] = try self.storeInt(db,sql:"SELECT COUNT(*) FROM records WHERE type='batch' AND project_id=CAST(? AS TEXT) AND EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.members')) WHERE json_extract(value,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY)",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
+        result["batch_count"] = batches.count < batchWindowLimit ? batches.count
+            : try self.storeInt(db,sql:"SELECT COUNT(*)" + batchScope,arguments:batchArguments) ?? 0
         result["batches_ref"] = ["method":"task_context","project_id":pid,"task_id":tid,"detail_level":"full"]
         if batches.count > 10 { result["truncated"] = true }
         result["task_sessions"] = try scopedTaskRows(db,type:"task_session",task:task,limit:25,descending:true).map {try taskSessionProjection(db,$0)}

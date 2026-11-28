@@ -43,8 +43,11 @@ public struct LocalPlatformServices: Sendable {
         self.supportedCapabilities = supportedCapabilities
     }
 
-    public static var macOS: LocalPlatformServices {
-        let transport = MacOSLocalCommandTransport()
+    public static var macOS: LocalPlatformServices { macOS(reusingConnection: false) }
+
+    /// Keep one connection from bootstrap through the final read of a one-shot command.
+    public static func macOS(reusingConnection: Bool) -> LocalPlatformServices {
+        let transport = MacOSLocalCommandTransport(reusingConnection: reusingConnection)
         return LocalPlatformServices(transport: transport, lifecycle: MacOSLocalServiceLifecycle(transport: transport),
                                      credentials: MacOSLocalCredentialReader(), supportedCapabilities: Set(LocalPlatformCapability.allCases))
     }
@@ -81,7 +84,20 @@ public struct MacOSLocalCredentialReader: LocalCredentialReader {
 }
 
 public struct MacOSLocalCommandTransport: LocalCommandTransport {
-    public init() {}
+    private let connectionScope: CommandConnectionScope?
+    private let makeConnection: @Sendable () -> NSXPCConnection
+
+    public init(reusingConnection: Bool = false) {
+        self.init(reusingConnection: reusingConnection) {
+            NSXPCConnection(machServiceName: ChecklistInstance.current.machServiceName, options: [])
+        }
+    }
+
+    init(reusingConnection: Bool, makeConnection: @escaping @Sendable () -> NSXPCConnection) {
+        connectionScope = reusingConnection ? CommandConnectionScope() : nil
+        self.makeConnection = makeConnection
+    }
+
     public func request(_ bytes: Data, replyTimeout: TimeInterval?) throws -> [String: Any] {
         try request(bytes, replyTimeout: replyTimeout, connection: nil)
     }
@@ -103,8 +119,18 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         let commandID = (request?["params"] as? [String: Any])?["command_id"] as? String
         func upgradeStatus() -> StorageUpgradeStatus? { suppliedConnection == nil ? StorageUpgradeStatus.read(root: upgradeRoot) : nil }
         if let upgrade = upgradeStatus() { throw upgrade.error(commandID: commandID) }
-        let connection = suppliedConnection ?? NSXPCConnection(machServiceName: ChecklistInstance.current.machServiceName, options: [])
-        connection.remoteObjectInterface = NSXPCInterface(with: ChecklistRPC.self)
+        let borrowed = suppliedConnection == nil ? connectionScope?.acquire(makeConnection) : nil
+        let connection = suppliedConnection ?? borrowed?.lease.connection ?? makeConnection()
+        let reused = borrowed?.reused == true
+        var keepConnection = false
+        defer {
+            if let borrowed, let connectionScope {
+                connectionScope.release(borrowed.lease, keep: keepConnection)
+            } else {
+                connection.invalidate()
+            }
+        }
+        if !reused { connection.remoteObjectInterface = NSXPCInterface(with: ChecklistRPC.self) }
         let semaphore = DispatchSemaphore(value: 0)
         let outcome = OSAllocatedUnfairLock(initialState: (finished: false, response: Optional<Data>.none, error: Optional<Error>.none, receivedAt: Optional<TimeInterval>.none))
         let timed = request?["diagnostics_timing"] as? Bool == true
@@ -117,12 +143,22 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
             }
             if accepted { semaphore.signal() }
         }
-        connection.interruptionHandler = { complete(nil, nil) }
-        connection.invalidationHandler = { complete(nil, nil) }
-        let resumeStarted = timed ? ProcessInfo.processInfo.systemUptime : 0
-        connection.resume()
-        let resumedConnection = timed ? ProcessInfo.processInfo.systemUptime : 0
-        defer { connection.invalidate() }
+        let lease = borrowed?.lease
+        connection.interruptionHandler = { [weak connectionScope, weak lease] in
+            if let lease, connectionScope?.discard(lease) == true { lease.connection.invalidate() }
+            complete(nil, nil)
+        }
+        connection.invalidationHandler = { [weak connectionScope, weak lease] in
+            if let lease { _ = connectionScope?.discard(lease) }
+            complete(nil, nil)
+        }
+        if !reused {
+            if timed { diagnostic["connection_resume_started_uptime_s"] = ProcessInfo.processInfo.systemUptime }
+            connection.resume()
+            if timed { diagnostic["connection_resumed_uptime_s"] = ProcessInfo.processInfo.systemUptime }
+        } else if timed {
+            diagnostic["connection_reused"] = true
+        }
         guard let remote = connection.remoteObjectProxyWithErrorHandler({ error in
             complete(nil, error)
         }) as? ChecklistRPC else { throw ChecklistError("SERVICE_UNAVAILABLE", "XPC service unavailable.") }
@@ -130,8 +166,6 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         diagnostic["connection_setup_ms"] = (sent-started)*1000
         remote.execute(bytes) { value in complete(value, nil) }
         if timed {
-            diagnostic["connection_resume_started_uptime_s"] = resumeStarted
-            diagnostic["connection_resumed_uptime_s"] = resumedConnection
             diagnostic["sent_uptime_s"] = sent
             diagnostic["execute_returned_uptime_s"] = ProcessInfo.processInfo.systemUptime
         }
@@ -158,9 +192,56 @@ public struct MacOSLocalCommandTransport: LocalCommandTransport {
         diagnostic["send_to_reply_ms"] = (ProcessInfo.processInfo.systemUptime-sent)*1000
         diagnostic["round_trip_ms"] = (ProcessInfo.processInfo.systemUptime-started)*1000
         if request?["diagnostics_timing"] as? Bool == true, let object = try? JSONSerialization.jsonObject(with:received) as? [String:Any] { diagnostic["service"] = object["_checklist_timing"] }
-        return try CommandReply.decode(received, method: request?["method"] as? String ?? "", commandID: commandID)
+        let reply = try CommandReply.decode(received, method: request?["method"] as? String ?? "", commandID: commandID)
+        keepConnection = true
+        return reply
+    }
+}
+
+/// Each loan owns the connection's request callbacks until its reply or failure.
+/// Concurrent callers use independent connections and never wait for a loan.
+private final class CommandConnectionScope: @unchecked Sendable {
+    final class Lease: @unchecked Sendable {
+        let connection: NSXPCConnection
+        init(_ connection: NSXPCConnection) { self.connection = connection }
     }
 
+    private let lock = NSLock()
+    private var current: Lease?
+    private var borrowed = false
+
+    deinit { current?.connection.invalidate() }
+
+    func acquire(_ makeConnection: () -> NSXPCConnection) -> (lease: Lease, reused: Bool)? {
+        lock.withLock {
+            guard !borrowed else { return nil }
+            borrowed = true
+            if let current { return (current, true) }
+            let lease = Lease(makeConnection())
+            current = lease
+            return (lease, false)
+        }
+    }
+
+    func release(_ lease: Lease, keep: Bool) {
+        let close = lock.withLock {
+            borrowed = false
+            if current === lease {
+                if keep { return false }
+                current = nil
+            }
+            return true
+        }
+        if close { lease.connection.invalidate() }
+    }
+
+    func discard(_ lease: Lease) -> Bool {
+        lock.withLock {
+            guard current === lease else { return false }
+            current = nil
+            return true
+        }
+    }
 }
 
 public struct MacOSLocalServiceLifecycle: LocalServiceLifecycle {

@@ -208,6 +208,14 @@ def check() -> dict:
     bad = copy.deepcopy(examples['backup-capacity-attention'])
     bad['reason'] = 'snapshot_deadline'
     reject('backup-capacity-attention', bad, 'deadline with capacity error code')
+    for section, field in [('listing', 'missing_count'), ('settlement', 'original_loss'),
+                           ('backup_missing_attachment_attention', 'attachment_id')]:
+        bad = copy.deepcopy(examples['attachment-original-loss'])
+        bad[section].pop(field)
+        reject('attachment-original-loss', bad, section + ' missing ' + field)
+    bad = copy.deepcopy(examples['attachment-original-loss'])
+    bad['settlement']['original_loss']['last_known_size'] = -1
+    reject('attachment-original-loss', bad, 'negative last known size')
     for section, field, value in [('preview', 'path', '/synthetic/outside-backups'),
                                   ('retire', 'include_unrecorded', True),
                                   ('retire', 'preview_sha256', 'not-an-exact-preview'),

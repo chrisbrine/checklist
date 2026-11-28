@@ -91,7 +91,9 @@ extension CommandRouter {
             let type = value["record_type"] as? String ?? ""
             if type == "attachment" {
                 if cleanupJobEqual(value["id"],aid) { continue }
-                if !bool(value,"unlinked"), value["availability"] as? String == "available", mentions(value["path"] ?? "") { holds.insert(.sharedLiveReference) }
+                if value["availability"] as? String == "available",
+                   !bool(value,"unlinked") || value["mode"] as? String == "managed",
+                   mentions(value["path"] ?? "") { holds.insert(.sharedLiveReference) }
                 continue
             }
             if bookkeeping.contains(type) { continue }

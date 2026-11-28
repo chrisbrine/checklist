@@ -1060,7 +1060,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
     /// it creates no change, native delivery or storage deadline to announce.
     /// Keep hooks on other reads that can fall back to the writer.
     static func requiresAfterCommand(_ method:String) -> Bool {
-        !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list","cleanup_job_list","cleanup_job_get"].contains(method)
+        !["service_info","tool_catalog","operation_get","command_status","task_get","session_list","project_list","project_resolve","workspace_page","task_list","triage_list","epic_list","cleanup_job_list","cleanup_job_get","attachment_missing_list"].contains(method)
     }
     private static let writerDependentReads: Set<String> = [
         "attachment_read","attachment_cleanup_preview","media_original_read",

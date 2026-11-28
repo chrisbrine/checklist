@@ -20,6 +20,59 @@ extension EvidenceAuthorityTests {
     }
     func reopenRouter() throws { router = nil; router = try TestStore.router(root: storeRoot) }
 
+    func testCL529LegacyExportJournalCannotRemoveManagedOriginals() throws {
+        let project = try project(), task = try ready(project)
+        let source = directory.appendingPathComponent("export-original.txt")
+        try Data("managed original".utf8).write(to:source)
+        let attachment = try call("attachment_add",["project_id":project["id"]!,"task_id":task["id"]!,"path":source.path])
+        let original = URL(fileURLWithPath:try XCTUnwrap(attachment["path"] as? String))
+        let destination = original.deletingLastPathComponent()
+        XCTAssertThrowsError(try call("export_project",["project_id":project["id"]!,"path":destination.path])) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"EXPORT_PATH_REFUSED")
+        }
+        let pending = ExportPublication(destination:destination,principal:owner.principal,command:uuid(),
+            digest:ChecklistCore.hash(Data("legacy uncommitted export".utf8)),journal:"staging/pending-exports/" + uuid() + ".json")
+        try pending.recordPending(StorageObjectFiles(root:router.root))
+        try pending.writeMarker(in:destination)
+        try reopenRouter()
+        XCTAssertEqual(try Data(contentsOf:original),Data("managed original".utf8))
+    }
+
+    func testCL529EnrolledWorkerListsAndSettlesMissingOriginals() throws {
+        let project = try project(), task = try ready(project)
+        let worker = try native(project,"Missing-original worker",domain:"codex:529:1:0")
+        let source = directory.appendingPathComponent("missing-original.txt")
+        try Data("managed original".utf8).write(to:source)
+        let input: JSON = ["project_id":project["id"]!,"task_id":task["id"]!,"path":source.path]
+        let attachment = try call("attachment_add",input), id = try XCTUnwrap(attachment["id"] as? String)
+        let original = URL(fileURLWithPath:try XCTUnwrap(attachment["path"] as? String))
+        let retained = directory.appendingPathComponent("detached-fixture.txt")
+        let catalog = router.toolCatalog(worker)
+        XCTAssertTrue(catalog.contains {$0["name"] as? String == "attachment_missing_list"})
+        XCTAssertTrue(catalog.contains {$0["name"] as? String == "attachment_missing_settle"})
+        try FileManager.default.moveItem(at:original,to:retained)
+        try FileManager.default.createSymbolicLink(at:original,withDestinationURL:retained)
+        let reportInput: JSON = ["project_id":project["id"]!]
+        let settleInput: JSON = ["project_id":project["id"]!,"attachment_id":id]
+        let uncertain = try call("attachment_missing_list",reportInput,worker)
+        XCTAssertEqual(uncertain["missing_count"] as? Int,0)
+        XCTAssertEqual(uncertain["uncheckable_count"] as? Int,1)
+        XCTAssertThrowsError(try call("attachment_missing_settle",settleInput,worker)) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"MANAGED_ORIGINAL_INSPECTION_FAILED")
+        }
+        try FileManager.default.moveItem(at:original,to:directory.appendingPathComponent("detached-link"))
+        let report = try call("attachment_missing_list",reportInput,worker)
+        let row = try XCTUnwrap((report["attachments"] as? [JSON])?.first)
+        XCTAssertEqual(Set(row.keys),["attachment_id","task_id","revision","state"])
+        XCTAssertEqual(row["state"] as? String,"unsettled")
+        var guarded = settleInput
+        guarded["expected_revision"] = row["revision"]
+        let settled = try call("attachment_missing_settle",guarded,worker)
+        XCTAssertEqual(settled["availability"] as? String,"original_missing")
+        XCTAssertEqual(try call("attachment_missing_list",reportInput,worker)["unsettled_count"] as? Int,0)
+        XCTAssertEqual(try Data(contentsOf:retained),Data("managed original".utf8))
+    }
+
     func testFailedSourceSubmitLeavesNoCaptureAndRetryLeavesOne() throws {
         try sourceFixture()
         let p = try project(), t = try ready(p), a = try claim(p, t)

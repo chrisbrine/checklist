@@ -1,10 +1,14 @@
+import Darwin
 import Foundation
 import os
 
 /// Optional diagnostics outside command parameters and durable receipts.
 /// Durations use the monotonic clock; no credentials, workspace or caller IDs.
 public enum CallTimingLog {
-    public static var enabled: Bool { ProcessInfo.processInfo.environment["CHECKLIST_TIMING"] == "1" }
+    public static var enabled: Bool {
+        guard let value = getenv("CHECKLIST_TIMING") else { return false }
+        return strcmp(value, "1") == 0
+    }
 
     public static func write(_ fields: [String: Any], to output: FileHandle = .standardError) {
         guard let bytes = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) else { return }

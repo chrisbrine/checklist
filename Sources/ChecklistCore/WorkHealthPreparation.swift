@@ -9,6 +9,7 @@ struct WorkHealthApplyTiming {
     private let started = ProcessInfo.processInfo.systemUptime
     var bodyStarted: TimeInterval?
     var bodyFinished: TimeInterval?
+    var validationFinished: TimeInterval?
     var finished: TimeInterval?
     var commitRequested = false
     var completed = false
@@ -30,6 +31,10 @@ struct WorkHealthApplyTiming {
             value["begin_ms"] = (bodyStarted - started) * 1000
             value["body_ms"] = (bodyFinished - bodyStarted) * 1000
             value["validation_and_finish_ms"] = (finished - bodyFinished) * 1000
+            if let validationFinished {
+                value["validation_ms"] = (validationFinished - bodyFinished) * 1000
+                value["commit_or_rollback_ms"] = (finished - validationFinished) * 1000
+            }
         } else {
             value["begin_ms"] = (finished - started) * 1000
         }
@@ -56,6 +61,7 @@ struct WorkHealthPreparedPage {
         let task: JSON
         let action: Action
         let dependencies: WorkHealthPreparationDependencies
+        let references: PreparedTaskReferences?
     }
     let items: [Item]
     let nextPosition: Int64

@@ -666,9 +666,9 @@ extension CommandRouter {
             throw CoreError("INVALID_INPUT", "Submit target-appropriate immutable evidence.")
         }
         evidence.removeValue(forKey: "acceptance_evidence")
-        if let map = try normalizedAcceptanceEvidence(
+        let acceptance = try normalizedAcceptanceEvidence(
             db, params: p, evidence: evidence, task: t, attempt: a, caller: c)
-        {
+        if let map = acceptance.coverage {
             evidence["acceptance_evidence"] = map
         }
         try normalizedEvidenceMeasures(&evidence)
@@ -741,10 +741,10 @@ extension CommandRouter {
             "created_at": now(),
         ]
         if let domain = c.executionDomain { manifest["author_execution_domain"] = domain }
-        manifest["contributors"] = try contributionHistory(db, attempt: a)
-        for var old in try records(db, type: "review_request", project: pid)
-        where old["task_id"] as? String == t["id"] as? String
-            && ["queued", "blocked"].contains(old["state"] as? String ?? "")
+        // Validation may already have loaded the contributor rows in this transaction.
+        manifest["contributors"] = try acceptance.contributors ?? contributionHistory(db, attempt: a)
+        for var old in try scopedTaskRows(db, type: "review_request", task: t)
+        where ["queued", "blocked"].contains(old["state"] as? String ?? "")
         {
             old["state"] = "superseded"
             try save(db, revised(old), type: "review_request")

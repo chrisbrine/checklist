@@ -74,7 +74,7 @@ struct StorageSettingsView: View {
             }
             Section("Last verified backup") {
                 ForEach(StorageSettingsSummary.observation(info["last_verified_backup"])) {row in LabeledContent(row.label,value:row.value)}
-                if let attention = info["backup_capacity_attention"] as? [String: Any] {
+                ForEach(Array(StorageSettingsSummary.backupAttentionItems(info).enumerated()),id: \.offset) { _,attention in
                     Text(StorageSettingsSummary.backupAttentionTitle(attention)).checklistFont(.bodyStrong)
                     if let step = attention["next_step"] as? String {Text(step).checklistFont(.callout)}
                 }

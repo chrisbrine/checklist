@@ -14,7 +14,7 @@ struct NeedsYouView: View {
         let _ = NativeRenderMetrics.body(.needsYou)
         VStack(alignment: .leading, spacing: Spacing.section) {
             Text("Needs You").checklistFont(.pageTitle)
-            if let attention = store.backupCapacityAttention {
+            ForEach(Array(store.backupAttentionItems.enumerated()),id: \.offset) { _,attention in
                 VStack(alignment: .leading, spacing: Spacing.small) {
                     Label(StorageSettingsSummary.backupAttentionTitle(attention.values), systemImage: "externaldrive.badge.exclamationmark")
                         .checklistFont(.bodyStrong)

@@ -33,7 +33,9 @@ The coordinator labels ordinary command turns `command.<method>` and the verifie
 
 An ordinary claim can select task-record row IDs on a separate reader before taking the gate. The writer observes a bounded set of changed row IDs while the reader selects. It pins its transaction snapshot, checks external SQLite changes and compares only touched rows that can change the selection. Each query repeats its authoritative row predicates. Unrelated foreground writes can continue. A stale selection retries once and then uses the original transaction. An already recorded command uses the normal receipt path.
 
-The work-health writer rechecks current waits and delivery authorization. A tick that leaves a pending request unchanged skips rewriting its message. For apply transactions at or above the step limit, `work_health_apply_timing` records UTC, load, time through BEGIN, callback time and the time spent in validation and commit or rollback. The physical hold in the watchdog also covers the rest of the writer callback.
+The work-health reader validates the ticket's status, tags and Epic against its snapshot. The writer checks whether those exact targets changed. It reads the final ticket envelope and compares its typed links. A changed target, link or write set uses full validation before commit. The writer rechecks current waits and delivery authorization. A tick that leaves a pending request unchanged skips rewriting its message. For apply transactions at or above the step limit, `work_health_apply_timing` records UTC, load, time through BEGIN, callback time, validation and commit or rollback. The physical hold in the watchdog also covers the rest of the writer callback.
+
+The watchdog records failed-publication quarantine as `backup_publication_quarantine` on the `snapshot_lease` resource. That interval includes marker publication and the directory rename. A shared manifest lease makes quarantine defer without waiting for the reader.
 
 On SQLite 3.51.3 and later, the service can coalesce notifications at 1,000 WAL frames and checkpoint passively on a separate connection. The writer keeps FULL sync for each commit. A checkpoint may copy only through the oldest visible reader snapshot. A later commit can arrange another pass. Startup leaves the inline checkpoint in place if it cannot validate the separate connection. Older SQLite runtimes also keep the inline checkpoint. [SQLite WAL and runtime compatibility](https://www.sqlite.org/wal.html#the_wal_reset_bug)
 
@@ -232,3 +234,17 @@ the edit's multi-second hold. Status took 184.718 ms and Triage list took
 250 ms physical limit. The first successful status request started before
 readiness and took 5.986 s. Later status replies during the initial prune
 window reached at most 59.738 ms.
+
+Full Triage list reads seek same-project member IDs in one read snapshot.
+They visit each requested membership and batch history family once. Batch
+lifecycle selects the first row in the original order and retains the legacy
+attempt fallback. A selected single Triage keeps the individual projection.
+The native owner's change subscription stays outside the worker catalog.
+
+Submission selects the ticket's own review requests and contributor attempts
+before decoding their envelopes. Gate completion validates the original
+project-wide inputs so a malformed record rolls back the verdict. A frozen batch
+still checks its complete exact active set in the writer. Its scope,
+revision, phase, digest, claim-token and original-command checks remain
+authoritative, including an unexpected active claim outside the frozen
+member list.

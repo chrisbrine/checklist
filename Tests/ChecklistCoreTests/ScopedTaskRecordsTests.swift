@@ -68,6 +68,13 @@ final class ScopedTaskRecordsTests:XCTestCase {
     }
     func testCompactBatchReferencesStayScopedAndFullContinuationRetainsNewestBatch()throws {
         let other=try call("task_create",["project_id":pid,"title":"Unrelated"])["id"] as! String
+        func seedBatches(_ range: Range<Int>, in db: Database) throws {
+            for i in range {
+                try router.save(db,["id":"batch-\(i)","project_id":pid,"phase":"implementation",
+                    "members":[["task_id":tid,"task_revision":1]],"revision":1,
+                    "created_at":"2026-01-01T00:00:00Z"],type:"batch")
+            }
+        }
         try write {db in
             try router.save(db,["id":"scoped-epic","project_id":pid,"kind":"epic","name":"Selected Epic","revision":1],type:"group")
             try router.save(db,["id":"scoped-triage","project_id":pid,"kind":"triage","name":"Selected Triage","phase":"implementation","members":[["task_id":tid]],"revision":1],type:"group")
@@ -75,19 +82,23 @@ final class ScopedTaskRecordsTests:XCTestCase {
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,?,?,?)",arguments:["corrupt-unrelated-task",pid,"task",1,try jsonString(["id":"different-task","project_id":pid,"status_id":task["status_id"]!,"revision":1])])
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,?,?,?)",arguments:["corrupt-unrelated-membership",pid,"triage_membership_interval",1,try jsonString(["id":"different-membership","project_id":pid,"triage_id":"unrelated","revision":1])])
             try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,?,?,?)",arguments:["corrupt-unrelated-attempt",pid,"attempt",1,try jsonString(["id":"different","project_id":pid,"task_id":other,"revision":1])])
-            for i in 0..<11 {try router.save(db,["id":"batch-\(i)","project_id":pid,"phase":"implementation","members":[["task_id":tid,"task_revision":1]],"revision":1,"created_at":"2026-01-01T00:00:00Z"],type:"batch")}
+            try seedBatches(0..<9,in:db)
         }
         let worker=Caller(role:"worker",installation:"scoped-worker",projectIDs:[pid],workspace:root.path)
+        let short = try call("task_context",["project_id":pid,"task_id":tid],worker)
+        XCTAssertEqual(short["batch_count"] as? Int,9)
+        XCTAssertEqual((short["batches"] as? [JSON])?.count,9)
+        try write { try seedBatches(9..<13,in:$0) }
         let summary=try call("task_context",["project_id":pid,"task_id":tid],worker),refs=summary["batches"] as! [JSON]
         XCTAssertEqual((summary["epic"] as? JSON)?["id"] as? String,"scoped-epic")
         XCTAssertEqual((summary["triages"] as? [JSON])?.first?["id"] as? String,"scoped-triage")
-        XCTAssertEqual(summary["batch_count"] as? Int,11);XCTAssertEqual(refs.count,10)
-        XCTAssertEqual(refs.last?["id"] as? String,"batch-10");XCTAssertEqual(refs.first?["id"] as? String,"batch-1")
+        XCTAssertEqual(summary["batch_count"] as? Int,13);XCTAssertEqual(refs.count,10)
+        XCTAssertEqual(refs.last?["id"] as? String,"batch-12");XCTAssertEqual(refs.first?["id"] as? String,"batch-3")
         XCTAssertTrue(refs.allSatisfy{$0["outcomes_loaded"] as? Bool==false && $0["members_complete"] as? Bool==false})
         XCTAssertTrue(refs.allSatisfy{$0["triage_key"] is NSNull},"Legacy batches without a Triage ID have no display key.")
         let full=try call("task_context",["project_id":pid,"task_id":tid,"detail_level":"full"],worker)
         let ids=(full["records"] as! [JSON]).filter{$0["record_type"] as? String=="batch"}.compactMap{$0["id"] as? String}
-        XCTAssertEqual(ids.count,11);XCTAssertEqual(Set(ids).count,11);XCTAssertTrue(ids.contains("batch-0"));XCTAssertTrue(ids.contains("batch-10"))
+        XCTAssertEqual(ids.count,13);XCTAssertEqual(Set(ids).count,13);XCTAssertTrue(ids.contains("batch-0"));XCTAssertTrue(ids.contains("batch-12"))
         XCTAssertFalse(try jsonString(summary).contains("corrupt-unrelated-attempt"))
     }
     func testOptionalTriageKeysAndSubjectsTolerateMissingOrCorruptReferences()throws {

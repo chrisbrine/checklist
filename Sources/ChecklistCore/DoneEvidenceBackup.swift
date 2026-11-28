@@ -129,7 +129,7 @@ extension CommandRouter {
     private func addDoneEvidenceBackupFailure(_ error: JSON,to value: inout JSON) {
         value["error_code"] = error["code"]
         let details = error["details"] as? JSON ?? [:]
-        for key in ["reason","next_step","command_outcome"] {value[key] = details[key]}
+        for key in ["reason","next_step","command_outcome"] + Self.backupMissingAttachmentFields {value[key] = details[key]}
     }
     private func saveDoneEvidenceBackupStatus(_ value: JSON) throws {
         try dbQueue.writeWithoutTransaction {db in

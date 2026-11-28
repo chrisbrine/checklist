@@ -189,6 +189,58 @@ final class ChecklistInstanceTests: XCTestCase {
         XCTAssertThrowsError(try ChecklistInstance.read(executable:contents.appendingPathComponent("MacOS/checklist")))
         XCTAssertNil(try ChecklistInstance.read(executable:directory.appendingPathComponent(".build/debug/checklist")).slot)
     }
+    func testExecutableAliasesResolveBeforeBundleMetadataIsRead() throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let contents = directory.appendingPathComponent("Startup.app/Contents")
+        let executable = contents.appendingPathComponent("MacOS/checklist")
+        try files.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: executable)
+        try PropertyListSerialization.data(fromPropertyList: [:], format: .xml, options: 0)
+            .write(to: contents.appendingPathComponent("Info.plist"))
+
+        var target = executable
+        for index in 0..<4 {
+            let alias = directory.appendingPathComponent("helper-\(index)")
+            try files.createSymbolicLink(at: alias, withDestinationURL: target)
+            let resolved = alias.resolvingSymlinksInPath()
+            let legacyBundle = resolved.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            let result = try ChecklistInstance.read(executable: alias)
+            XCTAssertEqual(result.bundleURL, legacyBundle)
+            XCTAssertNil(result.slot)
+            target = alias
+        }
+    }
+
+    func testDelegateExecutableIsResolvedOnlyAfterTheExpectationMatches() throws {
+        let bundle = home.appendingPathComponent("Unpublished-\(UUID().uuidString).app")
+        let instance = try ChecklistInstance(bundleURL: bundle, home: home, environment: [:])
+        let key = DelegateInstanceExpectation.environmentKey
+        var resolutions = 0
+        func resolve() -> URL {
+            resolutions += 1
+            return bundle.appendingPathComponent("Contents/MacOS/checklist")
+        }
+
+        try DelegateInstanceExpectation.verifyIfPresent(instance: instance, executable: resolve(), environment: [:])
+        let wrongBundle = try DelegateInstanceExpectation(instance: instance, bundleRoot: home).encoded()
+        for raw in ["", "{", wrongBundle] {
+            XCTAssertThrowsError(try DelegateInstanceExpectation.verifyIfPresent(instance: instance,
+                executable: resolve(), environment: [key: raw])) { error in
+                XCTAssertEqual((error as? ChecklistError)?.code, "DELEGATE_INSTANCE_MISMATCH")
+            }
+        }
+        XCTAssertEqual(resolutions, 0)
+
+        let matching = try DelegateInstanceExpectation(instance: instance, bundleRoot: bundle.resolvingSymlinksInPath()).encoded()
+        XCTAssertThrowsError(try DelegateInstanceExpectation.verifyIfPresent(instance: instance,
+            executable: resolve(), environment: [key: matching])) { error in
+            XCTAssertEqual((error as? ChecklistError)?.code, "DELEGATE_INSTANCE_MISMATCH")
+        }
+        XCTAssertEqual(resolutions, 1, "A matching expectation still checks the executable and requires its plist.")
+    }
+
     func testMissingMalformedUnreadableAndDanglingPlistsRefuse() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at:directory) }

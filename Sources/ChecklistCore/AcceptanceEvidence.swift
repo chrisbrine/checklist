@@ -18,10 +18,10 @@ enum AcceptanceEvidence {
 extension CommandRouter {
     /// Submission coverage is an evidence index, not a review verdict. Recheck in the
     /// transaction even when preparation already refused uncovered source-copy plans.
-    func normalizedAcceptanceEvidence(_ db: Database,params: JSON,evidence: JSON,task: JSON,attempt: JSON,caller: Caller) throws -> [JSON]? {
-        guard !caller.isOwner else { return nil }
+    func normalizedAcceptanceEvidence(_ db: Database,params: JSON,evidence: JSON,task: JSON,attempt: JSON,caller: Caller) throws -> (coverage: [JSON]?, contributors: [JSON]?) {
+        guard !caller.isOwner else { return (nil, nil) }
         let acceptance = strings(task,"acceptance")
-        guard !acceptance.isEmpty else { return [] }
+        guard !acceptance.isEmpty else { return ([], nil) }
         let raw: [JSON]
         if let value = params["acceptance_evidence"] {
             guard let entries = value as? [JSON],entries.count <= 100 else { throw CoreError("INVALID_INPUT","acceptance_evidence must contain at most 100 item objects.") };raw = entries
@@ -101,7 +101,7 @@ extension CommandRouter {
             }.joined(separator:"; ")
             throw CoreError("ACCEPTANCE_EVIDENCE_MISSING","Uncovered acceptance items: " + summary,details:["uncovered_items":missing])
         }
-        return normalized
+        return (normalized, contributors)
     }
     func acceptanceArtifactRefs(_ evidence: JSON) -> [JSON] {
         (evidence["acceptance_evidence"] as? [JSON] ?? []).flatMap {$0["evidence_refs"] as? [JSON] ?? []}.compactMap { ref in

@@ -147,8 +147,13 @@ extension CommandRouter {
               let attachmentID = job["attachment_id"] as? String, let pid = job["project_id"] as? String else { return }
         let jobID = try StoredRecord(job, family: "storage_job").string("id")
         do {
-            guard try managedImportReceipt(db, principal: principal, command: command, digest: digest) == nil,
-                  (try? scoped(db, attachmentID, pid, type: "attachment")) == nil else { return }
+            guard try managedImportReceipt(db, principal: principal, command: command, digest: digest) == nil else {return}
+            do {
+                _ = try scoped(db,attachmentID,pid,type:"attachment")
+                return
+            } catch let error as CoreError where error.code == "NOT_FOUND" {
+                // Path references are still checked before any unlink below.
+            }
             for object in (job["objects"] as? [JSON] ?? []) {
                 for field in ["stage", "final"] {
                     guard let path = object[field] as? String, path.hasPrefix(field == "stage" ? "staging/attachment-imports/" : "objects/") else { continue }
@@ -175,6 +180,9 @@ extension CommandRouter {
 
     func removeManagedFile(_ files: StorageObjectFiles, relative: String) throws -> Bool {
         try StorageSnapshotRetention.requireNoCapture(root:files.root)
+        guard relative.hasPrefix("staging/") else {
+            throw CoreError("CLEANUP_PATH_REFUSED","A staging cleanup can remove only a staged file.")
+        }
         let (directory, name) = try files.parent(relative); defer { Darwin.close(directory) }
         var info = stat()
         if fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) != 0 { if errno == ENOENT { return false }; throw CoreError("CLEANUP_IO", "A pending file could not be inspected.") }
@@ -184,6 +192,9 @@ extension CommandRouter {
 
     func removeManagedTree(_ files: StorageObjectFiles, relative: String) throws -> Bool {
         try StorageSnapshotRetention.requireNoCapture(root:files.root)
+        guard relative.hasPrefix("source-captures/") else {
+            throw CoreError("CLEANUP_PATH_REFUSED","A capture cleanup can remove only a source capture directory.")
+        }
         let parentFD: Int32, name: String
         do { (parentFD, name) = try files.parent(relative) } catch { if errno == ENOENT { return false }; throw error }
         defer { Darwin.close(parentFD) }

@@ -733,7 +733,7 @@ extension CommandRouter {
             guard let previous = observation[path],previous.identity == (try? managedIdentity(path)) else {throw MaintenanceStepDeferred()}
             guard previous.verified else {throw managedImportFailure("object_observation_failed")}
         }
-        let originalSettledByCleanup = ["original_cleaned","original_missing"].contains(attachment["availability"] as? String ?? "")
+        let originalSettledByCleanup = ["original_cleaned","original_missing",Self.originalCleanupPending].contains(attachment["availability"] as? String ?? "")
         if !originalSettledByCleanup {
             do {try verify(original)}
             catch {

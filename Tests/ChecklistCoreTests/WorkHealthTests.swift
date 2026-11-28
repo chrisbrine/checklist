@@ -75,6 +75,76 @@ extension EvidenceAuthorityTests {
         }
     }
 
+    func testWorkHealthProgressMatchesScopedAttemptTreeAndRefreshesInsertedRows() throws {
+        let project = try project(), task = try ready(project), unrelated = try ready(project)
+        let worker = try native(project,"health-selected-tree",domain:"health-selected-tree")
+        let attempt = try claim(project,task,caller:worker)
+        let projectID = try XCTUnwrap(project["id"] as? String)
+        let taskID = try XCTUnwrap(task["id"] as? String)
+        let unrelatedID = try XCTUnwrap(unrelated["id"] as? String)
+        let root = try XCTUnwrap(attempt["id"] as? String)
+        let active = uuid(), released = uuid(), inserted = uuid()
+        func stamp(_ second: Int) -> String { String(format:"2026-01-01T00:00:%02dZ",second) }
+        func fixtureAttempt(_ id: String, project: String, task: String, parent: String?, state: String, second: Int) -> JSON {
+            var value: JSON = ["id":id,"project_id":project,"task_id":task,"state":state,
+                               "revision":1,"health_progress_at":stamp(second)]
+            value["parent_attempt_id"] = parent
+            return value
+        }
+        // Exercise the actual SQLite inserted row ID used by the claim path.
+        let originalStatement = router.fixtureStoreStatement
+        router.fixtureStoreStatement = nil
+        defer {router.fixtureStoreStatement = originalStatement}
+        try healthWrite {db in
+            var parent = try router.record(db,root,type:"attempt")
+            parent["health_progress_at"] = stamp(1)
+            try router.save(db,parent,type:"attempt")
+            try router.save(db,fixtureAttempt(active,project:projectID,task:taskID,parent:root,state:"active",second:2),type:"attempt")
+            try router.save(db,fixtureAttempt(released,project:projectID,task:taskID,parent:active,state:"released",second:3),type:"attempt")
+            try router.save(db,fixtureAttempt(uuid(),project:projectID,task:taskID,parent:nil,state:"released",second:55),type:"attempt")
+            try router.save(db,fixtureAttempt(uuid(),project:uuid(),task:taskID,parent:root,state:"active",second:56),type:"attempt")
+            for second in 30...50 {
+                try router.save(db,fixtureAttempt(uuid(),project:projectID,task:unrelatedID,parent:root,state:"active",second:second),type:"attempt")
+            }
+            let stored = try router.record(db,taskID,type:"task")
+            let display: JSON = ["active_attention":true,"prerequisite_blockers":[] as [JSON]]
+            func progress() throws -> String {
+                let view = try router.workHealthView(db,task:stored,selectedProjection:display)
+                XCTAssertEqual(view["last_progress_clock"] as? String,"ticket_attempt")
+                return try XCTUnwrap(view["last_progress_at"] as? String)
+            }
+            let baseline = try progress()
+            XCTAssertEqual(baseline,stamp(3))
+            let selection = try router.prepareTaskRecordSelection(db,task:stored,types:["attempt"])
+            var queries: [String] = []
+            db.trace { event in
+                if case .statement(let statement) = event,statement.sql.contains("WITH RECURSIVE tree(id,data)") {
+                    queries.append(statement.expandedSQL)
+                }
+            }
+            defer {db.trace(nil)}
+            try router.withTaskRecordSelectionSnapshot(db,snapshot:selection) {
+                XCTAssertEqual(try progress(),baseline)
+                var next = fixtureAttempt(inserted,project:projectID,task:taskID,parent:released,state:"active",second:4)
+                try router.save(db,next,type:"attempt")
+                XCTAssertEqual(try progress(),stamp(4),"The inserted descendant is visible to the prepared claim selection")
+                next["health_progress_at"] = stamp(5)
+                try router.save(db,next,type:"attempt")
+                XCTAssertEqual(try progress(),stamp(5),"An existing attempt write invalidates the prepared selection")
+            }
+            XCTAssertEqual(try progress(),stamp(5))
+            guard queries.count == 4 else {return XCTFail("Expected four traced work-health progress queries")}
+            XCTAssertTrue(queries[0].contains("CROSS JOIN json_each"))
+            XCTAssertTrue(queries[1].contains("CROSS JOIN json_each"))
+            XCTAssertFalse(queries[2].contains("CROSS JOIN json_each"))
+            let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + queries[1])
+            XCTAssertTrue(plan.contains {($0["detail"] as String).contains("a USING INTEGER PRIMARY KEY")})
+            try db.execute(sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (?,?,'attempt',1,'{not json')",
+                           arguments:[uuid(),projectID])
+            XCTAssertEqual(try router.withTaskRecordSelection(db,tasks:[stored]) {try progress()},stamp(5))
+        }
+    }
+
     func testWorkHealthPagesYieldAndResumeWithoutSkippingCandidates() throws {
         let p = try project(), template = try ready(p)
         var ids: [String] = []

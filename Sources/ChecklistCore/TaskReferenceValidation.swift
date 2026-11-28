@@ -40,10 +40,23 @@ private struct CurrentTaskReference {
     var key: TaskReferenceKey { .init(project: Data(project.utf8), type: type, id: Data(id.utf8)) }
 }
 
+/// The reader has validated these target envelopes. A caller may supply this
+/// proof only after fencing the exact target IDs through the writer snapshot.
+struct PreparedTaskReferences {
+    fileprivate let project: Data
+    fileprivate let task: Data
+    fileprivate let keys: Set<TaskReferenceKey>
+
+    let targetIDs: Set<Data>
+}
+
 extension CommandRouter {
     /// The only outer commit owner validates after its complete callback. Nested
     /// calls share the frame and restore its snapshot with an actual savepoint.
-    func withValidatedDomainTransaction(_ db: Database, deadline: MaintenanceDeadline? = nil, _ body: () throws -> Database.TransactionCompletion) throws {
+    func withValidatedDomainTransaction(_ db: Database, deadline: MaintenanceDeadline? = nil,
+                                        preparedReferences: (() -> PreparedTaskReferences?)? = nil,
+                                        validationFinished: (() -> Void)? = nil,
+                                        _ body: () throws -> Database.TransactionCompletion) throws {
         if let frame = taskReferenceFrame {
             guard frame.database == ObjectIdentifier(db), db.isInsideTransaction else { throw referenceBoundaryFailure() }
             let snapshot = frame.projects
@@ -71,7 +84,9 @@ extension CommandRouter {
             try deadline?.check()
             let completion = try body()
             if case .commit = completion {
-                try validateCurrentTaskReferences(db, frame)
+                defer { validationFinished?() }
+                try deadline?.check()
+                try validateCurrentTaskReferences(db, frame, deadline: deadline, prepared: preparedReferences?())
                 try deadline?.check()
             }
             return completion
@@ -118,7 +133,16 @@ extension CommandRouter {
         }
     }
 
-    private func validateCurrentTaskReferences(_ db: Database, _ frame: TaskReferenceFrame) throws {
+    func prepareTaskReferences(_ db: Database, task: DecodedEnvelope) throws -> PreparedTaskReferences {
+        let project = try StoredRecord(task.object, family: "task").string("project_id")
+        var references: [TaskReferenceKey: CurrentTaskReference] = [:]
+        for reference in try currentReferences(task) { references[reference.key] = reference }
+        try validateTaskReferenceTargets(db, references, deadline: nil)
+        return .init(project: Data(project.utf8), task: Data(task.id.utf8), keys: Set(references.keys), targetIDs: Set(references.keys.map(\.id)))
+    }
+
+    private func validateCurrentTaskReferences(_ db: Database, _ frame: TaskReferenceFrame,
+                                               deadline: MaintenanceDeadline?, prepared: PreparedTaskReferences?) throws {
         guard frame.database == ObjectIdentifier(db), db.isInsideTransaction else { throw referenceBoundaryFailure() }
         guard !frame.projects.isEmpty else { return }
         var selected: [TaskReferenceKey: DecodedEnvelope] = [:]
@@ -126,6 +150,7 @@ extension CommandRouter {
         for (projectKey, work) in frame.projects.sorted(by: { $0.key.lexicographicallyPrecedes($1.key) }) {
             func consume(_ rows: [Row]) throws {
                 for row in rows {
+                    try deadline?.check()
                     let position: Int64 = row["_reference_position"]
                     guard seenRows.insert(position).inserted else { continue }
                     let task = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: "task")
@@ -134,11 +159,13 @@ extension CommandRouter {
                 }
             }
             for ids in referenceChunks(referenceOrder(work.tasks)) {
+                try deadline?.check()
                 let sql = "SELECT rowid AS _reference_position," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND id IN (" + referencePlaceholders(ids.count) + ") ORDER BY rowid"
                 try consume(referenceRows(db, sql: sql, arguments: referenceArguments(work.project, ids), count: ids.count))
             }
             for type in ["status", "tag", "group"] {
                 for ids in referenceChunks(referenceOrder(work.targets[type] ?? [:])) {
+                    try deadline?.check()
                     let candidate = inboundReferenceCandidate(type, placeholders: referencePlaceholders(ids.count))
                     let sql = "SELECT rowid AS _reference_position," + Self.canonicalRecordColumns + " FROM records WHERE type='task' AND project_id=CAST(? AS TEXT) AND (" + candidate + ") ORDER BY rowid"
                     try consume(referenceRows(db, sql: sql, arguments: referenceArguments(work.project, ids), count: ids.count))
@@ -150,8 +177,21 @@ extension CommandRouter {
         }
         var references: [TaskReferenceKey: CurrentTaskReference] = [:]
         for task in selected.values {
+            try deadline?.check()
             for reference in try currentReferences(task) { references[reference.key] = reference }
         }
+        // The actual final task envelope and its exact typed links still
+        // define the commit. A different write set needs ordinary validation.
+        if let prepared, frame.projects.count == 1, let project = frame.projects[prepared.project],
+           project.targets.isEmpty, project.tasks.count == 1, project.tasks[prepared.task] != nil,
+           Set(references.keys) == prepared.keys {
+            return
+        }
+        try validateTaskReferenceTargets(db, references, deadline: deadline)
+    }
+
+    private func validateTaskReferenceTargets(_ db: Database, _ references: [TaskReferenceKey: CurrentTaskReference],
+                                              deadline: MaintenanceDeadline?) throws {
         // Bulk target reads are grouped by exact project/type, in bounded chunks.
         // No per-save FK walk, global scan or per-task target refetch is added.
         var groups: [TaskReferenceScope: [Data: String]] = [:]
@@ -162,10 +202,12 @@ extension CommandRouter {
         var targets: [TaskReferenceKey: DecodedEnvelope] = [:]
         for (group, ids) in groups {
             for chunk in referenceChunks(referenceOrder(ids)) {
+                try deadline?.check()
                 var values: [DatabaseValueConvertible] = [group.project, Data(group.type.utf8)]
                 values += chunk.map { Data($0.utf8) as DatabaseValueConvertible }
                 let sql = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT) AND id IN (" + referencePlaceholders(chunk.count) + ") ORDER BY rowid"
                 for row in try referenceRows(db, sql: sql, arguments: StatementArguments(values), count: chunk.count) {
+                    try deadline?.check()
                     let target = try GRDBRecordEnvelopeAdapter.decode(row, expectedType: group.type)
                     let project = try StoredRecord(target.object, family: "reference_target").string("project_id")
                     targets[.init(project: Data(project.utf8), type: target.type, id: Data(target.id.utf8))] = target

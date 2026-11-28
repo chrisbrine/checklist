@@ -78,7 +78,10 @@ extension CommandRouter {
             }
             info["caller"] = callerInfo
             info["native_recovery"] = try nativeResumptionRecovery(db,caller:c,projects:c.projectIDs)
-            if c.isOwner {info["backup_capacity_attention"] = try backupCapacityAttention(db) as Any? ?? NSNull()}
+            if c.isOwner {
+                info["backup_capacity_attention"] = try backupCapacityAttention(db) as Any? ?? NSNull()
+                info["backup_missing_attachment_attention"] = try backupMissingAttachmentAttention(db) as Any? ?? NSNull()
+            }
             if let version = readSnapshotCache.readVersion(db) {info["read_version"] = version}
             return info
         case "tool_catalog": return ["tools":toolCatalog(c)]
@@ -202,6 +205,8 @@ extension CommandRouter {
         case "cleanup_job_list","cleanup_job_get","cleanup_job_cancel","cleanup_job_retry": return try archiveCleanupJobCommand(db,p,c,method)
         case "attachment_read_release": return try releaseAttachmentRead(db,p,c)
         case "attachment_add", "attachment_update": return try attachmentWrite(db,p,c,method)
+        case "attachment_missing_list": return try listMissingAttachmentOriginals(db,p,c)
+        case "attachment_missing_settle": return try settleMissingAttachmentOriginal(db,p,c)
         case "attachment_list", "attachment_read", "attachment_cleanup_preview": return try attachmentRead(db,p,c,method)
         case "import_preview", "import_commit", "import_rollback", "import_receipt_get": throw CoreError("STORAGE_BOUNDARY_REQUIRED","Project import runs through the prepared transfer boundary.")
         case "export_project": return try exportProject(db,p,c)

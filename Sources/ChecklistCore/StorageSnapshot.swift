@@ -126,7 +126,10 @@ enum StorageSnapshot {
                 try budget.notify("inventory_started")
                 (inventory, schema, families, tables) = try copy.read { db in
                     _ = try SchemaMigrations.inspect(db)
-                    return (try StorageSnapshotAuthority.inventory(db, root: source, budget: budget, retainedExists: { try sourceFiles.regularOrLinkExists($0) }), try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
+                    let inventory = try StorageSnapshotAuthority.inventory(db,root:source,budget:budget,
+                        checkUnsettledOriginal:sourceFiles.regularFileExists,
+                        retainedExists:{try sourceFiles.regularOrLinkExists($0)})
+                    return (inventory, try Int.fetchOne(db, sql: "PRAGMA user_version") ?? -1, try recordFamilyCounts(db), try tableCounts(db))
                 }
                 try copy.close()
                 try budget.notify("inventory_finished")

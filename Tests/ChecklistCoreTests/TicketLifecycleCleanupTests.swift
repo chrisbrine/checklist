@@ -131,6 +131,28 @@ final class TicketLifecycleCleanupTests: XCTestCase {
         }
         XCTFail("Fixture deletion did not settle")
     }
+
+    func testCL529DoneCleanupOutcomeRollbackNeverLeavesAnAvailableOriginal() throws {
+        let (_,_,attachment) = try fixture()
+        try pass()
+        try router.dbQueue.writeWithoutTransaction { db in
+            try db.execute(sql:"""
+                CREATE TEMP TRIGGER reject_cleanup_outcome BEFORE INSERT ON events
+                WHEN NEW.kind='ticket_evidence_cleanup_outcome'
+                BEGIN SELECT RAISE(ABORT,'fixture outcome write failed'); END
+                """)
+        }
+        try router.runTicketObjectDeletionCohort()
+        XCTAssertFalse(FileManager.default.fileExists(atPath:attachment["path"] as! String))
+        let stored = try router.dbQueue.read {try router.record($0,attachment["id"] as! String,type:"attachment")}
+        XCTAssertNotEqual(stored["availability"] as? String,"available")
+        try router.dbQueue.writeWithoutTransaction { db in
+            try db.execute(sql:"DROP TRIGGER reject_cleanup_outcome")
+        }
+        try finish()
+        let recovered = try router.dbQueue.read {try router.record($0,attachment["id"] as! String,type:"attachment")}
+        XCTAssertEqual(recovered["availability"] as? String,"original_missing")
+    }
     // Deletion-engine fixtures inspect the full internal projection. Public read
     // summary/detail paging is covered separately by TicketCleanupReceiptReadTests.
     func receipts(_ p: JSON) throws -> [JSON] {

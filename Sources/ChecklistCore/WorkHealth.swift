@@ -90,16 +90,24 @@ extension CommandRouter {
         if target["kind"] as? String == "attempt" {
             // The accepted tree is capped at 32 descendants by work authority.
             // Include released accepted children too: their completed work is progress.
+            // Borrow only a complete existing attempt selection. Other health
+            // readers keep this query's legacy malformed-row handling.
+            let selected = try selectedTaskRecordIDs(db,type:"attempt",task:task,prepareIfNeeded:false)
+            let source = selected == nil ? "records a JOIN tree p ON "
+                : "tree p CROSS JOIN json_each(?) candidate CROSS JOIN records a ON a.rowid=candidate.value AND "
             let sql = """
                 WITH RECURSIVE tree(id,data) AS (
                   SELECT id,data FROM records WHERE type='attempt' AND project_id=? AND id=? AND CASE WHEN json_valid(data) THEN 1 ELSE 0 END
-                  UNION ALL SELECT a.id,a.data FROM records a JOIN tree p ON CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.parent_attempt_id') END=p.id
+                  UNION ALL SELECT a.id,a.data FROM \(source)CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.parent_attempt_id') END=p.id
                   WHERE a.type='attempt' AND a.project_id=? AND CASE WHEN json_valid(a.data) THEN json_extract(a.data,'$.task_id') END=?
                 ) SELECT data FROM tree
                 """
+            var arguments: [DatabaseValueConvertible] = [pid,try StoredRecord(target,family:"health_target").string("id")]
+            if let selected { arguments.append(try jsonString(selected)) }
+            arguments += [pid,try StoredRecord(task,family:"task").string("id")]
             let latest = try storeDouble(db,
                 sql: "SELECT MAX(checklist_timestamp(COALESCE(json_extract(data,'$.health_progress_at'),json_extract(data,'$.last_checkpoint'),json_extract(data,'$.started_at')))) FROM (" + sql +
-                    ")", arguments: [pid, (try StoredRecord(target, family: "health_target").string("id")), pid, (try StoredRecord(task, family: "task").string("id"))])
+                    ")", arguments: StatementArguments(arguments))
             return (latest.map { Date(timeIntervalSince1970: $0) }, "ticket_attempt")
         }
         if let gid = target["triage_id"] as? String,
@@ -350,9 +358,12 @@ extension CommandRouter {
             let outcome = try withMaintenanceWriter(label: "work_health_apply") {db,deadline in
                 admitted = true
                 var result = CandidateOutcome.stale
+                var validatedReferences: PreparedTaskReferences?
                 timing = WorkHealthApplyTiming()
                 defer { timing?.finished = ProcessInfo.processInfo.systemUptime }
-                try withValidatedDomainTransaction(db,deadline:deadline) {
+                try withValidatedDomainTransaction(db,deadline:deadline,preparedReferences:{validatedReferences},validationFinished:{
+                    timing?.validationFinished = ProcessInfo.processInfo.systemUptime
+                }) {
                     timing?.bodyStarted = ProcessInfo.processInfo.systemUptime
                     defer { timing?.bodyFinished = ProcessInfo.processInfo.systemUptime }
                     guard let current = try fence.readSnapshot(db,version:version,previous:journal) else {
@@ -361,6 +372,11 @@ extension CommandRouter {
                     }
                     journal = current
                     guard try workHealthPreparationIsCurrent(db,changes:current.changes,dependencies:item.dependencies) else {return .rollback}
+                    // Unrelated captures may revise the same Epic. Revalidate
+                    // a changed reference at commit without deferring health.
+                    if let references = item.references, references.targetIDs.isDisjoint(with:current.changedIDs) {
+                        validatedReferences = references
+                    }
                     switch item.action {
                     case .unheld(let category):
                         try fence.stop(db)
@@ -436,9 +452,14 @@ extension CommandRouter {
                     """, arguments: [position,pageLimit])
         var dependencyRows = 0,dependencyBytes = 0
         let items = try rows.map {row -> WorkHealthPreparedPage.Item in
-            let task = try GRDBRecordEnvelopeAdapter.decode(row).object
+            let envelope = try GRDBRecordEnvelopeAdapter.decode(row)
+            let task = envelope.object
             let action: WorkHealthPreparedPage.Action
-            if let category = try healthUnheldCategory(db,task:task) {action = .unheld(category)}
+            if task["epic_id"] == nil || task["epic_id"] is NSNull {
+                // Retained pre-Epic tickets stay readable. Skip their advisory
+                // mutation while a later candidate still gets its own turn.
+                action = .skip
+            } else if let category = try healthUnheldCategory(db,task:task) {action = .unheld(category)}
             // Advisory attention retains orchestration/sibling handling.
             else if try selectedTaskActiveAttention(db,task:task) {
                 let target = try workHealthTarget(db,task:task)
@@ -446,11 +467,19 @@ extension CommandRouter {
                     reading:try healthProgressReading(db,task:task,target:target),
                     token:try healthProgressToken(db,task:task,target:target)))
             } else {action = .skip}
+            let references: PreparedTaskReferences?
+            switch action {
+            case .skip: references = nil
+            case .unheld, .inspect:
+                // A corrupt legacy reference is still reported only if the
+                // candidate tries to save the task, as before preparation.
+                references = try? prepareTaskReferences(db,task:envelope)
+            }
             var dependencies = try prepareWorkHealthDependencies(db,task:task,action:action)
             if dependencyRows + dependencies.ids.count > 32768 || dependencyBytes + dependencies.bytes > 4*1024*1024 {
                 dependencies.refuse()
             } else {dependencyRows += dependencies.ids.count;dependencyBytes += dependencies.bytes}
-            return .init(position:row["position"],task:task,action:action,dependencies:dependencies)
+            return .init(position:row["position"],task:task,action:action,dependencies:dependencies,references:references)
         }
         let enabled = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records INDEXED BY records_scope WHERE type='project') AND COALESCE(json_extract(data,'$.archived'),0)=0 AND COALESCE(json_extract(data,'$.work_health_settings.enabled'),1)=1") ?? 0
         return .init(items:items,nextPosition:rows.count < pageLimit ? 0 : (rows.last?["position"] as Int64? ?? 0),hasMore:rows.count == pageLimit,enabled:enabled > 0)

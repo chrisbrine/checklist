@@ -89,6 +89,49 @@ final class ScreenReadPerformanceTests: XCTestCase {
         }
     }
 
+    func testFullTriageOnOwnedReadOnlySnapshot() throws {
+        try QualificationSuite.requireEnabled()
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["CHECKLIST_READ_ONLY_DATABASE"],
+              let projectID = environment["CHECKLIST_READ_BENCHMARK_PROJECT_ID"] else {
+            throw XCTSkip("Requires an owned qualification snapshot and its project")
+        }
+        let qualification = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/ChecklistQualification").resolvingSymlinksInPath()
+        let database = URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
+        guard database.path.hasPrefix(qualification.path + "/"), database.lastPathComponent == "database.sqlite" else {
+            return XCTFail("Use the readonly database of a private qualification snapshot.")
+        }
+        let fixture = try ReadPerformanceFixture("CL-512-full-triage-read-only")
+        var configuration = Configuration()
+        configuration.readonly = true
+        configuration.prepareDatabase { db in
+            try SchemaMigrations.installStorageCollation(db)
+            CommandRouter.installTicketSearchFunctions(db)
+        }
+        let pool = try DatabasePool(path:database.path,configuration:configuration)
+        defer { try? pool.close() }
+        let owner = Caller(role:"owner",installation:"CL-512-read-only-triage",projectIDs:[])
+        var load = [Double](repeating:0,count:3)
+        getloadavg(&load,3)
+        let utc = Date().ISO8601Format()
+        let start = ProcessInfo.processInfo.systemUptime
+        let reply = try fixture.router.executePureRead(pool,method:"triage_list",params:["project_id":projectID],caller:owner)
+        let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1000
+        let response = try XCTUnwrap(reply["data"] as? JSON)
+        let rows = try XCTUnwrap(response["groups"] as? [JSON])
+        let serialized = try jsonString(rows)
+        print("CL-512 owned full Triage utc=\(utc) load=\(load) groups=\(rows.count) bytes=\(serialized.utf8.count) service_ms=\(milliseconds)")
+        let reference = try pool.read { db in
+            try fixture.router.records(db,type:"group",project:projectID)
+                .filter { $0["kind"] as? String == "triage" }
+                .map { try fixture.router.groupProjection(db,$0) }
+        }
+        XCTAssertFalse(rows.isEmpty)
+        XCTAssertEqual(serialized,try jsonString(reference))
+        XCTAssertLessThan(milliseconds,1000)
+    }
+
     func testOwnedStoreMeasurements() throws {
         try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_BENCHMARK_ROOT"],

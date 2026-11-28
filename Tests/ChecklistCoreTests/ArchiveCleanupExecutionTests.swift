@@ -128,23 +128,109 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
     }
     func testActualImagePreviewSurvivesOriginalCleanupAndRemainsReadableAsPreviewOnly() throws {
         let f = try fixture()
+        let (a,source,bytes) = try addImage(project:f.project,task:f.task)
+        let previewPath = try XCTUnwrap(a["preview_path"] as? String),previewBefore = try Data(contentsOf:URL(fileURLWithPath:previewPath))
+        let job = try archive(f);try makeDue(job)
+        // Exactly two selected originals, at most one actual unlink per pump.
+        try router.runStorageMaintenance();try router.runStorageMaintenance()
+        XCTAssertFalse(exists(a));XCTAssertEqual(try Data(contentsOf:source),bytes)
+        XCTAssertEqual(try Data(contentsOf:URL(fileURLWithPath:previewPath)),previewBefore)
+        XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"original_cleaned")
+        let preview = try call("attachment_read",["project_id":f.project["id"]!,"attachment_id":a["id"]!,"representation":"preview"])
+        XCTAssertEqual(preview["url"] as? String,previewPath)
+        XCTAssertThrowsError(try call("attachment_read",["project_id":f.project["id"]!,"attachment_id":a["id"]!,"representation":"original"]))
+    }
+
+    private func addImage(project: JSON, task: JSON) throws -> (JSON, URL, Data) {
         let context = try XCTUnwrap(CGContext(data:nil,width:32,height:32,bitsPerComponent:8,bytesPerRow:128,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue))
         context.setFillColor(CGColor(red:0.2,green:0.6,blue:0.8,alpha:1));context.fill(CGRect(x:0,y:0,width:32,height:32))
         let bytes = NSMutableData(),image = try XCTUnwrap(context.makeImage())
         let encoder = try XCTUnwrap(CGImageDestinationCreateWithData(bytes,UTType.png.identifier as CFString,1,nil))
         CGImageDestinationAddImage(encoder,image,nil);XCTAssertTrue(CGImageDestinationFinalize(encoder))
         let source = directory.appendingPathComponent("owned-image.png");try (bytes as Data).write(to:source)
-        let a = try call("attachment_add",["project_id":f.project["id"]!,"task_id":f.task["id"]!,"path":source.path])
-        let previewPath = try XCTUnwrap(a["preview_path"] as? String),previewBefore = try Data(contentsOf:URL(fileURLWithPath:previewPath))
-        let job = try archive(f);try makeDue(job)
-        // Exactly two selected originals, at most one actual unlink per pump.
-        try router.runStorageMaintenance();try router.runStorageMaintenance()
-        XCTAssertFalse(exists(a));XCTAssertEqual(try Data(contentsOf:source),bytes as Data)
-        XCTAssertEqual(try Data(contentsOf:URL(fileURLWithPath:previewPath)),previewBefore)
-        XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"original_cleaned")
-        let preview = try call("attachment_read",["project_id":f.project["id"]!,"attachment_id":a["id"]!,"representation":"preview"])
-        XCTAssertEqual(preview["url"] as? String,previewPath)
-        XCTAssertThrowsError(try call("attachment_read",["project_id":f.project["id"]!,"attachment_id":a["id"]!,"representation":"original"]))
+        let attachment = try call("attachment_add",["project_id":project["id"]!,"task_id":task["id"]!,"path":source.path])
+        return (attachment,source,bytes as Data)
+    }
+
+    func testCL529MissingOriginalNeedsSettlementAndBackupPreservesPreview() throws {
+        let f = try fixture()
+        let (attachment,_,image) = try addImage(project:f.project,task:f.task)
+        let id = try XCTUnwrap(attachment["id"] as? String), project = try XCTUnwrap(f.project["id"] as? String)
+        let original = URL(fileURLWithPath:try XCTUnwrap(attachment["path"] as? String))
+        let preview = URL(fileURLWithPath:try XCTUnwrap(attachment["preview_path"] as? String))
+        let previewBytes = try Data(contentsOf:preview)
+        let retainedOriginal = directory.appendingPathComponent("original-fixture")
+        let selection: JSON = ["project_id":project,"attachment_id":id]
+        let query: JSON = ["project_id":project]
+        XCTAssertThrowsError(try call("attachment_missing_settle",selection)) {
+            XCTAssertEqual(($0 as? CoreError)?.code,"MANAGED_ORIGINAL_PRESENT")
+        }
+        try router.runArchiveStorageMaintenance()
+        try FileManager.default.moveItem(at:original,to:retainedOriginal)
+        let report = try call("attachment_missing_list",query)
+        XCTAssertEqual(report["missing_count"] as? Int,1)
+        XCTAssertEqual(report["unsettled_count"] as? Int,1)
+        XCTAssertEqual((report["attachments"] as? [JSON])?.first?["attachment_id"] as? String,id)
+        XCTAssertEqual(try record(id,"attachment")["availability"] as? String,"available")
+
+        func refusedBackup(_ label: String) throws {
+            let command = uuid()
+            let destination = directory.appendingPathComponent(label)
+            XCTAssertThrowsError(try call("backup_create",["path":destination.path],command:command)) {
+                let error = $0 as? CoreError
+                XCTAssertEqual(error?.code,"BACKUP_IO_ERROR")
+                XCTAssertEqual(error?.details["project_id"] as? String,project)
+                XCTAssertEqual(error?.details["task_id"] as? String,f.task["id"] as? String)
+                XCTAssertEqual(error?.details["ticket_key"] as? String,f.task["key"] as? String)
+                XCTAssertEqual(error?.details["attachment_id"] as? String,id)
+                XCTAssertEqual(error?.details["representation"] as? String,"original")
+            }
+            let attention = try XCTUnwrap(call("storage_status",[:])["backup_missing_attachment_attention"] as? JSON)
+            XCTAssertEqual(attention["command_id"] as? String,command)
+            XCTAssertEqual(attention["project_id"] as? String,project)
+            XCTAssertEqual(attention["task_id"] as? String,f.task["id"] as? String)
+            XCTAssertEqual(attention["attachment_id"] as? String,id)
+        }
+        try refusedBackup("available-missing")
+        var originalRead = selection
+        originalRead["representation"] = "original"
+        XCTAssertThrowsError(try call("attachment_read",originalRead))
+        XCTAssertEqual(try record(id,"attachment")["availability"] as? String,"unavailable")
+        try refusedBackup("unavailable-missing")
+
+        let command = uuid()
+        let result = try call("attachment_missing_settle",selection,command:command)
+        XCTAssertEqual(try jsonString(call("attachment_missing_settle",selection,command:command)),try jsonString(result))
+        let loss = try XCTUnwrap(result["original_loss"] as? JSON)
+        XCTAssertEqual(loss["last_known_sha256"] as? String,attachment["sha256"] as? String)
+        XCTAssertEqual(int(loss,"last_known_size"),image.count)
+        XCTAssertNotNil((loss["found_at"] as? String).flatMap(StoredClock.shared.date(from:)))
+        XCTAssertEqual(try call("attachment_missing_list",query)["unsettled_count"] as? Int,0)
+        XCTAssertEqual(try Data(contentsOf:preview),previewBytes)
+        XCTAssertEqual(try Data(contentsOf:retainedOriginal),image)
+
+        let destination = directory.appendingPathComponent("settled-backup")
+        let backup = try call("backup_create",["path":destination.path])
+        XCTAssertEqual(backup["status"] as? String,"complete")
+        XCTAssertTrue(try call("storage_status",[:])["backup_missing_attachment_attention"] is NSNull)
+        let restore = try call("restore_preview",["path":destination.path])
+        let unavailable = try XCTUnwrap(restore["unavailable"] as? [JSON])
+        XCTAssertTrue(unavailable.contains {$0["authority"] as? String == "attachment:" + id && $0["reason"] as? String == "original_missing"})
+        let relative = try router.managedRelative(preview.path,family:"objects")
+        XCTAssertEqual(try Data(contentsOf:destination.appendingPathComponent("managed/" + relative)),previewBytes)
+        let restored = try call("restore_create",["path":destination.path,"manifest_sha256":try XCTUnwrap(restore["manifest_sha256"])])
+        let restoredPath = URL(fileURLWithPath:try XCTUnwrap(restored["path"] as? String))
+        XCTAssertEqual(try Data(contentsOf:restoredPath.appendingPathComponent(relative)),previewBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath:restoredPath.appendingPathComponent(try router.managedRelative(original.path,family:"objects")).path))
+
+        try FileManager.default.moveItem(at:preview,to:directory.appendingPathComponent("detached-preview"))
+        XCTAssertThrowsError(try call("backup_create",["path":directory.appendingPathComponent("missing-preview-backup").path])) {
+            let error = $0 as? CoreError
+            XCTAssertEqual(error?.code,"BACKUP_IO_ERROR")
+            XCTAssertEqual(error?.details["relative_path"] as? String,relative)
+            XCTAssertEqual(error?.details["attachment_id"] as? String,id)
+            XCTAssertEqual(error?.details["representation"] as? String,"preview")
+        }
     }
     func testLateReaderHoldBlocksFinalDeleteAndReleaseResumesCurrentJob() throws {
         let f = try fixture(),job = try archive(f),a = f.files[0],pid = f.project["id"]!
@@ -206,7 +292,7 @@ final class ArchiveCleanupExecutionTests: XCTestCase {
             },nil),SQLITE_OK)
         }
         try router.runStorageMaintenance();XCTAssertFalse(exists(a))
-        XCTAssertEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"available")
+        XCTAssertNotEqual(try record(a["id"] as! String,"attachment")["availability"] as? String,"available")
         router.dbQueue.writeWithoutTransaction { _ = sqlite3_set_authorizer($0.sqliteConnection,nil,nil) }
         router = nil;router = try TestStore.router(root:directory.appendingPathComponent("store"))
         // CL-345: a command's maintenance tail prepares no reference scan; the service turn continues the job.

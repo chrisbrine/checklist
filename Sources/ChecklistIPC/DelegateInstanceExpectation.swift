@@ -24,7 +24,7 @@ public struct DelegateInstanceExpectation: Codable, Sendable {
 
     /// Call immediately after resolving the current instance, before any IPC, credential read or bootstrap.
     public static func verifyIfPresent(instance: ChecklistInstance,
-                                      executable: URL = ChecklistInstance.executableURL,
+                                      executable: @autoclosure () -> URL = ChecklistInstance.executableURL,
                                       environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         guard let raw = environment[environmentKey] else { return }
         guard raw.utf8.count <= 16_384,
@@ -32,7 +32,7 @@ public struct DelegateInstanceExpectation: Codable, Sendable {
               let bundle = instance.bundleURL?.resolvingSymlinksInPath(), bundle.path == expected.bundleRoot,
               instance.slot == expected.slot, instance.bundleIdentifier == expected.bundleIdentifier,
               instance.machServiceName == expected.machServiceName else { throw mismatch }
-        let resolved = executable.resolvingSymlinksInPath()
+        let resolved = executable().resolvingSymlinksInPath()
         let macOS = resolved.deletingLastPathComponent(), contents = macOS.deletingLastPathComponent()
         guard macOS.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents",
               contents.deletingLastPathComponent() == bundle,

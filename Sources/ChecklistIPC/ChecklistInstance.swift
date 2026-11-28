@@ -176,7 +176,11 @@ public struct ChecklistInstance: Sendable {
         return URL(fileURLWithPath:path).standardizedFileURL.resolvingSymlinksInPath()
     }
     public static func read(executable: URL) throws -> ChecklistInstance {
-        let contents = executable.resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent()
+        try read(resolvedExecutable: executable.resolvingSymlinksInPath())
+    }
+
+    private static func read(resolvedExecutable: URL) throws -> ChecklistInstance {
+        let contents = resolvedExecutable.deletingLastPathComponent().deletingLastPathComponent()
         let bundle = contents.deletingLastPathComponent()
         guard contents.lastPathComponent == "Contents", bundle.pathExtension == "app" else { return try ChecklistInstance() }
         let plistURL = contents.appendingPathComponent("Info.plist")
@@ -188,7 +192,7 @@ public struct ChecklistInstance: Sendable {
         return try ChecklistInstance(slotValue:plist["ChecklistInstanceSlot"],bundleURL:bundle)
     }
     public static let current: ChecklistInstance = {
-        do { return try read(executable:executableURL) }
+        do { return try read(resolvedExecutable: executableURL) }
         catch { fputs("Checklist: \(error.localizedDescription)\n",stderr); exit(78) }
     }()
 }

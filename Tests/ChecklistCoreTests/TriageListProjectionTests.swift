@@ -64,6 +64,36 @@ final class TriageListProjectionTests: XCTestCase {
         XCTAssertEqual((rows[0]["member_warnings"] as! [JSON]).count,2)
     }
 
+    func testListHistoryMatchesIndividualProjectionAcrossRetainedRows() throws {
+        let f = try TriageListFixture(count:17)
+        let foreign = try f.store.call("project_create",["name":"Other project","key_prefix":"OT"])["id"] as! String
+        try f.store.save([
+            ("attempt",["id":"legacy-attempt","project_id":f.pid,"batch_id":"batch-0-0","revision":1]),
+            ("batch_claim",["id":"later-claim","project_id":f.pid,"batch_id":"batch-0-1","revision":1]),
+            ("batch_disposition",["id":"later-discard","project_id":f.pid,"batch_id":"batch-0-2","revision":1]),
+            ("batch_claim",["id":"foreign-claim","project_id":foreign,"batch_id":"batch-0-0","revision":1]),
+            ("triage_membership_exit",["id":"foreign-exit","project_id":foreign,"triage_id":"triage-0","membership_id":"membership-0-1","revision":1]),
+            ("triage_membership_exit",["id":"later-exit","project_id":f.pid,"triage_id":"triage-0","membership_id":"membership-0-0","revision":1]),
+        ])
+        let reference = try f.store.router.dbQueue.read { db in
+            try f.store.router.records(db,type:"group",project:f.pid).filter { $0["kind"] as? String == "triage" }.map {
+                try f.store.router.groupProjection(db,$0)
+            }
+        }
+        let all = try f.list()["groups"] as! [JSON]
+        XCTAssertEqual(try jsonString(all),try jsonString(reference))
+        for field in ["membership_history","batches"] {
+            let projected = try f.list(["fields":[field]])["groups"]!
+            let expected = f.store.router.listProjection(reference,fields:[field,"id","key","revision"])
+            XCTAssertEqual(try jsonString(projected),try jsonString(expected))
+        }
+        let batches = try XCTUnwrap(all.first?["batches"] as? [JSON])
+        XCTAssertEqual(batches.map {$0["lifecycle"] as? String},["claimed","claimed","discarded"])
+        XCTAssertTrue(batches[0]["dispatch"] is NSNull)
+        XCTAssertEqual((batches[1]["dispatch"] as? JSON)?["id"] as? String,"claim-0")
+        XCTAssertEqual((batches[2]["disposition"] as? JSON)?["id"] as? String,"discard-0")
+    }
+
     func testSelectedRowsUnknownFieldsAndCommittedChanges() throws {
         let f = try TriageListFixture(count:2)
         let fields = ["name","status_category","member_count"]

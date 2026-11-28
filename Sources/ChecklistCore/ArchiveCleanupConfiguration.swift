@@ -28,7 +28,7 @@ extension CommandRouter {
         return projectProjection(project,caller:c)
     }
 
-    func archiveRetentionFacts(_ db: Database,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil,currentIndex: ArchiveCleanupReferenceIndex? = nil) throws -> [ArchiveAttachmentFact] {
+    func archiveRetentionFacts(_ db: Database,task: JSON,considerArchiving: Bool = false,currentGraph: [JSON]? = nil,currentIndex: ArchiveCleanupReferenceIndex? = nil,resumingOriginalRemoval: String? = nil) throws -> [ArchiveAttachmentFact] {
         let attachments = try scopedTaskRows(db,type:"attachment",task:task).filter { !bool($0,"unlinked") }
         guard !attachments.isEmpty else { return [] }
         // CL-344: a command's writer reuses the scan it prepared on a read snapshot
@@ -43,7 +43,9 @@ extension CommandRouter {
         }
         return try attachments.map { a in
             let mode: ArchiveAttachmentFact.Mode = a["mode"] as? String == "managed" ? .managed : .externalReference
-            let availability: ArchiveAttachmentFact.Availability = a["availability"] as? String == "available" ? .available : (a["availability"] as? String == "original_cleaned" ? .originalCleaned : .missing)
+            let state = a["availability"] as? String
+            let resuming = state == Self.originalCleanupPending && resumingOriginalRemoval != nil && a["original_removal_receipt_id"] as? String == resumingOriginalRemoval
+            let availability: ArchiveAttachmentFact.Availability = state == "available" || resuming ? .available : (state == "original_cleaned" ? .originalCleaned : .missing)
             let holds = try completeArchiveCleanupHolds(db,attachment:a,task:task,considerArchiving:considerArchiving,currentIndex:index)
             return try .init(
                 id: (try StoredRecord(a, family: "a").string("id")), logicalOriginalBytes: ArchiveCleanupJob.integer(a["size"]), mode: mode, availability: availability,

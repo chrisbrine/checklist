@@ -64,6 +64,10 @@ extension CommandRouter {
         fields["project_icon_import"] = ["path"]
         fields["project_icon_clear"] = []
         fields["attachment_update"] = ["attachment_id","action","description"]
+        if c.role != "assistant" {
+            fields["attachment_missing_list"] = ["after_attachment_id","limit"]
+            fields["attachment_missing_settle"] = ["attachment_id"]
+        }
         fields["attachment_read_release"] = ["read_hold_id"]
         fields["relation_import"] = ["relations","aliases"]
         fields["human_request_snooze"] = ["request_id","snoozed"]
@@ -249,6 +253,12 @@ extension CommandRouter {
             properties["section"] = ["type":"string","enum":["items","objects","source_build_cache"]]
             properties["limit"] = ["type":"integer","minimum":1,"maximum":50]
         }
+        if name == "attachment_missing_list" {
+            properties.removeValue(forKey:"command_id")
+            properties.removeValue(forKey:"expected_revision")
+            properties["limit"] = ["type":"integer","minimum":1,"maximum":200]
+            properties["after_attachment_id"] = ["type":"string","minLength":1,"maxLength":100]
+        }
         if Self.storageBackupPruningMethods.contains(name) {
             if !Self.storageIncompleteBackupMethods.contains(name) || c.isOwner {
                 properties.removeValue(forKey:"project_id");properties.removeValue(forKey:"expected_revision")
@@ -282,6 +292,7 @@ extension CommandRouter {
         if name == "task_bulk_undo" { required += ["tasks","original_command_id"];properties["tasks"] = Self.ticketBulkTasksSchema }
         if name == "message_delivery_list" { required += ["message_id"] }
         if name == "message_mentions_prepare" { required += ["task_id","body"] }
+        if name == "attachment_missing_settle" { required.append("attachment_id") }
         var schema: JSON = ["type":"object","properties":properties,"required":required,"additionalProperties":false]
         if name == "triage_transition" {
             schema["allOf"] = [["oneOf":[["required":["triage_id"],"not":["required":["group_id"]]],["required":["group_id"],"not":["required":["triage_id"]]]]],
@@ -325,6 +336,8 @@ extension CommandRouter {
     }
     func description(_ method: String) -> String {
         switch method {
+        case "attachment_missing_list":return "Check this project for absent managed originals. Returns counts and attachment and ticket IDs without reading contents or changing availability. Use next_after_attachment_id to page the issue rows."
+        case "attachment_missing_settle":return "Record a confirmed missing managed original in this project with its last known SHA-256, size and discovery time. Keeps metadata and previews. Existing files and uncertain filesystem results are refused."
         case "attachment_read":return "Read one attachment of this project. representation is metadata (default), preview or original. Whole-file preview and original return an operation; result_expires_at is 24 hours after completion. Each result read rechecks access and original bytes; expiry is ATTACHMENT_READ_EXPIRED and cleanup is explicitly unavailable. File bytes are not journaled. Preview and original return content_base64, at most 8 MiB per file for an agent; a larger file returns FILE_TOO_LARGE with limit_bytes and size_bytes and stays available. To read a larger managed original, pass representation=original with offset and length (at most 8 MiB per range), join the ranges until eof is true and compare them with sha256."
         case "media_type_adopt_starter":return "Adopt one fixed built-in media type starter into this project in one step, through the owner's create and adopt path. starter is an exact ID or name: generic (Text and images), text (Story text), animation (Character animation images), video (Video takes), animation_video (Animation takes) or audio (Audio takes); an unknown starter refuses with MEDIA_STARTER_UNKNOWN and lists them. expected_revision is the current project revision. A starter whose type exists refuses with MEDIA_TYPE_ALREADY_ADOPTED, or MEDIA_TYPE_RETIRED when retired. Agent callers require allowed agent_rule_changes; owner_only refuses with HUMAN_CHANNEL_REQUIRED. Recorded as an agent action."
         case "media_type_create":return "Create a Draft custom media type with an optional definition (schema) and rubric. The service owns the type ID. Adopt it with media_type_adopt and the returned draft_revision_id and observed_type_token. Agent callers require allowed agent_rule_changes; owner_only refuses with HUMAN_CHANNEL_REQUIRED. Recorded as an agent action."

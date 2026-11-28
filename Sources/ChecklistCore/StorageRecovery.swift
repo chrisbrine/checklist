@@ -192,7 +192,7 @@ extension CommandRouter {
                 }
             } catch {
                 let reported = budget.reporting(error)
-                recordBackupCapacityAttention(command:params["command_id"] as? String,error:reported)
+                recordBackupAttention(command:params["command_id"] as? String,error:reported)
                 throw reported
             }
             timingOutcome = "complete"
@@ -264,6 +264,7 @@ extension CommandRouter {
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/objects/"),
               !destination.path.hasPrefix(root.standardizedFileURL.path + "/source-captures/") else { throw CoreError("INVALID_INPUT","Choose a separate backup destination.") }
         let parent = destination.deletingLastPathComponent(), name = destination.lastPathComponent
+        let stage = parent.appendingPathComponent(StorageSnapshot.names(operation).staging)
         func commitBackup(_ receipt: StorageSnapshotReceipt) throws -> JSON {
             try budget.notify("receipt_prepare_begin")
             let prepared = try prepareStorageBackupReceipt(destination:destination,receipt:receipt,identity:identity,params:params,caller:caller,command:command,budget:budget)
@@ -292,7 +293,6 @@ extension CommandRouter {
                 _ = try self.currentBackupManifest(destination,identity:identity,folderAccess:budget.folderAccess)
                 receipt = try StorageSnapshot.reconcile(parent:parent,operation:operation,publicationName:name,budget:budget)
             } else {
-                let stage = parent.appendingPathComponent(StorageSnapshot.names(operation).staging)
                 if try parentFiles.directoryExists(stage.lastPathComponent) {
                     let staged = try StorageObjectFiles(root:stage,folderAccess:budget.folderAccess)
                     if try staged.regularOrLinkExists("intent.json") {
@@ -319,6 +319,7 @@ extension CommandRouter {
                     }
                 }
             }
+            if let named = backupErrorNamingMissingAttachment(error,stage:stage,folderAccess:budget.folderAccess) {throw named}
             throw budget.reporting(error)
         }
         return try commitBackup(receipt)
@@ -407,7 +408,7 @@ extension CommandRouter {
             try db.execute(sql:"INSERT INTO metadata(key,value) VALUES (?,?)",arguments:["backup-generation:" + receipt.operationID.uuidString.lowercased(),generation])
             if caller.isOwner,caller.installation == Self.doneEvidenceBackupInstallation {try recordDoneEvidenceBackupCompletion(db,command:command,summary:summary)}
             try recordStorageCopyObservation(db,key:"backup",summary:summary)
-            try clearBackupCapacityAttention(db)
+            try clearBackupAttention(db)
             try Self.enqueueAutomaticBackupRetention(db,root:root,incarnation:identity.incarnation,operation:receipt.operationID.uuidString.lowercased())
             try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key]);return .commit
         }

@@ -85,6 +85,7 @@ extension CommandRouter {
                 "cleanup_enabled":true,"restore_supported":true,
                 "last_verified_backup":try summary("storage-last-verified-backup"),
                 "backup_capacity_attention":try backupCapacityAttention(db) as Any? ?? NSNull(),
+                "backup_missing_attachment_attention":try backupMissingAttachmentAttention(db) as Any? ?? NSNull(),
                 "automatic_backup":try doneEvidenceBackupProjection(db),
                 "last_verified_rehearsal":try summary("storage-last-verified-rehearsal"),"retained_usage":usage]
     }

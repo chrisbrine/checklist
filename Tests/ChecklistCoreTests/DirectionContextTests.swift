@@ -1,4 +1,5 @@
 import ChecklistTestSupport
+import GRDB
 import XCTest
 @testable import ChecklistCore
 
@@ -77,6 +78,96 @@ final class DirectionContextTests: XCTestCase {
         let currentTask = submission["task"] as! JSON
         try router.dbQueue.write { db in
             self.assertCode("CURSOR_RESET") { try self.router.validateDirectionCursor(db,params:["direction_cursor":fresh["direction_cursor"]!],task:currentTask,caller:worker) }
+        }
+    }
+
+    func testGeneratedDirectionCursorValidationMatchesLegacyScopeAndErrors() throws {
+        let (project, originalTask, worker) = try fixture()
+        let pid = try XCTUnwrap(project["id"] as? String), tid = try XCTUnwrap(originalTask["id"] as? String)
+        var task = originalTask
+        task["tag_ids"] = ["keep"]
+        let matching: JSON = ["id": "pin-keep", "body": "Keep behavior", "revision": 2, "tag_ids": ["keep"]]
+        let excluded: JSON = ["id": "pin-skip", "body": "Asset only", "revision": 1, "task_kinds": ["asset"]]
+        let legacy: JSON = ["id": "legacy-0", "body": "Preserve legacy context", "revision": 1, "origin": "legacy_project_context"]
+        let inputs: [(brief: String, pins: Any, expected: [JSON])] = [
+            ("", [JSON](), []), ("Project context", [excluded, matching], [matching]),
+            ("", ["Preserve legacy context"], [legacy]), ("", [excluded], []),
+        ]
+        let fallbackAttemptID = UUID().uuidString
+        try router.dbQueue.write { db in
+            try router.save(db, [
+                "id": fallbackAttemptID, "project_id": pid, "task_id": tid, "revision": 1,
+                "state": "active", "phase": "review", "principal": worker.principal,
+            ], type: "attempt")
+            let authorization = try router.authorizationScope(db, worker)
+            let generation = try router.callerSessionGeneration(db, worker, project: pid)
+            for variant in 0..<16 {
+                try db.inSavepoint {
+                    let input = inputs[variant % inputs.count]
+                    let revision = variant + 1
+                    let pending = variant >= 8 && variant.isMultiple(of: 2)
+                    var updatedProject = router.revised(try router.record(db, pid, type: "project"))
+                    updatedProject["brief"] = input.brief
+                    updatedProject["brief_revision"] = revision
+                    updatedProject["pinned_decisions"] = input.pins
+                    try router.save(db, updatedProject, type: "project")
+                    var expectedDirections: [JSON] = []
+                    for index in 0..<(variant / inputs.count) {
+                        let id = UUID().uuidString, addressed = !(pending && index == 0)
+                        try router.save(db, [
+                            "id": id, "project_id": pid, "task_id": tid, "origin": "human_ui",
+                            "requires_action": true, "addressed": addressed, "revision": index + 1,
+                        ], type: "message")
+                        if index == 2 {
+                            try router.save(db, [
+                                "id": UUID().uuidString, "project_id": pid, "task_id": tid,
+                                "message_id": id, "state": "retracted", "revision": 1,
+                            ], type: "direction_disposition")
+                        } else {
+                            expectedDirections.append(["id": id, "revision": index + 1, "addressed": addressed])
+                        }
+                    }
+                    let relevant: JSON = [
+                        "brief": input.brief, "brief_revision": revision, "decisions": input.expected, "directions": expectedDirections,
+                    ]
+                    let digest = ChecklistCore.hash(Data((try jsonString(relevant)).utf8))
+                    for attempt in [nil, ["id": "exact-review-round"]] as [JSON?] {
+                        let round = attempt?["id"] as? String ?? fallbackAttemptID
+                        let expectedScope = "\(pid):directions:\(tid):\(round):\(digest):\(authorization):\(generation)"
+                        XCTAssertEqual(try router.directionCursorScope(db, task: task, caller: worker, attempt: attempt), expectedScope)
+                        let valid = try router.cursor(db, caller: worker, scope: expectedScope, sequence: revision)
+                        let priorScope = try router.directionCursorScope(db, task: task, caller: worker, attempt: ["id": "prior-review-round"])
+                        let stale = try router.cursor(db, caller: worker, scope: priorScope, sequence: revision)
+                        let foreign = try router.cursor(db, caller: owner, scope: expectedScope, sequence: revision)
+                        for cursor in [valid, stale, foreign] {
+                            let params: JSON = ["direction_cursor": cursor]
+                            if pending || cursor != valid {
+                                assertCode(pending ? "USER_DIRECTION_PENDING" : "CURSOR_RESET") {
+                                    try self.router.validateDirectionCursor(db, params: params, task: task, caller: worker, attempt: attempt)
+                                }
+                            } else {
+                                var queries: [String] = []
+                                db.trace { if case .statement(let statement) = $0 { queries.append(statement.sql) } }
+                                XCTAssertNoThrow(try router.validateDirectionCursor(db, params: params, task: task, caller: worker, attempt: attempt))
+                                db.trace(options: [])
+                                XCTAssertEqual(queries.filter { $0.contains("json_extract(data,'$.origin')='human_ui'") }.count, 1)
+                                XCTAssertEqual(queries.filter { $0.hasSuffix("WHERE id = CAST(? AS TEXT) AND type = CAST(? AS TEXT)") }.count, 1)
+                            }
+                        }
+                        let hasContext = !input.brief.isEmpty || !input.expected.isEmpty || !expectedDirections.isEmpty
+                        for params in [[:], ["direction_cursor": NSNull()]] as [JSON] {
+                            if pending || hasContext {
+                                assertCode(pending ? "USER_DIRECTION_PENDING" : "DIRECTION_CURSOR_REQUIRED") {
+                                    try self.router.validateDirectionCursor(db, params: params, task: task, caller: worker, attempt: attempt)
+                                }
+                            } else {
+                                try router.validateDirectionCursor(db, params: params, task: task, caller: worker, attempt: attempt)
+                            }
+                        }
+                    }
+                    return .rollback
+                }
+            }
         }
     }
 

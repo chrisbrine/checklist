@@ -34,9 +34,12 @@ extension CommandRouter {
         }
     }
     func batchLifecycle(_ db: Database,_ batch: JSON) throws -> JSON {
-        let dispatch = try batchRelatedRecord(db,batch,type:"batch_claim")
-        let disposition = try batchDisposition(db,batch)
-        return ["lifecycle":disposition == nil ? (try (dispatch != nil || batchRelatedRecord(db,batch,type:"attempt") != nil) ? "claimed" : "prepared") : "discarded",
+        try batchLifecycle { try batchRelatedRecord(db,batch,type:$0) }
+    }
+    func batchLifecycle(relatedRecord: (String) throws -> JSON?) throws -> JSON {
+        let dispatch = try relatedRecord("batch_claim")
+        let disposition = try relatedRecord("batch_disposition")
+        return ["lifecycle":disposition == nil ? (try (dispatch != nil || relatedRecord("attempt") != nil) ? "claimed" : "prepared") : "discarded",
                 "dispatch":dispatch as Any? ?? NSNull(),"disposition":disposition as Any? ?? NSNull()]
     }
     /// Planning disposition only. The command transaction serializes this admission

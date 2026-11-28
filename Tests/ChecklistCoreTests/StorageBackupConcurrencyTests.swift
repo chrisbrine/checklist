@@ -234,14 +234,27 @@ final class StorageBackupConcurrencyTests: XCTestCase {
     }
 
     func testKilledCaptureReleasesKernelRetentionWithoutTouchingStaging() throws {
-        let f = try StorageFixture()
+        let f = try StorageFixture(open:false)
         let stage = f.root.appendingPathComponent("staging/retained-recovery")
         try FileManager.default.createDirectory(at:stage.deletingLastPathComponent(),withIntermediateDirectories:true)
         try Data("unchanged recovery".utf8).write(to:stage)
         let child = try f.spawn("backup-retention-held")
-        defer {if child.isRunning {_ = kill(child.processIdentifier,SIGKILL)}}
-        let until = ProcessInfo.processInfo.systemUptime + 5
-        while !FileManager.default.fileExists(atPath:f.base.appendingPathComponent("ready").path),child.isRunning,ProcessInfo.processInfo.systemUptime < until {usleep(10_000)}
+        defer {
+            if child.isRunning {
+                _ = kill(child.processIdentifier,SIGKILL)
+                try? f.finish(child)
+            }
+        }
+        let ready = f.base.appendingPathComponent("ready").path
+        // The folder opener has its own deadline. Allow time to launch the probe as well.
+        let timeout = StorageFolderAccess.seconds + 5
+        let until = ProcessInfo.processInfo.systemUptime + timeout
+        while !FileManager.default.fileExists(atPath:ready),child.isRunning,ProcessInfo.processInfo.systemUptime < until {usleep(10_000)}
+        guard FileManager.default.fileExists(atPath:ready) else {
+            let outcome = child.isRunning ? "no ready marker within \(timeout) seconds" : "exit status \(child.terminationStatus)"
+            XCTFail("Retention probe did not acquire its lock (\(outcome)).")
+            return
+        }
         XCTAssertTrue(try StorageSnapshotRetention.isActive(root:f.root))
         XCTAssertEqual(kill(child.processIdentifier,SIGKILL),0)
         try f.finish(child)

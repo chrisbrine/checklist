@@ -68,6 +68,39 @@ struct ManagedImportStageReferences {
             """,arguments:[Data(absolute.utf8),Data(relative.utf8),Data(absolute.utf8),Data(relative.utf8)])
     }
 
+    /// The final removal boundary checks current canonical owners even when a
+    /// prepared receipt describes this path as another attachment's preview.
+    func attachmentRows(_ db: Database, absolute: String, relative: String) throws -> [Row]? {
+        guard try Int.fetchOne(db,sql:"PRAGMA data_version") == dataVersion else {return nil}
+        try Self.rejectMalformed(db, table: "temp.checklist_import_stage_refs", condition: "malformed=1")
+        let arguments: StatementArguments = [Data(absolute.utf8),Data(relative.utf8),Data(absolute.utf8),Data(relative.utf8)]
+        return try Row.fetchAll(db, sql: """
+            SELECT \(CommandRouter.canonicalColumns(alias:"r")) FROM (
+                SELECT record_rowid FROM temp.checklist_import_stage_refs WHERE original IN (CAST(? AS TEXT),CAST(? AS TEXT))
+                UNION
+                SELECT record_rowid FROM temp.checklist_import_stage_refs WHERE preview IN (CAST(? AS TEXT),CAST(? AS TEXT))
+            ) x CROSS JOIN main.records r ON r.rowid=x.record_rowid LIMIT 129
+            """, arguments:arguments)
+    }
+
+    static func scanAttachmentRows(_ db: Database, absolute: String, relative: String) throws -> [Row] {
+        try rejectMalformed(db, table: "main.records", condition: "type='attachment' AND NOT json_valid(data)")
+        let arguments: StatementArguments = [Data(absolute.utf8),Data(relative.utf8),Data(absolute.utf8),Data(relative.utf8)]
+        return try Row.fetchAll(db, sql: """
+            SELECT \(CommandRouter.canonicalRecordColumns) FROM records
+            WHERE type='attachment' AND (
+                json_extract(data,'$.path') COLLATE BINARY IN (CAST(? AS TEXT),CAST(? AS TEXT)) OR
+                json_extract(data,'$.preview_path') COLLATE BINARY IN (CAST(? AS TEXT),CAST(? AS TEXT))
+            ) LIMIT 129
+            """, arguments:arguments)
+    }
+
+    private static func rejectMalformed(_ db: Database, table: String, condition: String) throws {
+        if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM \(table) WHERE \(condition))") == true {
+            throw CoreError("CLEANUP_REFERENCE_UNAVAILABLE","Attachment references could not be checked; bytes retained.")
+        }
+    }
+
     static func scan(_ db: Database,absolute: String,relative: String) throws -> Bool {
         try Int.fetchOne(db,sql:"""
             SELECT COUNT(*) FROM records WHERE type='attachment' AND CASE WHEN json_valid(data) THEN

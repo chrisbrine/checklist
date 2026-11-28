@@ -195,13 +195,16 @@ The service's `admission` object records listener entry, identity-check start an
 finish, admission to the peer, and whether the executable identity cache hit.
 Admission precedes the first request's switch, so it retains four monotonic
 stamps per connection even for untimed clients. A request also takes one dequeue stamp before decoding its opt-in switch.
-The new client callback stamps and the timing trailer are opt-in. The exact code-sign requirement remains enforced
-on each XPC message. A cache hit does not bypass that requirement.
+Client callback stamps and the timing trailer are opt-in. The exact code-sign
+requirement applies to each XPC message, including messages on a reused peer.
 
 Use these boundaries to split send-to-receipt delivery around listener admission.
-A connection can be admitted before send; intersect its admission interval with
-the send-to-receipt interval before subtracting it. The remaining delivery time
-includes XPC's per-message signature enforcement and OS scheduling. The identity
+Intersect admission with the current send-to-receipt interval. When the IPC line
+reports `connection_reused:true`, the reply carries the original peer admission
+stamps. The later message has no new listener interval. Its send-to-receive time
+still includes XPC's per-message signature enforcement and OS scheduling.
+The client's `lifecycle_prepare_ms`, `credential_read_ms` and `request_encode_ms`
+split request preparation when those steps run. The identity
 reader's wall interval includes scheduling too; it is not isolated signing CPU.
 Reply delivery runs from `reply_ready_uptime_s` to the client's reply callback,
 including the small timing-trailer encoding. Callback-to-waiter time is separate.
@@ -241,6 +244,41 @@ build 432 service intervals above stayed under the 250 ms step limit even
 on slow replies. Low process CPU and high host load point to scheduling
 delay. The off-CPU interval can also include IPC and client-side waits.
 Keep full wall time and the measured phase boundaries when comparing runs.
+
+Build 450 used the same burst with CPU-matched controls on 28 November 2026.
+The 250 ms probe grid ran from 15:43:18 to 15:49:18 UTC at load 201.68 /
+131.07 / 123.63 to 638.84 / 369.28 / 232.71. At least 20 client attachment
+operations were in flight for 322.2 s, with 100% median CPU busy.
+
+| Route during the sustained window | Wall p95 | Replies over 1 s |
+| --- | ---: | ---: |
+| Fresh authenticated `service_info` | 1,389 ms | 248 / 1,231 (20.15%) |
+| Fresh `service status` | 1,417 ms | 224 / 1,231 (18.20%) |
+| Persistent MCP `service_info` | 852 ms | 41 / 1,180 (3.47%) |
+| `/usr/bin/true` | 810 ms | 39 / 1,254 (3.11%) |
+| Same CLI `--version` | 1,231 ms | 139 / 1,246 (11.16%) |
+| CPU-matched Swift control | 1,185 ms | 128 / 1,235 (10.36%) |
+
+For 100 slow authenticated replies whose controls finished within one second,
+the CLI spent a mean 153.9 ms in IPC send-to-callback, including 108.0 ms
+from the listener to receipt across both legs. Most of that listener interval
+elapsed after peer admission. Preparation and bootstrap-to-command work
+accounted for another 138.3 ms of mean excess wall time over `--version`.
+For 87 corresponding slow diagnostic status calls, preparation accounted
+for 124.4 ms of excess. Kernel CPU estimates for preparation were 4.4 ms
+at the median on authenticated calls and 3.1 ms for status. The traces
+locate these waits. They combine filesystem and IPC work with scheduling.
+
+Fresh `checklist call service_info` now sends bootstrap and the authenticated
+read on one admitted XPC connection. The service checks the caller and
+message on both requests. `checklist service status` uses one unenrolled
+request from the CLI's main thread. It keeps the same reply and timeout and
+skips the extra dispatch and reply conversion. Both paths still verify the
+installed instance. The authenticated path still checks native ancestry and
+reads the current credential. Loader, process launch and host scheduling
+costs remain. Use persistent MCP when an agent needs sub-second replies under
+load. Saturation can still delay a persistent reply, as the build 450 counts
+show.
 
 In the second build 432 replay, `media_round_link_task` wall time was
 84.6/331.9 ms at p50/p95 for 100 edits before the attachment burst and

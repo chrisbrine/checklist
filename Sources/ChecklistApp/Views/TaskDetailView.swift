@@ -581,6 +581,7 @@ struct AttachmentRow: View {
     var availabilityLabel: String {
         switch file.string("availability") {
         case "available": return "Available"
+        case "original_cleanup_pending": return "Original cleanup pending"
         case "original_cleaned", "cleaned": return file.string("preview_path").isEmpty ? "Original cleaned" : "Original cleaned · preview retained"
         default: return "Original unavailable"
         }

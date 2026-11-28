@@ -222,9 +222,11 @@ public final class CommandRouter: @unchecked Sendable {
         return value
     }
     func records(_ db: Database, type: String, project: String? = nil) throws -> [JSON] {
-        let catalog = type == "project" && project == nil
-        var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE " + (catalog
-            ? "rowid IN (\(Self.projectCatalogRowIDs))"
+        // Media preparation shadows records with a TEMP view without the scope index.
+        let indexedExecutions = type == "source_execution" && db.configuration.label != MediaPreparationOverlay.label
+        let sparseGlobalFamily = project == nil && (type == "project" || indexedExecutions)
+        var query = "SELECT " + Self.canonicalRecordColumns + " FROM records WHERE " + (sparseGlobalFamily
+            ? "rowid IN (\(Self.globalFamilyRowIDs))"
             : "type = CAST(? AS TEXT)")
         var arguments: [DatabaseValueConvertible] = [Data(type.utf8)]
         if MediaRoundDeletionGraph.mayOwn(type) {query += " AND " + MediaRoundDeletionGraph.visibleSQL()}
@@ -237,9 +239,9 @@ public final class CommandRouter: @unchecked Sendable {
         }
     }
     // The scope index starts with project_id. Seek to each next project_id and
-    // look up its project row by (project_id,type), regardless of history size.
+    // look up rows of the requested type by (project_id,type).
     // The final NULL also searches any legacy row with a NULL scope.
-    private static let projectCatalogRowIDs = """
+    private static let globalFamilyRowIDs = """
         WITH RECURSIVE scopes(project_id) AS (
             SELECT min(project_id) FROM records INDEXED BY records_scope WHERE project_id IS NOT NULL
             UNION ALL

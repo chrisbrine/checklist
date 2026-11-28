@@ -60,7 +60,9 @@ enum StorageSnapshotAuthority {
     // Closed current authority catalog, not a permission grant from a path.
     static let knownTypes = Set(EnvelopeFamily.catalog.keys)
 
-    static func inventory(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil, retainedExists: (String) throws -> Bool) throws -> StorageSnapshotInventory {
+    static func inventory(_ db: Database, root: URL, budget: StorageSnapshotBudget, objectRoot: URL? = nil,
+                          checkUnsettledOriginal: ((String) throws -> Bool)? = nil,
+                          retainedExists: (String) throws -> Bool) throws -> StorageSnapshotInventory {
         var objects: [String: StorageSnapshotObject] = [:]
         var attributions: [String: Set<String>] = [:]
         var unavailable: [StorageSnapshotAbsence] = [], external: [String] = []
@@ -110,8 +112,8 @@ enum StorageSnapshotAuthority {
                 }
             }
         }
-        func add(_ value: StorageSnapshotObject) throws {
-            if cleaned[value.relativePath]?.contains(where: {object in
+        func add(_ value: StorageSnapshotObject, useDoneCleanupReceipt: Bool = true) throws {
+            if useDoneCleanupReceipt, cleaned[value.relativePath]?.contains(where: {object in
                 (value.expectedSHA256 == nil || object.sha == value.expectedSHA256) &&
                 (value.expectedSize == nil || object.size == value.expectedSize) &&
                 object.kind == value.kind
@@ -146,12 +148,14 @@ enum StorageSnapshotAuthority {
             budget.measurement.lowerBound = true
             guard objects.count <= budget.maximumObjects else { throw budget.capacityFailure("snapshot_object_capacity") }
         }
-        func regular(path: String, family: String, sha: String?, size: Int64?, executable: Bool = false, authority: String) throws {
+        func regular(path: String, family: String, sha: String?, size: Int64?, executable: Bool = false,
+                     authority: String, useDoneCleanupReceipt: Bool = true) throws {
             if let size, size < 0 { throw StorageSnapshotFailure.unsupportedAuthority }
             let decision = try relocation.decision(path, family: family, root: root)
             guard let relative = decision.relative else { try recordAbsence(authority, "outside_store_root"); return }
             try add(StorageSnapshotObject(relativePath: relative, kind: "file", expectedSHA256: sha,
-                expectedSize: size, executable: executable, linkTarget: nil, authorities: [authority]))
+                expectedSize: size, executable: executable, linkTarget: nil, authorities: [authority]),
+                useDoneCleanupReceipt:useDoneCleanupReceipt)
             if let size, size > budget.maximumObjectBytes { throw budget.capacityFailure("snapshot_object_bytes") }
         }
         func capture(_ value: [String: Any], attribution: String) throws {
@@ -219,11 +223,37 @@ enum StorageSnapshotAuthority {
                     guard mode == "managed" else { throw StorageSnapshotFailure.unsupportedAuthority }
                     _ = try text(value, "project_id")
                     let availability = try text(value, "availability")
+                    let loss = try AttachmentOriginalLoss.recorded(in:value)
                     if availability == "available" {
                         guard let size = (value["size"] as? NSNumber)?.int64Value else { throw StorageSnapshotFailure.unsupportedAuthority }
                         try regular(path: try text(value, "path"), family: "objects",
-                            sha: try digest(value["sha256"]), size: size, authority: authority + ":original")
+                            sha: try digest(value["sha256"]), size: size, authority: authority + ":original",
+                            useDoneCleanupReceipt:checkUnsettledOriginal == nil)
+                    } else if loss != nil && value["path"] == nil {
+                        // A portable project import can retain a validated loss
+                        // and preview without creating a local original path.
+                        try recordAbsence(authority,availability)
+                    } else if availability == CommandRouter.originalCleanupPending || loss != nil {
+                        if loss == nil { _ = try text(value,"original_removal_receipt_id") }
+                        let path = try text(value,"path")
+                        guard let relative = try relocation.decision(path,family:"objects",root:root).relative,
+                              let size = (value["size"] as? NSNumber)?.int64Value else {throw StorageSnapshotFailure.unsupportedAuthority}
+                        if try retainedExists(relative) {
+                            try regular(path:path,family:"objects",sha:try digest(value["sha256"]),size:size,
+                                        authority:authority + ":original",useDoneCleanupReceipt:false)
+                        } else {
+                            try recordAbsence(authority,availability)
+                        }
                     } else if ["original_cleaned", "original_missing", "unavailable", "damaged"].contains(availability) {
+                        // Building a new generation refuses an unexplained ENOENT.
+                        // Verification keeps the projection of older generations
+                        // that omitted unavailable originals before settlement existed.
+                        if availability != "original_cleaned", let checkUnsettledOriginal,
+                           let path = value["path"] as? String,
+                           let relative = try relocation.decision(path,family:"objects",root:root).relative,
+                           try !checkUnsettledOriginal(relative) {
+                            throw StorageSnapshotFailure.failed("fstatat",path:relative,root:root.path,code:ENOENT)
+                        }
                         try recordAbsence(authority, availability)
                     } else { throw StorageSnapshotFailure.unsupportedAuthority }
                     if value["preview_path"] != nil {

@@ -4,7 +4,7 @@ import GRDB
 @testable import ChecklistCore
 
 final class WorkHealthPreparationChangesTests: XCTestCase {
-    private static let families = ["task", "attempt", "project", "group", "status"]
+    private static let families = ["task", "attempt", "project", "group", "status", "tag"]
     private static let project = "00000000-0000-0000-0000-000000000001"
     private static let task = "00000000-0000-0000-0000-000000000002"
 

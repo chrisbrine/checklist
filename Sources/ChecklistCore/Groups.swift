@@ -233,11 +233,15 @@ extension CommandRouter {
     /// Empty fields retains the full legacy projection. List summaries avoid loading
     /// histories and lifecycle records that would be discarded by listProjection.
     func groupProjection(_ db: Database,_ source: JSON,fields: Set<String> = []) throws -> JSON {
+        try groupProjection(db,source,fields:fields,listRecords:nil)
+    }
+
+    private func groupProjection(_ db: Database,_ source: JSON,fields: Set<String>,listRecords: TriageListRecords?) throws -> JSON {
         var group = source
         if source["kind"] as? String == "triage" {
             let projectID = try StoredRecord(source, family: "group").string("project_id")
             let ids = triageMemberIDs(source)
-            let tasks = try ids.map { try scoped(db, $0, projectID, type: "task") }
+            let tasks = try ids.map { try listRecords?.task($0) ?? scoped(db,$0,projectID,type:"task") }
             let statuses = Set(tasks.compactMap {$0["status_id"] as? String})
             let state = tasks.isEmpty ? "empty" : (statuses.count == 1 ? "uniform" : "mixed")
             let uniformStatus = try statuses.count == 1 ? record(db,statuses.first!,type:"status") : nil
@@ -264,15 +268,18 @@ extension CommandRouter {
                 group["orchestration_connection"] = current ? "current" : "recovery_required"
             }
             if fields.isEmpty || fields.contains("membership_history") {
-                let exits = try groupRelatedRecords(db,source,type:"triage_membership_exit",field:"triage_id")
-                group["membership_history"] = try groupRelatedRecords(db,source,type:"triage_membership_interval",field:"triage_id").map { interval -> JSON in
+                let exits = try listRecords?.records("triage_membership_exit",source:source)
+                    ?? groupRelatedRecords(db,source,type:"triage_membership_exit",field:"triage_id")
+                let intervals = try listRecords?.records("triage_membership_interval",source:source)
+                    ?? groupRelatedRecords(db,source,type:"triage_membership_interval",field:"triage_id")
+                group["membership_history"] = intervals.map { interval -> JSON in
                     var interval = interval;interval["exit"] = exits.first {$0["membership_id"] as? String == interval["id"] as? String} ?? NSNull();return interval
                 }
             }
             if fields.isEmpty || fields.contains("batches") {
-                group["batches"] = try groupRelatedRecords(db,source,type:"batch",field:"triage_id").map { batch -> JSON in
-                    try batchGroupSummary(db, batch)
-                }
+                let batches = try listRecords?.records("batch",source:source)
+                    ?? groupRelatedRecords(db,source,type:"batch",field:"triage_id")
+                group["batches"] = try batches.map { try batchGroupSummary(db,$0,listRecords:listRecords) }
             }
             return group
         }
@@ -290,14 +297,21 @@ extension CommandRouter {
         group["description"] = group["brief"]
         return group
     }
-    private func batchGroupSummary(_ db: Database, _ batch: JSON) throws -> JSON {
+    private func batchGroupSummary(_ db: Database,_ batch: JSON,listRecords: TriageListRecords?) throws -> JSON {
         let record = StoredRecord(batch, family: "batch")
         var summary: JSON = [
             "id": try record.requiredValue("id"), "phase": try record.requiredValue("phase"),
             "created_at": try record.requiredValue("created_at"), "triage_revision": try record.requiredValue("triage_revision"),
             "member_count": (batch["members"] as? [JSON] ?? []).count, "digest": try record.requiredValue("digest"),
         ]
-        summary.merge(try batchLifecycle(db, batch)) { _, new in new }
+        let lifecycle: JSON
+        if let listRecords {
+            let batchID = try record.string("id")
+            lifecycle = try batchLifecycle { try listRecords.firstBatchRecord($0,batchID:batchID) }
+        } else {
+            lifecycle = try batchLifecycle(db,batch)
+        }
+        summary.merge(lifecycle) { _, new in new }
         return summary
     }
     /// Existing scope index selects the record family; unrelated rich histories
@@ -367,7 +381,59 @@ extension CommandRouter {
                     ])
             }
         }
-        return ["groups":listProjection(try groups.map {try groupProjection(db,$0,fields:fields)},fields:fields)]
+        let listRecords = kind == "triage" && groups.count > 1 ? try triageListRecords(db,projectID:pid,groups:groups,fields:fields) : nil
+        return ["groups":listProjection(try groups.map {try groupProjection(db,$0,fields:fields,listRecords:listRecords)},fields:fields)]
+    }
+    /// Seek each member by primary key. Visit each requested history family once
+    /// in the same read transaction, keeping original rowid and lifecycle order.
+    private func triageListRecords(_ db: Database,projectID: String,groups: [JSON],fields: Set<String>) throws -> TriageListRecords {
+        var list = TriageListRecords()
+        let encodedTasks = try jsonString(groups.flatMap(triageMemberIDs))
+        let sql = "SELECT " + Self.canonicalColumns(alias:"t") + """
+             FROM (SELECT DISTINCT value FROM json_each(?)) member
+             CROSS JOIN records t ON t.id=member.value
+             WHERE t.project_id=CAST(? AS TEXT) AND t.type='task'
+            """
+        for row in try fetchStoreRows(db,sql:sql,arguments:[encodedTasks,Data(projectID.utf8)]) {
+            let task = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"task")
+            list.tasks[Data(task.id.utf8)] = task.object
+        }
+        guard fields.isEmpty || fields.contains("membership_history") || fields.contains("batches") else { return list }
+        let groupIDs = try jsonString(groups.map { try StoredRecord($0,family:"group").string("id") })
+        if fields.isEmpty || fields.contains("membership_history") {
+            for type in ["triage_membership_exit","triage_membership_interval"] {
+                list.groupRows[type] = try groupedHistoryRows(db,projectID:projectID,type:type,field:"triage_id",ids:groupIDs)
+            }
+        }
+        if fields.isEmpty || fields.contains("batches") {
+            let batches = try groupedHistoryRows(db,projectID:projectID,type:"batch",field:"triage_id",ids:groupIDs)
+            list.groupRows["batch"] = batches
+            let batchIDs = try batches.values.flatMap { rows in
+                try rows.map { try GRDBRecordEnvelopeAdapter.decode($0).id }
+            }
+            if !batchIDs.isEmpty {
+                let ids = try jsonString(batchIDs)
+                for type in ["batch_claim","batch_disposition","attempt"] {
+                    list.batchRows[type] = try groupedHistoryRows(db,projectID:projectID,type:type,field:"batch_id",ids:ids,firstOnly:true)
+                }
+            }
+        }
+        return list
+    }
+    private func groupedHistoryRows(_ db: Database,projectID: String,type: String,field: String,ids: String,firstOnly: Bool = false) throws -> [Data:[Row]] {
+        let link = "json_extract(data,'$." + field + "') COLLATE BINARY"
+        let candidates = "FROM records INDEXED BY records_scope WHERE type=? AND project_id=?"
+            + " AND " + link + " IN (SELECT value FROM json_each(?))"
+        let matching: String
+        if firstOnly {
+            matching = "FROM records WHERE rowid IN (SELECT MIN(rowid) " + candidates + " GROUP BY " + link + ")"
+        } else {
+            matching = candidates
+        }
+        let sql = "SELECT " + Self.canonicalRecordColumns + ",CAST(" + link + " AS BLOB) AS history_link "
+            + matching + " ORDER BY rowid"
+        let rows = try fetchStoreRows(db,sql:sql,arguments:[type,projectID,ids])
+        return Dictionary(grouping:rows,by:{ $0["history_link"] as Data })
     }
     func groupWrite(_ db: Database,_ p: JSON,_ c: Caller,_ method: String) throws -> JSON {
         try worker(c);let pid = try scope(db,p,c,write:true)
@@ -454,5 +520,27 @@ extension CommandRouter {
         }
         group = try joinTriage(db,group:group,taskID:tid,caller:c,reason:"explicit_add",returnTriageID:carried)
         return try groupProjection(db,group)
+    }
+}
+
+private struct TriageListRecords {
+    var tasks: [Data:JSON] = [:]
+    var groupRows: [String:[Data:[Row]]] = [:]
+    var batchRows: [String:[Data:[Row]]] = [:]
+
+    func task(_ id: String) throws -> JSON {
+        guard let task = tasks[Data(id.utf8)] else {
+            throw CoreError("NOT_FOUND", "This record is not available in this project.")
+        }
+        return task
+    }
+
+    func records(_ type: String,source: JSON) throws -> [JSON] {
+        let key = Data(try StoredRecord(source,family:"group").string("id").utf8)
+        return try (groupRows[type]?[key] ?? []).map { try GRDBRecordEnvelopeAdapter.decode($0).object }
+    }
+
+    func firstBatchRecord(_ type: String,batchID: String) throws -> JSON? {
+        try batchRows[type]?[Data(batchID.utf8)]?.first.map { try GRDBRecordEnvelopeAdapter.decode($0).object }
     }
 }

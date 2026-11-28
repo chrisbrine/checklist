@@ -46,7 +46,19 @@ struct StorageSettingsSummary {
         switch attention["reason"] as? String {
         case "snapshot_free_space": return "Backup needs more free space"
         case "snapshot_deadline": return "Backup ran out of time"
+        case "file_missing":
+            let project = attention["project_name"] as? String ?? attention["project_id"] as? String ?? ""
+            let ticket = attention["ticket_key"] as? String ?? attention["task_id"] as? String
+            let attachment = attention["attachment_name"] as? String ?? attention["attachment_id"] as? String ?? ""
+            let title = attention["representation"] as? String == "preview" ? "Backup blocked by a missing preview" : "Backup blocked by a missing original"
+            return [title, project, ticket, attachment].compactMap { $0 }.joined(separator:" · ")
         default: return "Backup reached a storage limit"
+        }
+    }
+    static func backupAttentionItems(_ info: [String:Any]) -> [[String:Any]] {
+        ["backup_missing_attachment_attention","backup_capacity_attention"].compactMap {key in
+            guard let item = info[key] as? [String:Any],!item.isEmpty else {return nil}
+            return item
         }
     }
     static func automaticBackup(_ raw: Any?) -> [Row] {
@@ -57,6 +69,9 @@ struct StorageSettingsSummary {
         var rows = [Row(label: "Last attempt", value: states[state] ?? "Outcome unknown")]
         if let attempted = attempt["attempted_at"] as? String { rows.append(Row(label: "Attempted", value: attempted)) }
         if state == "failed" {
+            if attempt["attachment_id"] is String {
+                rows.append(Row(label:"Failure",value:backupAttentionTitle(attempt)))
+            }
             if let step = attempt["next_step"] as? String { rows.append(Row(label: "Next step", value: step)) }
             if let retry = attempt["retry_not_before"] as? String { rows.append(Row(label: "Retry no earlier than", value: retry)) }
         }

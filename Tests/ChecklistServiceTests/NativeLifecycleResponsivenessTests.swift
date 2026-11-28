@@ -137,7 +137,18 @@ final class NativeLifecycleResponsivenessTests: XCTestCase {
     }
 
     private func fixture(claudeCount: Int, notes: Int, deliveries: Int, fillerBytes: Int) throws -> Fixture {
-        let parent = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/ChecklistQualification/r12-N2/test-fixtures")
+        let qualification = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/ChecklistQualification").resolvingSymlinksInPath()
+        let parent: URL
+        if let path = ProcessInfo.processInfo.environment["CHECKLIST_LIFECYCLE_FIXTURE_ROOT"] {
+            let selected = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+            guard path.hasPrefix("/"), selected.path.hasPrefix(qualification.path + "/") else {
+                throw XCTSkip("Use an isolated lifecycle fixture directory under Library/Caches/ChecklistQualification.")
+            }
+            parent = selected
+        } else {
+            parent = qualification.appendingPathComponent("r12-N2/test-fixtures")
+        }
         let root = parent.appendingPathComponent("native-lifecycle-response-" + UUID().uuidString).resolvingSymlinksInPath().standardizedFileURL
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let instance = try ChecklistInstance(home: root, environment: [:])
