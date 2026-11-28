@@ -411,17 +411,32 @@ Trash. The parent cache, loose evidence and unmarked children stay. When a
 receipt in the shared files identifies the installed or immediate rollback build,
 every workspace in the round stays. Apply prepares same-volume Trash destinations
 in bounded groups. After each earlier move and its receipt output, apply scans
-the next path's shared round for receipts and takes a fresh process observation.
-The scan discovers newly created receipts even when an earlier rename changed
-the same directory timestamp. Apply then checks the recorded inventory,
-workspace markers, explicit keeps, installed and rollback identities, and the
-latest process result. A change refuses the affected move.
+the next path's shared round for receipts. The scan discovers new receipts in a
+directory whose timestamp an earlier rename changed. Apply finishes the path's
+inventory, directory and permission checks, then verifies workspace markers,
+explicit keeps, ownership, release state, and installed and rollback identities.
+A change refuses the affected move.
 
-Once the final metadata checks pass, apply calls an exclusive, no-follow rename
-in the same process. The gap contains no scan, directory walk or subprocess.
-A process can open the next path after that path's process observation.
-A writer can also change a path after its final metadata read. The observations
-leave other processes free to act during those intervals.
+Apply takes its final process observation after those checks. When the path is
+idle, it calls an exclusive, no-follow rename in the same process. Once the
+observation returns, the rename follows without a filesystem scan, metadata
+read or subprocess. A process can open a file after its record is sampled.
+A writer can also change a path after its final metadata read, including
+during the process observation.
+
+The measured process-to-rename window on 28 November 2026 used three generated
+released workspaces, native `lsof` and `ps`, and a temporary Trash. Each row runs
+from the start of the path's final observation to entry into its prepared rename.
+The last column measures from the observation's return to that same entry.
+
+| Payload files | Load (1m, 5m, 15m) | Start to rename | Return to rename |
+| --- | --- | ---: | ---: |
+| 1 | 299.82, 293.00, 250.80 | 5.548 s | 135.1 ms |
+| 1,000 | 300.71, 293.30, 251.15 | 2.725 s | 5.4 ms |
+| 12,000 | 300.02, 293.28, 251.39 | 1.728 s | 9.2 ms |
+
+These timings describe the recorded run. The observation and rename leave
+other processes free to act during the checks.
 See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 

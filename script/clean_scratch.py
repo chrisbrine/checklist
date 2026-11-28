@@ -1162,28 +1162,39 @@ def restore_modes(modes, destinations):
             os.close(descriptor)
 
 
-def validate_move(decision, path, used, installations, shared, observed_shared, round_hold, keep,
-                  session_id, include_released, modes):
-    """Check only named paths and observations. The caller can rename on return."""
-    item = Path(decision['path'])
-    if item in used:
-        raise ValueError('running process began using item; stopped')
+def inventory_stamps_match(expected):
+    # Check directory stamps after payload entries so a file added during the
+    # payload checks can still invalidate its recorded parent.
+    directories = {}
+    for path, stamp in expected.items():
+        if stat.S_ISDIR(stamp[2]):
+            directories[path] = stamp
+        elif path_stamp(path) != stamp:
+            return False
+    return all(path_stamp(path) == directories[path] for path in reversed(directories))
+
+
+def validate_workspace_scope(decision, item, keep, session_id, include_released):
     if any(overlap(item, folder) for folder in keep):
         raise ValueError('explicitly retained qualified copy or persistent build slot')
-    before = decision['inventory']
-    inventory_unchanged = stamps_match(before)
-    shared_unchanged = observed_shared == shared and stamps_match(shared)
     if not in_scope(item, decision['kind'], session_id, include_released) or not stamps_match(decision['markers']):
         raise ValueError('workspace ownership/release changed; stopped')
+
+
+def validate_move(decision, path, installations, shared, observed_shared, round_hold, keep,
+                  session_id, include_released, modes):
+    """Finish the filesystem and policy checks before the final process read."""
+    item = Path(decision['path'])
+    before = decision['inventory']
+    inventory_unchanged = inventory_stamps_match(before)
+    shared_unchanged = observed_shared == shared and inventory_stamps_match(shared)
+    validate_workspace_scope(decision, item, keep, session_id, include_released)
     if not inventory_unchanged:
         raise ValueError('item changed during inspection/Trash moves; stopped')
     if round_hold:
         raise ValueError(str(round_hold) + '; stopped before Trash')
     if not shared_unchanged:
         raise ValueError('shared round contents changed during inspection; stopped')
-    if any(path_stamp(file, follow_symlinks=follow) != stamp for (file, follow), stamp in installations.items()):
-        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
-
     root = permission_root(item, decision['kind'], session_id)
     writable_directory(path.parent, before.get(path.parent) or shared.get(os.fspath(path.parent)), root, modes)
     if stat.S_ISDIR(before[path][2]):
@@ -1197,6 +1208,12 @@ def validate_move(decision, path, used, installations, shared, observed_shared, 
         valid = observed == expected
     if not valid:
         raise ValueError('item changed during inspection/Trash moves; stopped')
+
+    # Permission preparation and its stat checks also precede the last policy
+    # check and process observation.
+    validate_workspace_scope(decision, item, keep, session_id, include_released)
+    if any(path_stamp(file, follow_symlinks=follow) != stamp for (file, follow), stamp in installations.items()):
+        raise ValueError('installed round changed; rerun preview with its qualified copy retained')
 
 
 def record_move(decision, path, destination):
@@ -1250,15 +1267,19 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
         shared = shared_snapshots.get(parent, {})
         observed = {}
         try:
+            # The first path can stop early on a known process hold before
+            # scanning receipts or inventory. In a split round, also observe
+            # after the shared scan so a hold can avoid the inventory pass.
+            preflight, first = first, False
+            early_processes = list(process_reader()) if preflight else []
+            if used_items(early_processes, (item,)):
+                raise ValueError('running process began using item; stopped')
             # A fresh walk rediscovers receipts even when an earlier rename
-            # updated the same directory's timestamp. Complete it before the
-            # current process observation and after the prior receipt output.
+            # updated the same directory's timestamp.
             round_roots = {parent: rounds[parent]} if parent in rounds else {}
-            processes = list(process_reader()) if first and round_roots else []
-            first = False
             hold = shared_round_holds(round_roots, fingerprint, previous, observed).get(parent)
-            processes.extend(process_reader())
-            used = used_items(processes, (item,))
+            if preflight and round_roots and used_items(process_reader(), (item,)):
+                raise ValueError('running process began using item; stopped')
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             move_error(decision, error, path, stop=True)
             continue
@@ -1266,12 +1287,20 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
         destination = None
         try:
             try:
-                validate_move(decision, path, used, installations, shared, observed.get(parent, {}), hold, keep,
+                validate_move(decision, path, installations, shared, observed.get(parent, {}), hold, keep,
                               session_id, include_released, modes)
             except PermissionError as error:
                 move_error(decision, error, path)
                 continue
             except (OSError, ValueError) as error:
+                move_error(decision, error, path, stop=True)
+                continue
+            # This observation belongs to this rename. No filesystem checks,
+            # process setup or receipt output follow it before the mover.
+            try:
+                if used_items(process_reader(), (item,)):
+                    raise ValueError('running process began using item; stopped')
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
                 move_error(decision, error, path, stop=True)
                 continue
             if mover is None:

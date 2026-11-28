@@ -651,9 +651,12 @@ class CleanScratchTests(unittest.TestCase):
         item = self.item();self.write(item, '.build/object')
         source = self.write(item, 'src/source.py', b'old source\n')
         self.write(item, 'note', b'private')
-        reader = iter([[], [], [item / 'new-process-cwd']])
+        # Observe the new use only after the first path really moved.
+        def processes():
+            return [] if (item / '.build').exists() else [item / 'new-process-cwd']
+
         with patch.object(cleanup, 'MOVE_BATCH_SIZE', 1):
-            result, records = self.run_cleanup(apply=True, process_reader=lambda: next(reader))
+            result, records = self.run_cleanup(apply=True, process_reader=processes)
         self.assertEqual(result, 1);self.assertTrue(source.exists())
         self.assertEqual(records[0]['action'], 'trash_move')
         self.assertIn('running process began', records[1]['reason'])
@@ -1173,18 +1176,20 @@ class CleanScratchTests(unittest.TestCase):
                 items = [self.item(name, session=session) for name in ['a', 'b', 'c']]
                 for item in items:
                     self.write(item, '.build/object')
-                calls = 0
+                retry_pending = False
                 def reader():
-                    nonlocal calls
-                    calls += 1
-                    if calls == 4:
+                    nonlocal retry_pending
+                    if retry_pending:
+                        retry_pending = False
                         if failure == 'process':
                             raise OSError('fixture process inspection failed')
                         self.installed.write_text(json.dumps({'source_fingerprint': 'b' * 64}))
                     return []
                 def partial(paths):
+                    nonlocal retry_pending
                     path, = paths
                     if path == items[1]:
+                        retry_pending = True
                         raise PermissionError('fixture second move failed')
                     yield path, trash(path)
                 result, records = self.run_cleanup(apply=True, session_id=session,
@@ -1217,7 +1222,7 @@ class CleanScratchTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(result, 0)
         self.assertLess(elapsed, 60, f'large tree apply took {elapsed:.2f}s')
-        self.assertEqual(processes.call_count, 251)  # Fresh observation for each move, plus planning.
+        self.assertEqual(processes.call_count, 259)  # Planning, 8 group preflights, 250 final samples.
         self.assertEqual(inspected.call_count, 500)  # Plan and post-move walks, no walk in the final gate.
         summaries = [r for r in records if r['action'] == 'trashed']
         self.assertEqual(len(summaries), 250)
@@ -1559,7 +1564,8 @@ class CleanScratchTests(unittest.TestCase):
         }
         round_wide = {'installed matches receipt', 'rollback matches receipt', 'shared receipt matches installed'}
         between_moves = {'after rename', 'after receipt output'}
-        stages = ('shared scan', 'process refresh', 'size walk', 'after rename', 'after receipt output')
+        stages = ('shared scan', 'process refresh', 'size walk', 'after rename', 'after receipt output',
+                  'final metadata')
         for stage_index, stage in enumerate(stages):
             for case_index, (case, expected_reason) in enumerate(change_cases.items()):
                 with self.subTest(stage=stage, change=case):
@@ -1631,6 +1637,14 @@ class CleanScratchTests(unittest.TestCase):
 
                     scans, reads = 0, 0
                     scan_receipts, size_reader = cleanup.shared_round_receipts, cleanup.du_sizes
+                    read_stamp = cleanup.path_stamp
+
+                    def during_metadata(path, *, follow_symlinks=False):
+                        # The released checkout's payload is inspected here
+                        # during the final inventory pass, after planning.
+                        if path == payload and not injected:
+                            inject('final metadata')
+                        return read_stamp(path, follow_symlinks=follow_symlinks)
 
                     def scan(root, workspaces):
                         nonlocal scans
@@ -1668,6 +1682,7 @@ class CleanScratchTests(unittest.TestCase):
 
                     with patch.object(cleanup, 'shared_round_receipts', side_effect=scan), \
                          patch.object(cleanup, 'du_sizes', side_effect=size_walk), \
+                         patch.object(cleanup, 'path_stamp', side_effect=during_metadata), \
                          patch.object(cleanup, 'note_directory_changes', side_effect=after_rename), \
                          patch.object(cleanup, 'record_move', side_effect=after_receipt):
                         code, rows = self.run_cleanup(
@@ -1679,7 +1694,8 @@ class CleanScratchTests(unittest.TestCase):
                     held = by_path[str(checkout)]
                     self.assertEqual(held['action'], 'kept_error')
                     reason = expected_reason
-                    if case == 'shared receipt matches installed' and stage == 'process refresh':
+                    if (case == 'shared receipt matches installed'
+                            and stage in {'process refresh', 'final metadata'}):
                         reason = 'shared round contents changed during inspection; stopped'
                     self.assertEqual(held['reason'], reason)
                     self.assertEqual(held['moved_count'], 0)
@@ -1691,6 +1707,32 @@ class CleanScratchTests(unittest.TestCase):
                     self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
                                      expected_moves)
                     self.assertEqual(sibling.is_dir(), case in round_wide)
+
+    def test_final_process_observation_precedes_rename_without_other_reads(self):
+        item = self.item()
+        source = self.write(item, '.build/object').parent
+        self.write(item, 'hand-in.md')
+        events = []
+        original_stamp = cleanup.path_stamp
+
+        def stamp(path, *, follow_symlinks=False):
+            events.append('metadata')
+            return original_stamp(path, follow_symlinks=follow_symlinks)
+
+        def observe():
+            events.append('process observation')
+            return []
+
+        def rename(paths):
+            self.assertEqual(paths, [source])
+            self.assertEqual(events[-2:], ['metadata', 'process observation'])
+            yield source, trash(source)
+
+        with patch.object(cleanup, 'path_stamp', side_effect=stamp):
+            result, records = self.run_cleanup(apply=True, process_reader=observe, mover=rename)
+        self.assertEqual(result, 0)
+        self.assertEqual([row['source'] for row in records if row['action'] == 'trash_move'],
+                         [str(source)])
 
     def test_partial_move_cannot_adopt_an_unplanned_entry_in_its_parent(self):
         item = self.item()
