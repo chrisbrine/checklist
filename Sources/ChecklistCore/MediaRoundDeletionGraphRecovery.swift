@@ -10,7 +10,13 @@ extension CommandRouter {
     /// TEMP triggers cover a running attempt. Reopen checks the durable witness
     /// against a new reader snapshot before it uses any saved row positions.
     func validateMediaDeletionGraphResume(_ db: Database,progress: DeletionGraph.Progress,
-                                          work: DeletionGraph.Work, historyKey: String, historyLimit: Int) throws -> MediaGraphResumeHistory? {
+                                          work: DeletionGraph.Work, historyKey: String, historyLimit: Int,
+                                          command: String) throws -> MediaGraphResumeHistory? {
+        let timing = StoragePhaseTiming(operation:"media_round_graph_resume",command:command,
+                                       uptime:{ProcessInfo.processInfo.systemUptime})
+        var outcome = "failed"
+        timing.record("graph_selection")
+        defer {timing.record(outcome,terminal:true)}
         if !work.handoffOnlyIDs.isEmpty, progress.handoffWitnessCount == nil {
             throw StoreRecovery.required("media_deletion_graph_handoff_unverified")
         }
@@ -70,22 +76,55 @@ extension CommandRouter {
             throw MediaRoundDeletionFence.changed("planned_record_changed",type:String(decoding:witness.type,as:UTF8.self),id:id)
         }
         guard owned.count == progress.total else {throw StoreRecovery.required("media_deletion_graph_progress_invalid")}
-        func tokens(_ raw: String) throws -> Set<Data> {
-            let values = try JSONDecoder().decode([String].self,from:Data(raw.utf8))
-            return Set(values.map {Data($0.utf8)})
+        let tokens = try JSONDecoder().decode([String].self,from:Data(work.fence.tokens.utf8))
+        let needles = Set(tokens.map {Data($0.utf8)})
+        let kept = work.kept, handoffs = undetachedHandoffs
+        let budget = MediaRoundDeletionReferenceBudget()
+        timing.record("reference_and_history_scan",rowsRead:owned.count)
+        @Sendable func observeReferences(_ reader: Database,partition: TicketCleanupRowRange? = nil) throws -> MediaRoundDeletionReferences {
+            try self.mediaRoundDeletionReferences(reader,owned:owned,retainedAttachments:kept,
+                handoffOnlyIDs:handoffs,needles:needles,holdDigests:[],deletionTasks:[],partition:partition,budget:budget)
         }
-        _ = try mediaRoundDeletionReferences(db,owned:owned,retainedAttachments:work.kept,
-            handoffOnlyIDs:undetachedHandoffs,needles:tokens(work.fence.tokens),
-            holdDigests:[],deletionTasks:[],
-            budget:MediaRoundDeletionReferenceBudget())
         // A resumed attempt may have stopped because new history appeared
         // after visibility. Select it again against the original identities,
         // including ones already removed, before resuming physical deletion.
-        let history = try MediaRoundDeletionHistory.select(db,project:progress.project,owned:owned,progressKey:historyKey,
-                                                            continuing:true,writerLimit:historyLimit,projectFinal:true)
-        guard !history.events.isEmpty || !history.commands.isEmpty else {return nil}
+        @Sendable func observeHistory(_ reader: Database) throws -> MediaRoundDeletionHistory {
+            try MediaRoundDeletionHistory.select(reader,project:progress.project,owned:owned,progressKey:historyKey,
+                                                  continuing:true,writerLimit:historyLimit,projectFinal:true)
+        }
+        let ranges = try TicketCleanupRowRange.split(db,count:MediaRoundDeletionReadWork.partitions)
+        var scanRows = 0
+        var history: MediaRoundDeletionHistory?
+        if let pieces = try MediaRoundDeletionReadWork.perform(db,read:{reader,index in
+            let started = ProcessInfo.processInfo.systemUptime
+            if index < ranges.count {
+                return .references(try observeReferences(reader,partition:ranges[index]),ProcessInfo.processInfo.systemUptime - started)
+            }
+            return .history(try observeHistory(reader),ProcessInfo.processInfo.systemUptime - started)
+        }) {
+            for piece in pieces {
+                switch piece {
+                case .references(let rows,_): scanRows += rows.rowsRead
+                case .history(let value,_): history = value
+                }
+            }
+        }
+        if history == nil {
+            // A failed fanout shares no admitted byte charges with the serial
+            // fallback. Its snapshot remains the one pinned by the caller.
+            scanRows = try mediaRoundDeletionReferences(db,owned:owned,retainedAttachments:kept,
+                handoffOnlyIDs:handoffs,needles:needles,holdDigests:[],deletionTasks:[],
+                budget:MediaRoundDeletionReferenceBudget()).rowsRead
+            history = try observeHistory(db)
+        }
+        timing.record("fence_observation",rowsRead:scanRows)
+        guard let history, !history.events.isEmpty || !history.commands.isEmpty else {
+            outcome = "complete"
+            return nil
+        }
         let fence = try MediaRoundDeletionFence(db,ids:[],events:history.events,commands:history.commands,
                                                needles:[],pendingRequestTasks:[],holdDigests:[],filePaths:[])
+        outcome = "complete"
         return .init(rows:history,fence:fence)
 
     }

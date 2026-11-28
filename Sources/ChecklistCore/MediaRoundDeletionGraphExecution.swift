@@ -1,14 +1,37 @@
 import Foundation
 import GRDB
+import SQLite3
 
 enum MediaRoundDeletionWriterBudget: Error {
     case history
     case graph(String)
+    case indivisibleGraphStep
 }
 
 extension CommandRouter {
     typealias DeletionGraph = MediaRoundDeletionGraph
     static let mediaGraphWriterBudget: TimeInterval = 0.25
+    private static let mediaGraphMinimumStepInstructionLimit = 4_096_000
+
+    private static func withMediaGraphMinimumStepBudget(_ db: Database, _ body: () throws -> Void) throws {
+        // Loaded hosts can deschedule the writer during even one indexed
+        // update. Bound the SQLite work without expiring that unit while idle.
+        let interval: Int32 = 1_000
+        var remaining = mediaGraphMinimumStepInstructionLimit / Int(interval)
+        try withUnsafeMutablePointer(to:&remaining) { budget in
+            sqlite3_progress_handler(db.sqliteConnection,interval,{ context in
+                guard let context else {return 1}
+                let remaining = context.assumingMemoryBound(to:Int.self)
+                remaining.pointee -= 1
+                return remaining.pointee <= 0 ? 1 : 0
+            },budget)
+            defer { sqlite3_progress_handler(db.sqliteConnection,0,nil,nil) }
+            do {try body()}
+            catch let error as DatabaseError where error.resultCode == .SQLITE_INTERRUPT {
+                throw MediaRoundDeletionWriterBudget.indivisibleGraphStep
+            }
+        }
+    }
 
     struct GraphDeletionContext {
         let params: JSON
@@ -57,28 +80,31 @@ extension CommandRouter {
     /// its cursor unchanged, including when committing throws.
     private func writeMediaDeletionGraph(_ context: GraphDeletionContext, phase: String,
                                          from current: DeletionGraph.Progress?, to next: DeletionGraph.Progress?,
+                                         records: Int? = nil, indivisible: Bool = false,
                                          apply: (Database) throws -> Void) throws {
         let passStarted = ProcessInfo.processInfo.systemUptime
         let pass = next?.pass ?? ((current?.pass ?? 0) + 1)
+        let softBudget = ["media_round_graph_hide","media_round_history_pass"].contains(phase)
+            ? Self.mediaDeletionWriterBudget : Self.mediaGraphWriterBudget
         var seconds: TimeInterval?, committed = false
         defer {
             if let seconds {
                 StoragePhaseTiming.writerHold(operation:phase,command:context.command,pass:pass,seconds:seconds,committed:committed,
-                    elapsedSeconds:ProcessInfo.processInfo.systemUptime - passStarted,interruptedStep:committed ? nil : phase)
+                    elapsedSeconds:ProcessInfo.processInfo.systemUptime - passStarted,interruptedStep:committed ? nil : phase,
+                    budgetSeconds:indivisible ? nil : softBudget,
+                    instructionLimit:indivisible ? Self.mediaGraphMinimumStepInstructionLimit : nil,records:records)
                 mediaRoundDeletionWriterProbe?(phase,seconds,committed)
             }
         }
         let encoded = try next.map(DeletionGraph.encode)
         // The visibility write and a resumed history pass may still carry
         // the last history batch. Give them the same budget as other history.
-        let budget = ["media_round_graph_hide","media_round_history_pass"].contains(phase)
-            ? Self.mediaDeletionWriterBudget : Self.mediaGraphWriterBudget
         try ArchiveStorageGate.withExclusive(root:root) { _ in
             try self.withMediaRoundDeletionWrite {
                 try self.dbQueue.writeWithoutTransaction { db in
                     let started = ProcessInfo.processInfo.systemUptime
                     defer {seconds = ProcessInfo.processInfo.systemUptime - started}
-                    let finished = try Self.withPruneStepBudget(db,seconds:budget) {
+                    func commitStep() throws {
                         try self.withValidatedDomainTransaction(db) {
                             let project = try self.mediaAccess(db,context.params,context.caller,write:true)
                             if let expectedGeneration = context.expectedAuthorizationGeneration {
@@ -98,14 +124,21 @@ extension CommandRouter {
                             } else {
                                 try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[context.key])
                             }
-                            guard ProcessInfo.processInfo.systemUptime - started < budget else {
+                            guard indivisible || ProcessInfo.processInfo.systemUptime - started < softBudget else {
                                 throw MediaRoundDeletionWriterBudget.graph(phase)
                             }
                             return .commit
                         }
-                        return true
                     }
-                    guard finished == true else {throw MediaRoundDeletionWriterBudget.graph(phase)}
+                    if indivisible {
+                        try Self.withMediaGraphMinimumStepBudget(db,commitStep)
+                    } else {
+                        let finished = try Self.withPruneStepBudget(db,seconds:softBudget) {
+                            try commitStep()
+                            return true
+                        }
+                        guard finished == true else {throw MediaRoundDeletionWriterBudget.graph(phase)}
+                    }
                     committed = true
                 }
             }
@@ -239,6 +272,7 @@ extension CommandRouter {
         if cursor.phase == .deleting, let work {
             let graph = try MediaRoundDeletionFence.VisibleGraph(work)
             var batchLimit = DeletionGraph.rowLimit
+            var indivisible = false
             while cursor.next < work.slices.count {
                 try mediaRoundDeletionGraphProbe?()
                 let source = work.slices[cursor.next]
@@ -265,25 +299,38 @@ extension CommandRouter {
                 next.removed += slice.members.count
                 let operation = "media_round_graph_" + slice.kind.rawValue
                 do {
-                    try writeMediaDeletionGraph(context,phase:operation,from:cursor,to:next) { db in
+                    try writeMediaDeletionGraph(context,phase:operation,from:cursor,to:next,
+                                                records:slice.changes.count,indivisible:indivisible) { db in
                         try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,graph:graph)
                         try context.changes.apply(db) {
                             if kept,let updates {try self.detachKeptMediaGraphAttachments(db,context:context,updates:updates)}
                             else {try self.applyMediaGraphSlice(db,context:context,slice:slice,ids:ids,positions:positions,updates:updates)}
                         }
                     }
+                    if indivisible && cursor.next != next.next {
+                        indivisible = false
+                        batchLimit = DeletionGraph.rowLimit
+                    }
                     cursor = next
-                } catch let budget as MediaRoundDeletionWriterBudget {
+                } catch MediaRoundDeletionWriterBudget.graph(_) {
                     let smaller = max(1,(end - cursor.sliceOffset) / 2)
-                    guard source.batchEnd(after:cursor.sliceOffset,limit:smaller) < end else {throw budget}
-                    batchLimit = smaller
+                    if source.batchEnd(after:cursor.sliceOffset,limit:smaller) < end {
+                        batchLimit = smaller
+                    } else {
+                        // One record or a reciprocal import/attachment pair
+                        // is the smallest durable step. Retry it in this
+                        // snapshot with its own bounded admission.
+                        guard end - cursor.sliceOffset <= 2 else {throw MediaRoundDeletionWriterBudget.indivisibleGraphStep}
+                        indivisible = true
+                        batchLimit = 1
+                    }
                 }
             }
             let before = cursor
             cursor.phase = .retiring
             if cursor.handoffWitnessCount == nil {cursor.handoffWitnessCount = 0}
             cursor.pass += 1
-            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire",from:before,to:cursor) { _ in }
+            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire",from:before,to:cursor,indivisible:true) { _ in }
         }
         guard cursor.phase == .retiring, cursor.removed == cursor.total else {
             throw StoreRecovery.required("media_deletion_graph_progress_invalid")
@@ -294,7 +341,7 @@ extension CommandRouter {
             let before = cursor, key = DeletionGraph.shardKey(context.key,cursor.staged - 1)
             cursor.staged -= 1
             cursor.pass += 1
-            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire_journal",from:before,to:cursor) { db in
+            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire_journal",from:before,to:cursor,indivisible:true) { db in
                 try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key])
                 guard db.changesCount == 1 else {throw StoreRecovery.required("media_deletion_graph_journal_missing")}
             }
@@ -307,7 +354,7 @@ extension CommandRouter {
             let key = DeletionGraph.handoffWitnessPrefix(context.key) + String(format:"%08d",offset)
             cursor.handoffWitnessCount = offset
             cursor.pass += 1
-            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire_journal",from:before,to:cursor) { db in
+            try writeMediaDeletionGraph(context,phase:"media_round_graph_retire_journal",from:before,to:cursor,indivisible:true) { db in
                 try db.execute(sql:"DELETE FROM metadata WHERE key=?",arguments:[key])
                 guard db.changesCount == 1 else {throw StoreRecovery.required("media_deletion_graph_handoff_unverified")}
             }
@@ -410,7 +457,7 @@ extension CommandRouter {
         }
         let encoded = try jsonString(marker)
         let successorKey = try mediaGraphSuccessorKey(context,predecessor:progress.predecessor)
-        try writeMediaDeletionGraph(context,phase:"media_round_graph_publish",from:progress,to:nil) { db in
+        try writeMediaDeletionGraph(context,phase:"media_round_graph_publish",from:progress,to:nil,indivisible:true) { db in
             try db.execute(sql:"""
                 UPDATE records SET data=json_set(data,'$.state',json_extract(data,'$.media_graph_cleanup_state'),
                     '$.parent_principal',?,'$.parent_command_id',?,'$.intent_digest',?)

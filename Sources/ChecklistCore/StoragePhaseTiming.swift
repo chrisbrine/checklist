@@ -55,7 +55,8 @@ final class StoragePhaseTiming {
     }
 
     static func writerHold(operation: String, command: String, pass: Int, seconds: TimeInterval, committed: Bool,
-                           elapsedSeconds: TimeInterval? = nil, interruptedStep: String? = nil) {
+                           elapsedSeconds: TimeInterval? = nil, interruptedStep: String? = nil,
+                           budgetSeconds: TimeInterval? = nil, instructionLimit: Int? = nil, records: Int? = nil) {
         var load = [Double](repeating: 0, count: 3)
         let observed = getloadavg(&load, 3)
         var value: JSON = ["kind":"storage_phase_timing", "operation":operation, "phase":"writer_hold",
@@ -63,6 +64,9 @@ final class StoragePhaseTiming {
             "uptime_s":ProcessInfo.processInfo.systemUptime, "load":observed == 3 ? load : [], "time":now()]
         value["elapsed_seconds"] = elapsedSeconds
         value["interrupted_step"] = interruptedStep
+        value["budget_seconds"] = budgetSeconds
+        value["sqlite_instruction_limit"] = instructionLimit
+        value["records"] = records
         if let bytes = try? JSONSerialization.data(withJSONObject:value, options:[.sortedKeys]),
            let line = String(data:bytes, encoding:.utf8) { log(line) }
     }

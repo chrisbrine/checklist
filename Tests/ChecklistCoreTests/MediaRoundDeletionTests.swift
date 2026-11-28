@@ -639,6 +639,34 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertEqual(try paths.map {try Data(contentsOf:URL(fileURLWithPath:$0))},bytes)
     }
 
+    func testIndivisibleGraphDetachCommitsAfterSoftWriterBudget() throws {
+        let f = try Fixture()
+        let round = try cancel(f,f.round(f.type(checks.schema())))
+        try forceBoundedGraph(f,round:round)
+        let rowID = try XCTUnwrap(f.rows("media_intake_row").compactMap {$0["id"] as? String}.min())
+        let holds = LockedTestState([(seconds:TimeInterval,committed:Bool)]())
+        f.router.mediaRoundDeletionWriterProbe = {phase,seconds,committed in
+            if phase == "media_round_graph_detach" {holds.withLock {$0.append((seconds,committed))}}
+        }
+        try f.router.dbQueue.writeWithoutTransaction {db in
+            db.add(function:DatabaseFunction("fixture_graph_detach_delay",argumentCount:0) { _ in
+                Thread.sleep(forTimeInterval:0.30)
+                return 0
+            })
+            try db.execute(sql:"""
+                CREATE TEMP TRIGGER fixture_graph_detach_delay BEFORE UPDATE ON main.records
+                WHEN OLD.id='\(rowID)'
+                BEGIN SELECT fixture_graph_detach_delay(); END
+                """)
+        }
+        let result = try worker(f,"media_round_delete",input(f,round))
+        XCTAssertEqual(result["deleted"] as? Bool,true)
+        let attempts = holds.withLock {$0}
+        XCTAssertTrue(attempts.contains {!$0.committed && $0.seconds >= CommandRouter.mediaGraphWriterBudget})
+        XCTAssertTrue(attempts.contains {$0.committed && $0.seconds >= CommandRouter.mediaGraphWriterBudget})
+        XCTAssertTrue(try f.rows("media_intake_row").isEmpty)
+    }
+
     private func forceBoundedGraph(_ f: Fixture,round: JSON) throws {
         let id = try XCTUnwrap(round["id"] as? String)
         try f.router.dbQueue.writeWithoutTransaction {db in

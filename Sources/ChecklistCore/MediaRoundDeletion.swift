@@ -118,6 +118,8 @@ extension CommandRouter {
                     interruptedGraph = nil
                 } catch let budget as MediaRoundDeletionWriterBudget {
                     switch budget {
+                    case .indivisibleGraphStep:
+                        throw Self.mediaDeletionBudgetError()
                     case .history, .graph("media_round_graph_hide"), .graph("media_round_history_pass"):
                         guard historyLimit > 1 else {throw Self.mediaDeletionBudgetError()}
                         historyLimit /= 2
@@ -232,7 +234,7 @@ extension CommandRouter {
                 if progress.phase == .deleting {
                     let saved = try self.loadMediaDeletionGraph(db,progress,context:context)
                     resumeHistory = try self.validateMediaDeletionGraphResume(db,progress:progress,work:saved,
-                                                                             historyKey:historyKey,historyLimit:historyLimit)
+                                                                             historyKey:historyKey,historyLimit:historyLimit,command:command)
                     work = saved
                 } else { work = nil }
                 existingGraph = (context,progress,work)
