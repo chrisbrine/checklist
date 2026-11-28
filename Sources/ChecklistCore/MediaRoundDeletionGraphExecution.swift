@@ -258,7 +258,10 @@ extension CommandRouter {
         next.pass += 1
         let writes = try history.rows.prepareWrites()
         let graph = try MediaRoundDeletionFence.VisibleGraph(work)
-        try writeMediaDeletionGraph(context,phase:"media_round_history_pass",from:progress,to:next) { db in
+        let records = history.rows.events.count + history.rows.commands.count
+        // A late singleton is already the minimum work, even if the selection cap is larger.
+        try writeMediaDeletionGraph(context,phase:"media_round_history_pass",from:progress,to:next,
+                                    records:records,indivisible:records == 1) { db in
             try work.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion,graph:graph)
             try history.fence.validate(db,changes:context.changes,writerVersion:context.writerVersion)
             try history.rows.validateResultDependents(db,journal:context.changes.name,removed:graph.owned)

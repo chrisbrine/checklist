@@ -667,6 +667,79 @@ final class MediaRoundDeletionTests: XCTestCase {
         XCTAssertTrue(try f.rows("media_intake_row").isEmpty)
     }
 
+    func testSingletonResumedGraphHistoryCommitsAfterSoftWriterBudget() throws {
+        let f = try Fixture()
+        let round = try cancel(f,f.round(f.type(checks.schema())))
+        try forceBoundedGraph(f,round:round)
+        let roundID = try XCTUnwrap(round["id"] as? String)
+        let key = try MediaRoundDeletionGraph.key(MediaRoundDeletionHistory.progressKey(project:f.project,round:roundID))
+        let params = try input(f,round)
+        let router = f.router!
+        let receiptCommitted = LockedTestState(false)
+        router.mediaRoundDeletionWriterProbe = {phase,_,committed in
+            if phase == "media_round_graph_receipt" && committed {receiptCommitted.withLock {$0 = true}}
+        }
+        router.mediaRoundDeletionGraphProbe = {
+            if receiptCommitted.withLock({$0}) {throw CoreError("TEST_INTERRUPT","Stopped after the provisional receipt committed.")}
+        }
+        checks.checkError("TEST_INTERRUPT") {try worker(f,"media_round_delete",params)}
+        let before = try XCTUnwrap(router.dbQueue.read {try MediaRoundDeletionGraph.load($0,key,as:MediaRoundDeletionGraph.Progress.self)})
+        XCTAssertEqual(before.phase,.deleting)
+        XCTAssertEqual(before.removed,0)
+        XCTAssertTrue(receiptCommitted.withLock {$0})
+
+        let event = uuid()
+        try router.dbQueue.writeWithoutTransaction {db in
+            try db.execute(sql:"""
+                INSERT INTO events(id,project_id,entity_id,actor,kind,occurred_at,data)
+                VALUES(?,?,?,'fixture','media_item_created',?,'{"text":"Late original history"}')
+                """,arguments:[event,f.project,roundID,now()])
+            db.add(function:DatabaseFunction("fixture_graph_history_delay",argumentCount:0) { _ in
+                Thread.sleep(forTimeInterval:CommandRouter.mediaDeletionWriterBudget + 0.10)
+                return 0
+            })
+            try db.execute(sql:"""
+                CREATE TEMP TRIGGER fixture_graph_history_delay BEFORE UPDATE ON main.events
+                WHEN OLD.id='\(event)'
+                BEGIN SELECT fixture_graph_history_delay(); END
+                """)
+        }
+        let holds = LockedTestState([(seconds:TimeInterval,committed:Bool)]())
+        router.mediaRoundDeletionWriterProbe = {phase,seconds,committed in
+            if phase == "media_round_history_pass" {holds.withLock {$0.append((seconds,committed))}}
+        }
+        let observedScrub = LockedTestState(false)
+        router.mediaRoundDeletionGraphProbe = {
+            let first = observedScrub.withLock { observed in
+                guard !observed else {return false}
+                observed = true
+                return true
+            }
+            guard first else {return}
+            try router.dbQueue.read {db in
+                var expected = before
+                expected.pass += 1
+                XCTAssertEqual(try MediaRoundDeletionGraph.load(db,key,as:MediaRoundDeletionGraph.Progress.self),expected)
+                let row = try XCTUnwrap(Row.fetchOne(db,sql:"SELECT entity_id,kind,data FROM events WHERE id=?",arguments:[event]))
+                XCTAssertNil(row["entity_id"] as String?)
+                XCTAssertEqual(row["kind"] as String,MediaRoundDeletionHistory.redactedEventKind)
+                XCTAssertEqual(row["data"] as String,"{}")
+            }
+        }
+        defer {
+            router.mediaRoundDeletionWriterProbe = nil
+            router.mediaRoundDeletionGraphProbe = nil
+        }
+        let reply = try worker(f,"media_round_delete",params,command:uuid())
+        XCTAssertTrue(observedScrub.withLock {$0})
+        let attempts = holds.withLock {$0}
+        XCTAssertEqual(attempts.filter(\.committed).count,1)
+        XCTAssertTrue(attempts.contains {$0.committed && $0.seconds >= CommandRouter.mediaDeletionWriterBudget})
+        XCTAssertEqual(reply["deleted"] as? Bool,true)
+        XCTAssertEqual(reply["byte_deletion_receipt_id"] as? String,before.receipt)
+        XCTAssertEqual(try deletion(f,round)["byte_deletion_receipt_id"] as? String,before.receipt)
+    }
+
     private func forceBoundedGraph(_ f: Fixture,round: JSON) throws {
         let id = try XCTUnwrap(round["id"] as? String)
         try f.router.dbQueue.writeWithoutTransaction {db in
