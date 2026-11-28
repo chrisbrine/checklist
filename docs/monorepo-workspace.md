@@ -460,20 +460,28 @@ name and reports the reason. If the original name is occupied, apply keeps
 both entries and reports the stage. A later cleanup checks the root and
 descendants of each candidate. Marker-held preview also walks those entries.
 A recovery row reports the current `recovery_path` and `recovery_provenance`.
-A matching unresolved device, inode and entry type identifies a recorded
-stage even if the stage or its ancestor was renamed. A different identity at
-the old path cannot inherit the record.
+A recorded stage matches the entry's device, inode, type and birth time,
+plus the source parent's device, inode and birth time. Renaming the stage in
+that parent or moving an ancestor preserves the match. Moving the stage to a
+different immediate parent removes that proof. A reused inode or path cannot
+supply the missing identity.
 
 Before staging, cleanup writes each intent and nonce to the caller-owned
 `.checklist-scratch-stages.jsonl` journal beside the publication lock. It
-syncs the journal and its parent before each move batch. It closes intents
-for unused moves, verified Trash moves and successful rollbacks. For moves
-and rollbacks it syncs the changed rename directories before recording the
-resolution. After an interruption, a matching identity at the recorded
-original path or at its unique final Trash destination can establish the
-outcome before a resolution record was written. A retry records those known resolutions
-before moving the entry away from that path. Older records without those
-paths stay open when their identities are encountered.
+syncs the journal and its parent before each move batch. The intent is
+written until the entry leaves its source name in the recorded parent.
+Observing the same entry at that source settles the intent, including
+when a person returns it there. Preview only reports the observation.
+Apply closes it in the journal. A verified Trash move finishes the record.
+A successful rollback restores it. The unique planned Trash name and
+destination parent provide proof after an interruption before resolution.
+
+When a whole-tree move or rollback succeeds, cleanup closes the open
+intents for verified descendants it carried at their recorded source,
+staging or final Trash names. It syncs the changed rename directories
+and writes the descendant outcomes with the enclosing outcome in the same
+journal batch. An entry or parent without a birth time and older journal
+records without both identities have no recorded match.
 
 A reserved-format name with no matching identity remains held as
 `unverified`. Earlier genuine stages and fixture names share that format.

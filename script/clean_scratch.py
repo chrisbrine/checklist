@@ -13,6 +13,7 @@ from contextlib import nullcontext
 import hashlib
 from itertools import chain
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -80,7 +81,13 @@ def stage_nonce(staged):
 
 
 def stage_identity(stamp):
-    return [stamp[0], stamp[1], stat.S_IFMT(stamp[2])]
+    return [stamp[0], stamp[1], stat.S_IFMT(stamp[2]), stamp[6]]
+
+
+def stage_parent_identity(stamp):
+    if stamp and stat.S_ISDIR(stamp[2]) and stamp[6] is not None:
+        return [stamp[0], stamp[1], stamp[6]]
+    return None
 
 
 def owned_regular(descriptor):
@@ -112,31 +119,30 @@ def append_stage_journal(records):
     sync_directory(path.parent)
 
 
-def resolved_stage_record(nonce):
-    return {'version': 1, 'nonce': nonce, 'state': 'resolved'}
-
-
-def stage_at_outcome(record, location):
-    return location in (record.get('source'), record.get('destination'))
+def resolved_stage_record(nonce, outcome):
+    return {'version': 2, 'nonce': nonce, 'state': outcome}
 
 
 def write_stage_records(entries):
     records = stage_index()
-    settled = set()
+    settled = {}
     intents = []
     for source, staged, stamp, destination in entries:
-        identity = stage_identity(stamp)
-        location = str(source.absolute())
-        # A retry can prove older intents settled at this source. Close them
-        # before moving the entry away from that proof.
-        settled.update(record['nonce'] for record in records.get(stamp[1], ())
-                       if record['identity'] == identity and stage_at_outcome(record, location))
-        intent = {'version': 1, 'nonce': stage_nonce(staged), 'name': staged.name,
-                  'source': location, 'path': str(staged.absolute()), 'identity': identity}
+        parent_stamp = path_stamp(source.parent)
+        # A direct retry already has proof of the older outcome. Record it
+        # before another rename can move the entry away from that proof.
+        settled.update((record['nonce'], state)
+                       for record, state in matching_stage_intents(source, stamp, records, parent_stamp)
+                       if state != 'staged')
+        intent = {'version': 2, 'nonce': stage_nonce(staged), 'state': 'written', 'name': staged.name,
+                  'source': str(source.absolute()), 'path': str(staged.absolute()),
+                  'identity': stage_identity(stamp), 'source_parent': stage_parent_identity(parent_stamp)}
         if destination is not None:
             intent['destination'] = str(destination.absolute())
+            intent['destination_parent'] = stage_parent_identity(path_stamp(destination.parent))
         intents.append(intent)
-    append_stage_journal(chain(map(resolved_stage_record, sorted(settled)), intents))
+    append_stage_journal(chain((resolved_stage_record(nonce, state) for nonce, state in sorted(settled.items())),
+                               intents))
 
 
 def read_stage_records():
@@ -154,15 +160,18 @@ def read_stage_records():
                     record = json.loads(line)
                 except (ValueError, RecursionError):
                     continue
-                if not isinstance(record, dict) or record.get('version') != 1:
+                if not isinstance(record, dict) or record.get('version') != 2:
                     continue
                 nonce = record.get('nonce')
                 if not isinstance(nonce, str) or not re.fullmatch('[0-9a-f]{32}', nonce):
                     continue
                 identity = record.get('identity')
-                if record.get('state') == 'resolved':
+                state = record.get('state')
+                if state in ('finished', 'restored', 'unused'):
                     records.pop(nonce, None)
-                elif isinstance(identity, list) and len(identity) == 3 and all(type(n) is int for n in identity):
+                elif (state == 'written' and isinstance(identity, list) and len(identity) == 4
+                      and all(type(n) is int for n in identity[:3])
+                      and isinstance(record.get('source'), str) and isinstance(record.get('name'), str)):
                     records[nonce] = record
     except OSError:
         return {}
@@ -176,15 +185,28 @@ def stage_index():
     return by_inode
 
 
+def matching_stage_intents(path, stamp, records, parent_stamp=None):
+    if not records or stamp is None or stamp[6] is None:
+        return
+    matching = [record for record in records.get(stamp[1], ()) if record['identity'] == stage_identity(stamp)]
+    if not matching:
+        return
+    parent = stage_parent_identity(parent_stamp if parent_stamp is not None else path_stamp(path.parent))
+    if parent is None:
+        return
+    for record in matching:
+        destination = record.get('destination')
+        if (isinstance(destination, str) and path.name == os.path.basename(destination)
+                and parent == record.get('destination_parent')):
+            yield record, 'finished'
+        elif parent == record.get('source_parent'):
+            # A matching entry back at its source is either unused or
+            # restored. Either outcome is safe, including after a parent rename.
+            yield record, 'restored' if path.name == os.path.basename(record['source']) else 'staged'
+
+
 def recorded_stage(path, stamp, records):
-    if stamp is None or not (matches := records.get(stamp[1])):
-        return False
-    identity = stage_identity(stamp)
-    location = str(path.absolute())
-    # The source proves an unused intent or restoration. The exclusive,
-    # unique final destination proves the Trash rename. Older records have
-    # neither field and remain open wherever the entry is found.
-    return any(record['identity'] == identity and not stage_at_outcome(record, location) for record in matches)
+    return any(state == 'staged' for _, state in matching_stage_intents(path, stamp, records))
 
 
 def recovery_details(path, stamp, records):
@@ -358,8 +380,12 @@ def blob_id(path):
 
 
 def metadata_stamp(metadata):
+    birth = getattr(metadata, 'st_birthtime', None)
+    # Use the Darwin stat value consistently across Python versions. A
+    # filesystem without a positive birth time cannot establish provenance.
+    birth = birth if birth is not None and math.isfinite(birth) and birth > 0 else None
     return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
-            metadata.st_mtime_ns, metadata.st_ctime_ns)
+            metadata.st_mtime_ns, metadata.st_ctime_ns, birth)
 
 
 def path_stamp(path, *, follow_symlinks=False):
@@ -1523,19 +1549,38 @@ def relocate_recovery(public, source, destination):
     public['errors'][-1]['reason'] = public['reason']
 
 
+def planned_stage_outcomes(decision, records):
+    """Keep proof for descendants until their enclosing rename is confirmed."""
+    carried, settled = {}, {}
+    if not records:
+        return carried, settled
+    before = decision['inventory']
+    moves = set(decision['moves'])
+    for path, stamp in before.items():
+        for record, state in matching_stage_intents(path, stamp, records, before.get(path.parent)):
+            selected = next((parent for parent in (path, *path.parents) if parent in moves), None)
+            nonce = record['nonce']
+            if selected is None:
+                if state != 'staged':
+                    settled[nonce] = state
+            elif selected != path and (state != 'staged' or path.name == record['name']):
+                carried.setdefault(selected, set()).add(nonce)
+    return carried, settled
+
+
 def finish_stage_batch(stage_batch, trash, completed):
-    # Intents that never reached rename are also safe to close. An attempted
+    # Intents that never reached rename are safe to close. An attempted
     # rename with an uncertain outcome remains open.
     for _, path in stage_batch:
         staged = trash.prepared_stages.pop(path, None)
         if staged is not None:
-            completed.append((staged, ()))
+            completed.append((stage_nonce(staged), 'unused', ()))
 
     if completed:
         # Close a moved or restored stage only after its rename is durable.
-        for parent in sorted({parent for _, parents in completed for parent in parents}):
+        for parent in sorted({parent for _, _, parents in completed for parent in parents}):
             sync_directory(parent)
-        append_stage_journal(resolved_stage_record(stage_nonce(staged)) for staged, _ in completed)
+        append_stage_journal(resolved_stage_record(nonce, outcome) for nonce, outcome, _ in completed)
 
 
 def permission_root(item, kind, session_id):
@@ -1887,9 +1932,11 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                             decision['public'].update(recovery_details(staged, stamp, stage_index()))
                     else:
                         relocate_recovery(decision['public'], staged, path)
-                        completed.append((staged, (path.parent,)))
+                        completed.append((stage_nonce(staged), 'restored', (path.parent,)))
+                        completed.extend((nonce, 'restored', ()) for nonce in decision['carried_stages'].get(path, ()))
                 elif destination is not None:
-                    completed.append((staged, (path.parent, destination.parent)))
+                    completed.append((stage_nonce(staged), 'finished', (path.parent, destination.parent)))
+                    completed.extend((nonce, 'finished', ()) for nonce in decision['carried_stages'].get(path, ()))
                 restore_modes(modes, {path: restore_path} if restore_path is not None else {})
                 changed_dirs = set(modes)
                 expected = decision['inventory']
@@ -2021,7 +2068,11 @@ def clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock(),
                                 previous=previous, round_hold=round_holds.get(item.parent), records=records)
                 public = preview_public(decision)
+                carried, settled = planned_stage_outcomes(decision, records)
+                if settled:
+                    append_stage_journal(resolved_stage_record(nonce, state) for nonce, state in sorted(settled.items()))
                 if decision['moves']:
+                    decision['carried_stages'] = carried
                     public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)
                     decision['public'] = public
                     decision['markers'] = markers

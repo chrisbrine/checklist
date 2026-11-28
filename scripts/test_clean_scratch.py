@@ -2489,8 +2489,10 @@ class CleanScratchTests(unittest.TestCase):
             record = cleanup.read_stage_records()[nonce]
             self.assertEqual(Path(record.pop('destination')).parent, self.trash)
             self.assertEqual(record, {
-                'version': 1, 'nonce': nonce, 'name': destination.name, 'path': str(destination),
+                'version': 2, 'nonce': nonce, 'state': 'written', 'name': destination.name, 'path': str(destination),
                 'identity': cleanup.stage_identity(cleanup.path_stamp(source)), 'source': str(source),
+                'source_parent': cleanup.stage_parent_identity(cleanup.path_stamp(source.parent)),
+                'destination_parent': cleanup.stage_parent_identity(cleanup.path_stamp(self.trash)),
             })
             rename(trash, source, destination)
 
@@ -2546,6 +2548,93 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(row['eligible_paths'], [])
         self.assertEqual(original.read_bytes(), b'original build')
         self.assertEqual(staged.read_bytes(), b'new occupant')
+
+    def test_unavailable_entry_or_parent_birth_time_uses_reserved_name_fallback(self):
+        for missing in ('entry', 'parent'):
+            with self.subTest(missing=missing):
+                workspace = self.item('checkout-' + missing)
+                payload = self.write(workspace, '.build/output.o', b'fixture bytes')
+                target = (payload if missing == 'entry' else payload.parent).lstat()
+                stamp = cleanup.metadata_stamp
+
+                def hide_birth(metadata):
+                    observed = stamp(metadata)
+                    if (metadata.st_dev, metadata.st_ino) == (target.st_dev, target.st_ino):
+                        return (*observed[:6], None)
+                    return observed
+
+                with patch.object(cleanup, 'metadata_stamp', new=hide_birth):
+                    staged = cleanup.ScratchTrash().stage(payload)
+                    self.mark(workspace, release=True)
+                    for apply in (False, True):
+                        code, rows = self.run_cleanup(apply=apply)
+                        self.assertEqual(code, 0)
+                        row = next(row for row in rows if row['path'] == str(workspace))
+                        self.assertEqual(row['recovery_path'], str(staged))
+                        self.assertEqual(row['recovery_provenance'], 'unverified')
+                        self.assertEqual(row['planned_move_count'], 0)
+                    ordinary = staged.rename(staged.with_name('ordinary-name'))
+                    code, rows = self.run_cleanup()
+                    self.assertEqual(code, 0)
+                    row = next(row for row in rows if row['path'] == str(workspace))
+                    self.assertNotIn('recovery_path', row)
+                    self.assertEqual(row['eligible_paths'], [str(workspace)])
+                    self.assertEqual(ordinary.read_bytes(), b'fixture bytes')
+                    workspace.rename(self.root / ('parked-' + missing))
+
+    def test_return_to_source_name_resolves_intent_after_parent_rename(self):
+        workspace = self.item('checkout')
+        source = self.write(workspace, '.build/output.o', b'fixture bytes')
+        staged = cleanup.ScratchTrash().stage(source)
+        staged.rename(source)
+        relocated = workspace.rename(workspace.with_name('relocated'))
+        self.mark(relocated)
+
+        code, rows = self.run_cleanup()
+        self.assertEqual(code, 0)
+        self.assertNotIn('recovery_path', rows[0])
+        self.assertIn(cleanup.stage_nonce(staged), cleanup.read_stage_records())
+
+        code, rows = self.run_cleanup(apply=True)
+        self.assertEqual(code, 0)
+        self.assertNotIn('recovery_path', rows[0])
+        self.assertEqual(cleanup.read_stage_records(), {})
+        self.assertEqual((relocated / '.build/output.o').read_bytes(), b'fixture bytes')
+
+    def test_enclosing_rollback_closes_child_intent_with_parent(self):
+        workspace = self.item('checkout')
+        self.write(workspace, 'notes', b'private evidence')
+        payload = self.write(workspace, '.build/output.o', b'fixture bytes')
+        with patch.object(cleanup.ScratchTrash, 'stage', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cleanup(apply=True)
+        child_nonce, = cleanup.read_stage_records()
+        self.mark(workspace, release=True)
+
+        batches = []
+        append = cleanup.append_stage_journal
+
+        def observe(records):
+            batch = list(records)
+            batches.append(batch)
+            append(batch)
+
+        def refuse(paths, *, staged):
+            self.assertEqual(paths, [workspace])
+            self.assertTrue((staged / '.build/output.o').is_file())
+            raise ValueError('synthetic Trash refusal')
+
+        with patch.object(cleanup, 'append_stage_journal', new=observe):
+            code, rows = self.run_cleanup(apply=True, mover=refuse)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(rows[0]['reason'], 'synthetic Trash refusal')
+        intent, closing = batches
+        self.assertEqual(len(intent), 1)
+        self.assertEqual({row['nonce']: row['state'] for row in closing},
+                         {intent[0]['nonce']: 'restored', child_nonce: 'restored'})
+        self.assertEqual(cleanup.read_stage_records(), {})
+        self.assertEqual(payload.read_bytes(), b'fixture bytes')
 
     def test_finished_trash_move_closes_stage_record(self):
         workspace = self.item('released')
@@ -3047,7 +3136,8 @@ print(json.dumps({"data": data}))
             def visit(path):
                 metadata = path.lstat()
                 result[path] = (metadata.st_dev, metadata.st_ino, metadata.st_mode,
-                                metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+                                metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+                                getattr(metadata, 'st_birthtime', None) or None)
                 if stat.S_ISDIR(metadata.st_mode):
                     for child in sorted(path.iterdir()):
                         visit(child)
