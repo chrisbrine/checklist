@@ -458,11 +458,7 @@ the original source.
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
 both entries and reports the staged location in `staged_path`. A later cleanup
-retains a discovered staging entry and reports its recovery path. Staging names
-sit beside the selected source and use a basename-free fallback for long names.
-A released tree stages in its parent, so matching names inside it are payload.
-Partial cleanup can stage a selected child at any depth. The Trash rename uses
-a unique final destination and requires no intermediate Trash stage.
+retains a discovered staging name for recovery.
 
 Scratch apply and Checklist identity publishers take an exclusive advisory
 lock on `~/Library/Caches/ChecklistQualification/.checklist-publication.lock`.
