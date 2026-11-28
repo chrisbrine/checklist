@@ -45,6 +45,30 @@ MOVE_BATCH_BYTES = 64 * 1024
 PREVIEW_WORKERS = 8
 
 
+def staging_name(path, token):
+    suffix = '.checklist-retiring-' + token
+    name = '.' + path.name + suffix
+    return name if len(os.fsencode(name)) <= 255 else suffix
+
+
+def recovery_sibling(source, staged=None):
+    """Find an interrupted staging name for this source in its rename parent."""
+    parent = source.parent
+    if parent.is_symlink():
+        return None
+    prefix = staging_name(source, '0' * 32)[:-32]
+    staged_name = staged.name if staged is not None else None
+    with os.scandir(parent) as entries:
+        name = min((entry.name for entry in entries
+                    if entry.name != staged_name and entry.name[:-32] == prefix
+                    and RETIRING_NAME.fullmatch(entry.name)), default=None)
+    return parent / name if name is not None else None
+
+
+def recovery_reason(path):
+    return 'interrupted retirement needs recovery; retained: ' + str(path)
+
+
 class ScratchTrash:
     """Prepare same-volume Trash paths before validation and rename in process."""
 
@@ -121,9 +145,7 @@ class ScratchTrash:
             raise OSError(error, os.strerror(error), str(source), None, str(destination))
 
     def stage(self, path):
-        suffix = '.checklist-retiring-' + uuid.uuid4().hex
-        name = '.' + path.name + suffix
-        staged = path.with_name(name if len(os.fsencode(name)) <= 255 else suffix)
+        staged = path.with_name(staging_name(path, uuid.uuid4().hex))
         self.rename_exclusive(path, staged)
         return staged
 
@@ -1050,9 +1072,15 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     # A root released for ended tickets retires whole: no per-file hashing (CL-359).
     ticket_retire = ticket_released(item)
     released_retire = released_by(item)
-    recovery = next((path for path in before if RETIRING_NAME.fullmatch(path.name)), None)
+    retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
+    whole = retire_run or released_retire
+    # A released tree is staged in its parent. For partial cleanup a stage
+    # can be left beside a selected entry anywhere inside the item.
+    recovery = item if RETIRING_NAME.fullmatch(item.name) else recovery_sibling(item)
+    if recovery is None and not whole:
+        recovery = next((path for path in before if RETIRING_NAME.fullmatch(path.name)), None)
     if recovery is not None:
-        reason = 'interrupted retirement needs recovery; retained: ' + str(recovery)
+        reason = recovery_reason(recovery)
     elif item.is_symlink():
         reason = 'symbolic link; never followed'
     elif stat.S_ISREG(before[item][2]):
@@ -1091,8 +1119,6 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
 
     # Explicit root release authorizes whole-folder retirement. Fingerprinted
     # qualification runs keep their additional links/Git guard unless ticket-released.
-    retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
-    whole = retire_run or released_retire
     if retire_run and not ticket_retire and not reason and any(
             not stat.S_ISREG(entry[2]) or '.git' in relative_parts(path)
             for path, entry in files.items()):
@@ -1526,6 +1552,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
         staged = None
         try:
             try:
+                if recovery := recovery_sibling(path):
+                    raise ValueError(recovery_reason(recovery))
                 validate_move(decision, path, installations, shared, observed.get(parent, {}), hold, keep,
                               session_id, include_released, modes)
             except PermissionError as error:
@@ -1571,6 +1599,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 # The workspace scan can take time. Check for later shared
                 # cache and receipt changes before sampling processes.
                 confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
+                if recovery := recovery_sibling(path, staged):
+                    raise ValueError(recovery_reason(recovery))
                 if path_stamp(path) is not None:
                     raise ValueError('original name reappeared before Trash')
                 # A read-only open can leave those checks unchanged. After
