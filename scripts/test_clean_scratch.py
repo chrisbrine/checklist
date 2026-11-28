@@ -1826,6 +1826,67 @@ class CleanScratchTests(unittest.TestCase):
                 self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
                 self.assertEqual(payload.read_bytes(), b'unique released work')
 
+    def test_former_open_sibling_becomes_shared_directory_before_pre_stage_scan(self):
+        container = self.item('round')
+        self.write(container, '.build/cache/object')
+        workspace, sibling = container / 'retired', container / 'open'
+        payload = self.write(workspace, 'src/work.py', b'released workspace data')
+        self.mark(workspace, release=True)
+        self.write(sibling, 'src/work.py', b'open ticket data')
+        self.mark(sibling)
+        incoming = self.root / 'incoming'
+        receipt = 'stage/Checklist.app/Contents/Resources/build-info.json'
+        identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+        self.write(incoming, receipt, identity)
+
+        def publish():
+            sibling.rename(self.root / 'previous-open')
+            incoming.rename(sibling)
+
+        status, rows = self.run_cleanup(apply=True, after_inspection=publish)
+
+        self.assertEqual(status, 1)
+        self.assertEqual((sibling / receipt).read_bytes(), identity)
+        self.assertEqual(payload.read_bytes(), b'released workspace data')
+        self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_original_name_reappears_as_shared_directory_before_final_scan(self):
+        container = self.item('round')
+        self.write(container, '.build/cache/object')
+        workspace = container / 'retired'
+        self.write(workspace, 'src/work.py', b'released workspace data')
+        self.mark(workspace, release=True)
+        incoming = self.root / 'incoming'
+        receipt = 'stage/Checklist.app/Contents/Resources/build-info.json'
+        identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+        self.write(incoming, receipt, identity)
+        compare = cleanup.inventory_stamps_match
+        staged_payload = None
+
+        def publish_during_inventory(expected):
+            nonlocal staged_payload
+            if staged_payload is None and not workspace.exists():
+                for path in expected:
+                    if isinstance(path, Path) and path.name == 'work.py':
+                        staged_payload = path
+                        incoming.rename(workspace)
+                        break
+            return compare(expected)
+
+        with patch.object(cleanup, 'inventory_stamps_match', new=publish_during_inventory):
+            status, rows = self.run_cleanup(apply=True)
+
+        self.assertEqual(status, 1)
+        self.assertIsNotNone(staged_payload)
+        held = next(row for row in rows if row.get('path') == str(workspace))
+        self.assertEqual(held['staged_path'], str(staged_payload.parent.parent))
+        self.assertIn('original name occupied', held['reason'])
+        self.assertEqual(staged_payload.read_bytes(), b'released workspace data')
+        self.assertEqual((workspace / receipt).read_bytes(), identity)
+        self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_loose_scratch_file_is_retained_with_a_file_reason(self):
         workspace = self.item()
         loose = self.write(workspace.parent, 'run.jsonl', b'uncommitted log')
@@ -1935,7 +1996,8 @@ class CleanScratchTests(unittest.TestCase):
             'new explicit keep': 'explicitly retained qualified copy or persistent build slot',
             'shared receipt matches installed': 'qualified copy of latest installed round (matching source fingerprint); stopped before Trash',
         }
-        round_wide = {'installed matches receipt', 'rollback matches receipt', 'shared receipt matches installed'}
+        round_wide = {'re-marked persistent', 'release withdrawn', 'installed matches receipt',
+                      'rollback matches receipt', 'shared receipt matches installed'}
         between_moves = {'after rename', 'after receipt output'}
         stages = ('shared scan', 'process refresh', 'size walk', 'after rename', 'after receipt output',
                   'final metadata')
@@ -2237,7 +2299,7 @@ class CleanScratchTests(unittest.TestCase):
             'process', 'new nested work', 'new nested marker', 'keep', 'shared receipt replacement',
             'shared receipt in-place installed', 'shared receipt in-place nonmatching', 'same-size work edit',
         )
-        round_wide = set(changes[2:4]) | set(changes[8:11])
+        round_wide = set(changes[:4]) | set(changes[8:11])
         phases = ('before stage', 'after stage', 'during validation', 'before commit')
         identity = lambda fingerprint, note='before': json.dumps(
             {'source_fingerprint': fingerprint, 'note': note}).encode()

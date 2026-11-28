@@ -437,10 +437,17 @@ contribute their metadata stamps.
 At every listed directory it also checks for newly arrived child directories,
 including empty directories and populated trees published by rename. It treats
 new symbolic links as possible directory arrivals without following them.
-Independently discovered workspaces stay outside the shared scan. Ordinary
-loose files outside shared caches can still change. Build identity receipts
-keep their checks. An ordinary directory can disappear if it held no tracked
-shared dependencies.
+A discovered workspace stays outside the shared walk while its directory
+device and inode and its marker's identity and bytes match discovery. The
+check opens the directory and marker without following links. A replacement,
+removal or marker change stops the round's pending move. An older private copy
+discovered by layout keeps its directory identity and its original marker
+absence. During staging, the staged path carries the workspace identity and
+the old name must be vacant. If a new occupant prevents restoration, cleanup
+keeps both and reports the staged path. Ordinary loose files outside shared
+caches and writes inside a workspace with a stable identity can continue.
+Build identity receipts keep their checks. An ordinary shared directory can
+disappear if it held no tracked shared dependencies.
 
 Apply then samples process use of the staged path and original workspace again.
 After that sample, only in-memory path matching and the prepared exclusive

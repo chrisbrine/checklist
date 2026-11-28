@@ -845,14 +845,69 @@ def build_identity_hold(paths, fingerprint, previous, contents=None):
     return None
 
 
+def workspace_boundary(path):
+    """Read the directory and marker identities without following either as a link."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        identity = metadata_stamp(os.fstat(descriptor))[:2]
+        marker = None
+        try:
+            marker_fd = os.open(WORKSPACE_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=descriptor)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(marker_fd, 'rb') as source:
+                stamp = metadata_stamp(os.fstat(source.fileno()))
+                if not stat.S_ISREG(stamp[2]) or stamp[3] > 16384:
+                    raise ValueError('invalid excluded workspace marker: ' + os.fspath(path))
+                data = source.read(16385)
+                if len(data) != stamp[3] or metadata_stamp(os.fstat(source.fileno())) != stamp:
+                    raise ValueError('excluded workspace marker changed: ' + os.fspath(path))
+                marker = (stamp, data)
+        try:
+            current = metadata_stamp(os.stat(WORKSPACE_MARKER, dir_fd=descriptor, follow_symlinks=False))
+        except FileNotFoundError:
+            current = None
+        if current != (marker[0] if marker else None) or (path_stamp(path) or ())[:2] != identity:
+            raise ValueError('excluded workspace identity changed: ' + os.fspath(path))
+        return identity, marker
+    finally:
+        os.close(descriptor)
+
+
 def shared_rounds(items):
-    """Group the immediate workspace candidates split from a round container."""
+    """Record the boundaries of immediate workspace candidates in a split round."""
     rounds = {}
     for item, kind in items:
         parent = item.parent
         if kind in {'session', 'spare'} and parent.name != 'scratchpad' and parent.parent.name == 'scratchpad':
-            rounds.setdefault(parent, set()).add(os.fspath(item))
+            try:
+                boundary = workspace_boundary(item)
+                # A round with its own cache splits out marked children only.
+                # Older private copies can be independently discovered by layout.
+                if boundary[1] is None and ((parent / '.build').is_dir() or not private_copy(item)):
+                    raise ValueError('excluded workspace marker vanished: ' + str(item))
+            except (OSError, ValueError) as error:
+                boundary = error
+            rounds.setdefault(parent, {})[os.fspath(item)] = boundary
     return rounds
+
+
+def validate_round_workspaces(workspaces):
+    for path, expected in workspaces.items():
+        if expected is None:
+            if path_stamp(path) is not None:
+                raise ValueError('original name reappeared before Trash: ' + path)
+            continue
+        try:
+            if isinstance(expected, Exception):
+                raise expected
+            if workspace_boundary(path) == expected:
+                continue
+        except (OSError, ValueError) as error:
+            raise ValueError('excluded workspace identity changed: ' + path) from error
+        raise ValueError('excluded workspace identity changed: ' + path)
 
 
 def shared_round_listing(folder, workspaces, in_cache):
@@ -861,6 +916,11 @@ def shared_round_listing(folder, workspaces, in_cache):
     with os.scandir(folder) as entries:
         for entry in entries:
             if entry.path in workspaces:
+                boundary = workspaces[entry.path]
+                if boundary is None:
+                    raise ValueError('original name reappeared before Trash: ' + entry.path)
+                if not entry.is_dir(follow_symlinks=False) or entry.inode() != boundary[0][1]:
+                    raise ValueError('excluded workspace identity changed: ' + entry.path)
                 continue
             directory = entry.is_dir(follow_symlinks=False)
             cache = entry.name in BUILD_NAMES and directory
@@ -881,6 +941,7 @@ def shared_round_listing(folder, workspaces, in_cache):
 def shared_round_receipts(root, workspaces, receipt_bytes):
     """Observe round identity, shared cache directories and shared build receipts."""
     root = os.fspath(root)
+    validate_round_workspaces(workspaces)
     pending = [(root, False)]
     walked, tracked = [], {}
     while pending:
@@ -943,6 +1004,8 @@ def shared_round_receipts(root, workspaces, receipt_bytes):
         if (any(read_build_identity(Path(receipt)) != receipt_bytes[Path(receipt)] for receipt in receipts)
                 or not inventory_stamps_match(closing_stamps)):
             raise ValueError('shared round contents changed during inspection; stopped')
+    # Exclusions are root children. Verify them after the root's closing listing.
+    validate_round_workspaces(workspaces)
 
 
 def shared_round_holds(rounds, fingerprint, previous, snapshots=None, contents=None):
@@ -1482,7 +1545,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 workspaces = rounds.get(parent)
                 staged_shared = shared
                 if workspaces is not None and path == item:
-                    workspaces = workspaces | {os.fspath(staged)}
+                    original = os.fspath(item)
+                    workspaces = workspaces | {original: None, os.fspath(staged): workspaces[original]}
                     if parent in modes:
                         key = os.fspath(parent)
                         device, inode, mode = shared[key]
@@ -1507,6 +1571,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 # The workspace scan can take time. Check for later shared
                 # cache and receipt changes before sampling processes.
                 confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
+                if path_stamp(path) is not None:
+                    raise ValueError('original name reappeared before Trash')
                 # A read-only open can leave those checks unchanged. After
                 # this sample, dispatch the prepared rename without more I/O.
                 if used_items(process_reader(), (item, staged)):
@@ -1559,7 +1625,7 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                         # The prior workspace no longer owns this name. If it
                         # reappears, scan it as part of the round's shared tree.
                         if parent in rounds:
-                            rounds[parent].discard(os.fspath(item))
+                            rounds[parent].pop(os.fspath(item))
                     else:
                         prefix = os.fspath(path) + '/'
                         for entry in [entry for entry in expected if entry == path or os.fspath(entry).startswith(prefix)]:
@@ -1630,9 +1696,9 @@ def clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
             print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
             failed = True
     items = list(candidates(sessions, qualification, session_id, include_released))
+    rounds = shared_rounds(items)
     objects = git_objects(repo) if items else set()
     fingerprint, previous, installations = installation_observation(installed_info) if items else (None, None, {})
-    rounds = shared_rounds(items)
     processes = process_reader() if items else []
     used = used_items(processes, (item for item, _ in items))
     shared_snapshots, shared_contents = ({}, {}) if apply else (None, None)
