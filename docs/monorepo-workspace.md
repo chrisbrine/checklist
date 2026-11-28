@@ -424,11 +424,11 @@ Apply renames an idle path to a hidden `.<name>.checklist-retiring-<id>` name
 in the same parent. It walks the full checkout under that name and compares
 each entry with the plan. It rechecks the markers, keeps, release state,
 installed and rollback fingerprints, and the round's shared scope. An early
-staged process sample can refuse a busy workspace. Apply rescans the shared
-scope again to catch new receipts, confirms the workspace's own inventory, then
-samples process use of the staged path and original workspace again. After that
-sample, only in-memory path matching and the prepared
-exclusive rename to the Trash remain. The same order applies to whole
+staged process sample can refuse a busy workspace. Apply confirms the workspace's
+own inventory, then rescans the shared scope for cache changes and new receipts.
+It samples process use of the staged path and original workspace again. After
+that sample, only in-memory path matching and the prepared exclusive rename to
+the Trash remain. The same order applies to whole
 workspaces and partial moves. Only the Trash rename produces a receipt,
 which still names the original source.
 

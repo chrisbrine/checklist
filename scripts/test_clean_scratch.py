@@ -1478,7 +1478,8 @@ class CleanScratchTests(unittest.TestCase):
         self.assertTrue(receipt.is_file())
 
     def test_apply_moves_released_workspaces_while_open_sibling_and_loose_logs_change(self):
-        for phase in ('before staging', 'during staging', 'during staged observation'):
+        for phase in ('before staging', 'during staging', 'during staged observation',
+                      'during final workspace check'):
             with self.subTest(phase=phase):
                 session = phase.replace(' ', '-')
                 container = self.item('round', session=session)
@@ -1521,7 +1522,16 @@ class CleanScratchTests(unittest.TestCase):
                         write_activity()
                     return [active / 'src']
 
-                with patch.object(cleanup.ScratchTrash, 'stage', new=stage):
+                compare = cleanup.inventory_stamps_match
+
+                def check_inventory(expected):
+                    if (phase == 'during final workspace check' and staged is not None
+                            and staged / 'src/work.py' in expected and not writes):
+                        write_activity()
+                    return compare(expected)
+
+                with patch.object(cleanup.ScratchTrash, 'stage', new=stage), \
+                     patch.object(cleanup, 'inventory_stamps_match', new=check_inventory):
                     result, rows = self.run_cleanup(
                         apply=True, session_id=session, process_reader=watch_processes,
                         after_inspection=write_activity if phase == 'before staging' else None)
@@ -1579,6 +1589,43 @@ class CleanScratchTests(unittest.TestCase):
         self.assertTrue(payload.is_file())
         self.assertTrue(receipt.is_file())
         self.assertEqual(list(self.trash.iterdir()), [])
+
+    def assert_late_shared_change_refuses(self, relative_path, data):
+        container = self.item('round')
+        self.write(container, '.build/cache/old.o')
+        self.write(container, 'reports/keep.txt')
+        workspace = container / 'retired'
+        payload = self.write(workspace, 'src/work.py', b'only copy of retired work')
+        self.mark(workspace, release=True)
+        written = None
+        compare = cleanup.inventory_stamps_match
+
+        def check_inventory(expected):
+            nonlocal written
+            if written is None and not workspace.exists() and any(
+                    isinstance(path, Path) and path.name == payload.name for path in expected):
+                written = self.write(container, relative_path, data)
+            return compare(expected)
+
+        with patch.object(cleanup, 'inventory_stamps_match', new=check_inventory):
+            result, rows = self.run_cleanup(apply=True)
+
+        self.assertEqual(written, container / relative_path)
+        self.assertEqual(written.read_bytes(), data)
+        self.assertEqual(result, 1)
+        held, = rows
+        self.assertEqual(held['action'], 'kept_error')
+        self.assertIn('shared round contents changed', held['reason'])
+        self.assertEqual(held['destinations'], [])
+        self.assertEqual(payload.read_bytes(), b'only copy of retired work')
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_new_shared_cache_entry_during_final_workspace_check(self):
+        self.assert_late_shared_change_refuses('.build/cache/new.o', b'new shared cache object')
+
+    def test_new_matching_shared_receipt_during_final_workspace_check(self):
+        identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+        self.assert_late_shared_change_refuses('reports/build-info.json', identity)
 
     def test_loose_scratch_file_is_retained_with_a_file_reason(self):
         workspace = self.item()

@@ -1440,7 +1440,6 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 # policy and compare the observations before the Trash rename.
                 check_staged_policy(actual, installed_info, installations, fingerprint, previous)
                 validate_staged_file(decision, path, staged)
-                confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
                 if path_stamp(path) is not None:
                     raise ValueError('original name reappeared before Trash')
                 staged_item = staged if path == item else item
@@ -1448,6 +1447,9 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                                          source=path, staged=staged)
                 if not inventory_stamps_match(actual):
                     raise ValueError('item changed during inspection/Trash moves; stopped')
+                # The workspace scan can take time. Check for later shared
+                # cache and receipt changes before sampling processes.
+                confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
                 # A read-only open can leave those checks unchanged. After
                 # this sample, dispatch the prepared rename without more I/O.
                 if used_items(process_reader(), (item, staged)):
