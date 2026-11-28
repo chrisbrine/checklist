@@ -856,8 +856,8 @@ def shared_rounds(items):
 
 
 def shared_round_listing(folder, workspaces, in_cache):
-    """List relevant entry names and locate child directories and receipt files."""
-    names, directories, receipts = set(), [], []
+    """List relevant names, directory entries and receipt paths."""
+    names, directory_entries, directories, receipts = set(), set(), [], []
     with os.scandir(folder) as entries:
         for entry in entries:
             if entry.path in workspaces:
@@ -868,11 +868,14 @@ def shared_round_listing(folder, workspaces, in_cache):
             receipt = identity and not directory and entry.is_file(follow_symlinks=False)
             if in_cache or cache or identity:
                 names.add((entry.name, directory, receipt))
+            # A new link can lead to a directory. Include it without following it.
+            if directory or entry.is_symlink():
+                directory_entries.add((entry.name, entry.inode(), directory))
             if directory:
                 directories.append((entry.path, in_cache or cache))
             elif receipt:
                 receipts.append(entry.path)
-    return names, directories, receipts
+    return names, directory_entries, directories, receipts
 
 
 def shared_round_receipts(root, workspaces):
@@ -892,12 +895,12 @@ def shared_round_receipts(root, workspaces):
             tracked[folder] = stamp[:3] if folder == root else stamp
             yield folder, tracked[folder]
         try:
-            names, directories, receipts = shared_round_listing(folder, workspaces, in_cache)
+            names, directory_entries, directories, receipts = shared_round_listing(folder, workspaces, in_cache)
         except FileNotFoundError:
             if folder == root or in_cache:
                 raise
             continue
-        walked.append((folder, in_cache, names))
+        walked.append((folder, in_cache, names, directory_entries))
         pending.extend(directories)
         for receipt in receipts:
             stamp = path_stamp(receipt)
@@ -910,23 +913,24 @@ def shared_round_receipts(root, workspaces):
     if not inventory_stamps_match(tracked):
         raise ValueError('shared round contents changed during inspection; stopped')
 
-    # A receipt or cache entry can arrive in an already-listed directory while
-    # we descend or read a receipt elsewhere. Recheck each listing on the way
-    # back up, with the round root last. Check every name in shared caches and
-    # only names that can affect shared identity elsewhere.
-    for folder, in_cache, names in reversed(walked):
+    # Recheck listings with the round root last. A new directory can arrive
+    # populated, so compare directory arrivals even outside the cache scope.
+    for folder, in_cache, names, directory_entries in reversed(walked):
         stamp = path_stamp(folder)
         current = None
         if stamp is not None and stat.S_ISDIR(stamp[2]):
             try:
-                current, _, _ = shared_round_listing(folder, workspaces, in_cache)
+                current = shared_round_listing(folder, workspaces, in_cache)
             except FileNotFoundError:
                 pass
         if current is None:
             if folder == root or in_cache:
                 raise ValueError('shared round directory changed: ' + folder)
-            current = set()
-        if current != names:
+            current_names, current_directories = set(), set()
+        else:
+            current_names, current_directories, _, _ = current
+        # Directory removals still depend on the original receipt/cache checks.
+        if current_names != names or not current_directories.issubset(directory_entries):
             raise ValueError('shared round contents changed during inspection; stopped')
 
 

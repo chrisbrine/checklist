@@ -427,12 +427,20 @@ installed and rollback fingerprints, and the round's shared scope. An early
 staged process sample can refuse a busy workspace. Apply confirms the workspace's
 own inventory, then rescans the shared scope for cache changes and new receipts.
 Each shared scan rechecks the directory listings after descent and receipt reads.
-It compares every name in shared caches and receipt and cache names elsewhere,
-excluding independently discovered workspaces. Apply then samples process use
-of the staged path and original workspace again. After that sample, only
-in-memory path matching and the prepared exclusive rename to the Trash remain. The same order applies to whole
-workspaces and partial moves. Only the Trash rename produces a receipt,
-which still names the original source.
+It compares every name in shared caches and receipt and cache names elsewhere.
+At every listed directory it also checks for newly arrived child directories,
+including empty directories and populated trees published by rename. It treats
+new symbolic links as possible directory arrivals without following them.
+Independently discovered workspaces stay outside the shared scan. Ordinary
+loose files outside shared caches can still change. Build identity receipts
+keep their checks. An ordinary directory can disappear if it held no tracked
+shared dependencies.
+
+Apply then samples process use of the staged path and original workspace again.
+After that sample, only in-memory path matching and the prepared exclusive
+rename to the Trash remain. The same order applies to whole workspaces and
+partial moves. Only the Trash rename produces a receipt, which still names
+the original source.
 
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
@@ -455,9 +463,10 @@ stamping, rollback retirement and fingerprinted qualification markers use
 the same file. Leave the lock file in place between operations.
 
 Cooperating publishers can publish before apply plans or after apply releases
-the lock. The lock orders those operations by when they acquire it. Manual
-edits and writes through existing handles can bypass it and change bytes after
-the last filesystem check.
+the lock. The lock orders those operations by when they acquire it. Inside
+each listed directory the closing listing detects shared entry arrivals during
+the walk. A writer that bypasses the lock can still publish an entry after
+the closing listing of its directory and before the rename.
 
 A process can open a path after the final observation samples its process
 entry and before the rename completes. Closing that interval requires kernel

@@ -1627,12 +1627,15 @@ class CleanScratchTests(unittest.TestCase):
         identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
         self.assert_late_shared_change_refuses('reports/build-info.json', identity)
 
+    shared_walk_files = ('.build/cache/deep/old.o', 'module-cache/deep/old.o',
+                         'reports/nested/keep.txt')
+
     def assert_final_shared_walk_change(self, directory, change, *, during_descent=False):
         session = 'walk-' + directory.replace('/', '-') + '-' + change
         container = self.item('round', session=session)
-        cache = self.write(container, '.build/cache/deep/old.o').parent
-        self.write(container, 'module-cache/deep/old.o')
-        self.write(container, 'reports/nested/keep.txt')
+        for relative in self.shared_walk_files:
+            self.write(container, relative)
+        cache = container / '.build/cache/deep'
         log = self.write(container, 'run-active.jsonl')
         workspace, sibling = container / 'retired', container / 'active'
         payload = self.write(workspace, 'src/work.py', b'only copy of retired work')
@@ -1648,19 +1651,43 @@ class CleanScratchTests(unittest.TestCase):
         samples_after_write = []
         compare, scan, stamp = cleanup.inventory_stamps_match, os.scandir, cleanup.path_stamp
 
+        identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+        incoming_contents = {
+            'receipt-tree': ('Checklist.app/Contents/Resources/build-info.json', identity),
+            'cache-tree': ('module-cache/new.o', b'new shared cache'),
+            'nested-tree': ('ordinary/deeper/build-info.json', identity),
+        }
+        incoming = self.root / 'incoming' / session
+        if change in incoming_contents:
+            relative, data = incoming_contents[change]
+            self.write(incoming, relative, data)
+        elif change == 'directory-link':
+            self.write(incoming, 'build-info.json', identity)
+
         def publish():
-            if change == 'receipt':
-                data = json.dumps({'source_fingerprint': self.fingerprint}).encode()
-                writes.append(self.write(listed, 'build-info.json', data))
-            elif change == 'cache':
-                name = 'new.o' if in_cache else 'CompilationCache/new.o'
-                writes.append(self.write(listed, name))
-            else:
+            if change == 'unrelated':
                 log.rename(container / 'run-active-previous.jsonl')
                 writes.append(self.write(container, log.name))
                 writes.append(self.write(sibling, 'src/new.py'))
                 if not in_cache:
                     writes.append(self.write(listed, 'unrelated.txt'))
+                return
+
+            published = listed / 'stage-output'
+            if change == 'receipt':
+                published = self.write(listed, 'build-info.json', identity)
+            elif change == 'cache':
+                published = self.write(listed, 'CompilationCache/new.o').parent
+            elif change == 'empty-directory':
+                published.mkdir()
+            elif change == 'directory-link':
+                published.symlink_to(incoming, target_is_directory=True)
+            elif change == 'removed-directory':
+                published = self.root / 'parked-directory'
+                listed.rename(published)
+            else:
+                incoming.rename(published)
+            writes.append(published)
 
         def check_inventory(expected):
             nonlocal final_inventory_checked
@@ -1697,9 +1724,11 @@ class CleanScratchTests(unittest.TestCase):
             result, rows = self.run_cleanup(apply=True, session_id=session, process_reader=observe_processes)
 
         self.assertTrue(writes)
-        self.assertTrue(all(path.is_file() for path in writes))
+        self.assertTrue(all(path.exists() for path in writes))
+        if change == 'directory-link':
+            self.assertTrue(writes[0].is_symlink())
         moves = [row for row in rows if row['action'] == 'trash_move']
-        if change == 'unrelated':
+        if change in {'unrelated', 'removed-directory'}:
             self.assertEqual((result, samples_after_write), (0, [True]))
             move, = moves
             self.assertEqual(move['source'], str(workspace))
@@ -1714,10 +1743,11 @@ class CleanScratchTests(unittest.TestCase):
             self.assertEqual(set(self.trash.iterdir()), trash_before)
 
     def test_relevant_arrivals_after_each_final_shared_listing(self):
-        directories = ('.', '.build', '.build/cache', '.build/cache/deep', 'module-cache',
-                       'module-cache/deep', 'reports', 'reports/nested')
+        directories = sorted({str(parent) for name in self.shared_walk_files for parent in Path(name).parents})
+        changes = ('receipt', 'cache', 'empty-directory', 'receipt-tree', 'cache-tree', 'nested-tree',
+                   'directory-link', 'unrelated')
         for directory in directories:
-            for change in ('receipt', 'cache', 'unrelated'):
+            for change in changes:
                 with self.subTest(directory=directory, change=change):
                     self.assert_final_shared_walk_change(directory, change)
 
@@ -1726,6 +1756,15 @@ class CleanScratchTests(unittest.TestCase):
 
     def test_root_cache_created_during_final_shared_walk_stops_move(self):
         self.assert_final_shared_walk_change('.', 'cache', during_descent=True)
+
+    def test_matching_receipt_inside_newly_published_stage_directory(self):
+        self.assert_final_shared_walk_change('.', 'receipt-tree', during_descent=True)
+
+    def test_shared_cache_inside_newly_published_stage_directory(self):
+        self.assert_final_shared_walk_change('.', 'cache-tree', during_descent=True)
+
+    def test_removing_ordinary_directory_without_shared_dependencies_allows_move(self):
+        self.assert_final_shared_walk_change('reports/nested', 'removed-directory')
 
     def test_loose_scratch_file_is_retained_with_a_file_reason(self):
         workspace = self.item()
