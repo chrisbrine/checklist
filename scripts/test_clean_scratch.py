@@ -2435,6 +2435,193 @@ class CleanScratchTests(unittest.TestCase):
                                      expected_moves)
                     self.assertEqual(sibling.is_dir(), case in round_wide)
 
+    def test_released_workspace_holds_unverified_legacy_staging_names(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        paths = (
+            '.fixture.checklist-retiring-' + '1' * 32,
+            'fixtures/trash/..build-' + '2' * 32 + '.checklist-retiring-' + '3' * 32,
+            'fixtures/shared/session/scratchpad/round/.checklist-retiring-' + '4' * 32,
+        )
+        for relative in paths:
+            self.write(workspace, relative + '/payload', relative.encode())
+
+        for apply in (False, True):
+            code, rows = self.run_cleanup(apply=apply)
+            self.assertEqual(code, 0)
+            row, = rows
+            self.assertEqual(row['recovery_path'], str(workspace / paths[0]))
+            self.assertEqual(row['recovery_provenance'], 'unverified')
+            self.assertEqual(row['eligible_paths'], [])
+        for relative in paths:
+            self.assertEqual((workspace / relative / 'payload').read_bytes(), relative.encode())
+
+    def test_released_workspace_can_move_fixtures_outside_reserved_staging_names(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        relative = 'fixtures/trash/.fixture-retiring-' + '1' * 32 + '/payload'
+        self.write(workspace, relative, b'fixture bytes')
+
+        code, rows = self.run_cleanup(apply=True)
+
+        self.assertEqual(code, 0)
+        move, = [row for row in rows if row['action'] == 'trash_move']
+        self.assertFalse(workspace.exists())
+        self.assertEqual((Path(move['trash']) / relative).read_bytes(), b'fixture bytes')
+
+    def assert_interrupted_stage_survives_release(self, ticket_release):
+        class InterruptedRetirement(Exception):
+            pass
+
+        workspace = self.item('checkout')
+        self.write(workspace, 'notes.txt', b'private notes keep this partial')
+        selected = self.write(workspace, '.build/output.o', b'generated output').parent
+        stage = cleanup.ScratchTrash.stage
+        rename = cleanup.ScratchTrash.rename_exclusive
+        staged_paths = []
+
+        def check_prepared_record(trash, source, destination):
+            nonce = cleanup.stage_nonce(destination)
+            self.assertEqual(source, selected)
+            self.assertFalse(destination.exists())
+            self.assertEqual(cleanup.read_stage_records()[nonce], {
+                'version': 1, 'nonce': nonce, 'name': destination.name, 'path': str(destination),
+                'identity': cleanup.stage_identity(cleanup.path_stamp(source)),
+            })
+            rename(trash, source, destination)
+
+        def interrupt_after_stage(trash, path):
+            staged_paths.append(stage(trash, path))
+            raise InterruptedRetirement
+
+        with patch.object(cleanup.ScratchTrash, 'stage', new=interrupt_after_stage), \
+             patch.object(cleanup.ScratchTrash, 'rename_exclusive', new=check_prepared_record):
+            with self.assertRaises(InterruptedRetirement):
+                self.run_cleanup(apply=True)
+        staged, = staged_paths
+        self.assertFalse(selected.exists())
+        self.write(workspace, '.!.checklist-retiring-' + '8' * 32, b'unverified lookalike')
+        cleanup.write_marker(workspace, 'session', 'fixture workspace', tickets=['CL-528'])
+        if ticket_release:
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cleanup.release_finished([workspace], 'session', lambda _: {'CL-528': 'done'}), 0)
+        else:
+            cleanup.write_marker(workspace, 'session', release=True)
+
+        for apply in (False, True):
+            code, rows = self.run_cleanup(apply=apply)
+            self.assertEqual(code, 0)
+            row, = rows
+            self.assertEqual(row['recovery_path'], str(staged))
+            self.assertEqual(row['recovery_provenance'], 'recorded')
+            self.assertEqual(row['eligible_paths'], [])
+        self.assertEqual((staged / 'output.o').read_bytes(), b'generated output')
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_real_partial_stage_survives_later_workspace_release(self):
+        self.assert_interrupted_stage_survives_release(ticket_release=False)
+
+    def test_real_partial_stage_survives_later_ticket_release(self):
+        self.assert_interrupted_stage_survives_release(ticket_release=True)
+
+    def test_recovery_record_for_different_inode_does_not_confirm_a_lookalike(self):
+        workspace = self.item('checkout')
+        output = self.write(workspace, '.build/output.o', b'original build')
+        staged = cleanup.ScratchTrash().stage(output)
+        original = self.root / 'original-payload'
+        staged.rename(original)
+        self.write(staged.parent, staged.name, b'new occupant')
+        self.mark(workspace, release=True)
+
+        code, rows = self.run_cleanup()
+
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['recovery_path'], str(staged))
+        self.assertEqual(row['recovery_provenance'], 'unverified')
+        self.assertEqual(row['eligible_paths'], [])
+        self.assertEqual(original.read_bytes(), b'original build')
+        self.assertEqual(staged.read_bytes(), b'new occupant')
+
+    def test_interrupted_whole_workspace_reports_actual_staged_name(self):
+        for source in ('released', 'long-name-' + 'r' * 210):
+            with self.subTest(source=source):
+                workspace = self.item(source)
+                self.mark(workspace, release=True)
+                self.write(workspace, 'src/unique', b'keep this')
+                staged = cleanup.ScratchTrash().stage(workspace)
+
+                code, rows = self.run_cleanup(apply=True)
+
+                self.assertEqual(code, 0)
+                row = next(row for row in rows if row.get('path') == str(staged))
+                self.assertEqual(row['reason'], cleanup.recovery_reason(staged))
+                self.assertEqual(row['eligible_paths'], [])
+                self.assertEqual((staged / 'src/unique').read_bytes(), b'keep this')
+                self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
+
+    def test_interrupted_partial_cleanup_reports_actual_staged_entry(self):
+        workspace = self.item('checkout')
+        self.write(workspace, 'notes', b'private retained notes')
+        source = self.write(workspace, '.build/deep/output.o', b'generated output')
+        staged = cleanup.ScratchTrash().stage(source)
+
+        code, rows = self.run_cleanup(apply=True)
+
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['reason'], cleanup.recovery_reason(staged))
+        self.assertEqual(row['eligible_paths'], [])
+        self.assertEqual(staged.read_bytes(), b'generated output')
+
+    def test_retiring_candidate_in_explicit_trash_root_reports_recovery_path(self):
+        # The production destination is a direct rename. An explicitly
+        # enumerated Trash entry can nevertheless carry a stage name.
+        self.qualification = self.trash
+        workspace = self.item('qualification', qualification=True)
+        self.mark(workspace, release=True)
+        self.write(workspace, 'payload', b'keep this')
+        staged = cleanup.ScratchTrash().stage(workspace)
+
+        code, rows = self.run_cleanup()
+
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['path'], str(staged))
+        self.assertEqual(row['reason'], cleanup.recovery_reason(staged))
+        self.assertEqual(row['eligible_paths'], [])
+        self.assertEqual((staged / 'payload').read_bytes(), b'keep this')
+
+    def test_recovery_sibling_arriving_during_final_shared_scan_stops_move(self):
+        container = self.item('round')
+        self.write(container, '.build/cache/output.o')
+        workspace = container / 'retired'
+        payload = self.write(workspace, 'src/work.py', b'released work')
+        self.mark(workspace, release=True)
+        recovery = container / cleanup.staging_name(workspace, '5' * 32)
+        confirm = cleanup.confirm_staged_round
+        confirmations = 0
+
+        def publish_after_closing_read(*args):
+            nonlocal confirmations
+            confirm(*args)
+            confirmations += 1
+            if confirmations == 2:
+                self.write(recovery, 'payload', b'other staged work')
+
+        with patch.object(cleanup, 'confirm_staged_round', new=publish_after_closing_read):
+            code, rows = self.run_cleanup(apply=True)
+
+        self.assertEqual(confirmations, 2)
+        self.assertEqual(code, 1)
+        row, = rows
+        self.assertEqual(row['action'], 'kept_error')
+        self.assertEqual(row['reason'], cleanup.recovery_reason(recovery))
+        self.assertEqual(row['destinations'], [])
+        self.assertEqual(payload.read_bytes(), b'released work')
+        self.assertEqual((recovery / 'payload').read_bytes(), b'other staged work')
+        self.assertEqual(list(self.trash.iterdir()), [])
+
     def test_staged_restore_collision_preserves_both_names_and_reports_recovery_path(self):
         checkout = self.item('checkout')
         self.mark(checkout, release=True)

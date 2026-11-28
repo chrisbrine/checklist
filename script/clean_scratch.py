@@ -23,6 +23,7 @@ import tempfile
 import time
 import uuid
 
+import publication_lock as publication
 from publication_lock import PublicationBusy, SCRATCH_WAIT_SECONDS, publication_lock
 from retire_old_bundles import previous_timestamp
 
@@ -45,6 +46,144 @@ MOVE_BATCH_BYTES = 64 * 1024
 PREVIEW_WORKERS = 8
 
 
+def staging_name(path, token):
+    suffix = '.checklist-retiring-' + token
+    name = '.' + path.name + suffix
+    return name if len(os.fsencode(name)) <= 255 else suffix
+
+
+def recovery_sibling(source, staged=None):
+    """Find an interrupted staging name for this source in its rename parent."""
+    parent = source.parent
+    if parent.is_symlink():
+        return None
+    prefix = staging_name(source, '0' * 32)[:-32]
+    staged_name = staged.name if staged is not None else None
+    with os.scandir(parent) as entries:
+        name = min((entry.name for entry in entries
+                    if entry.name != staged_name and entry.name[:-32] == prefix
+                    and RETIRING_NAME.fullmatch(entry.name)), default=None)
+    return parent / name if name is not None else None
+
+
+def recovery_reason(path):
+    return 'interrupted retirement needs recovery; retained: ' + str(path)
+
+
+def stage_records_path():
+    return publication.publication_path().with_name('.checklist-scratch-stages.jsonl')
+
+
+def stage_nonce(staged):
+    return staged.name.rsplit('-', 1)[-1]
+
+
+def stage_identity(stamp):
+    return [stamp[0], stamp[1], stat.S_IFMT(stamp[2])]
+
+
+def owned_regular(descriptor):
+    metadata = os.fstat(descriptor)
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+
+
+def write_stage_records(entries):
+    path = stage_records_path()
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, 'wb') as output:
+        if not owned_regular(output.fileno()):
+            raise ValueError('scratch stage journal must be a caller-owned regular file: ' + str(path))
+        # An interrupted append can leave a partial trailing line.
+        output.write(b'\n')
+        for staged, stamp in entries:
+            record = {'version': 1, 'nonce': stage_nonce(staged), 'name': staged.name,
+                      'path': str(staged.absolute()), 'identity': stage_identity(stamp)}
+            output.write(json.dumps(record).encode() + b'\n')
+        output.flush()
+        os.fsync(output.fileno())
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def read_stage_records():
+    records = {}
+    try:
+        fd = os.open(stage_records_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as source:
+            if not owned_regular(source.fileno()):
+                return records
+            for line in source:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get('version') == 1 and isinstance(record.get('nonce'), str):
+                    records[record['nonce']] = record
+    except OSError:
+        pass
+    return records
+
+
+def stage_record_matches(path, record):
+    if not record or record.get('name') != path.name:
+        return False
+    stamp = path_stamp(path)
+    return bool(stamp and record.get('identity') == stage_identity(stamp))
+
+
+def recovery_report(path, records):
+    provenance = 'unverified'
+    try:
+        if stage_record_matches(path, records.get(stage_nonce(path))):
+            provenance = 'recorded'
+    except OSError:
+        # Missing, unreadable and mismatched records never authorize a move.
+        pass
+    return {'recovery_path': str(path), 'recovery_provenance': provenance}
+
+
+def recorded_recovery_items(items):
+    """Find recorded stages at known paths before the held-root preview shortcut."""
+    roots = {item for item, _ in items}
+    matches = set()
+    for nonce, record in read_stage_records().items():
+        if not isinstance(record.get('path'), str):
+            continue
+        path = Path(record['path'])
+        if (not path.is_absolute() or '..' in path.parts
+                or not RETIRING_NAME.fullmatch(path.name) or stage_nonce(path) != nonce):
+            continue
+        owners = roots.intersection((path, *path.parents))
+        try:
+            if owners and stage_record_matches(path, record):
+                matches.update(owners)
+        except OSError:
+            pass
+    return matches
+
+
+def pending_recovery(item, before):
+    if RETIRING_NAME.fullmatch(item.name):
+        return recovery_report(item, read_stage_records())
+    sibling = recovery_sibling(item)
+    paths = [sibling] if sibling is not None else []
+    paths.extend(path for path in before if RETIRING_NAME.fullmatch(path.name))
+    if not paths:
+        return {}
+    records = read_stage_records()
+    first = {}
+    for path in paths:
+        details = recovery_report(path, records)
+        if details['recovery_provenance'] == 'recorded':
+            return details
+        first = first or details
+    return first
+
+
 class ScratchTrash:
     """Prepare same-volume Trash paths before validation and rename in process."""
 
@@ -53,6 +192,7 @@ class ScratchTrash:
         if self.test_directory == '':
             raise ValueError('CHECKLIST_TRASH_DIR must name a temporary Trash folder.')
         self.directories = {}
+        self.prepared_stages = {}
         self.rename = ctypes.CDLL(None, use_errno=True).renamex_np
         self.rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
         self.rename.restype = ctypes.c_int
@@ -120,10 +260,17 @@ class ScratchTrash:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(source), None, str(destination))
 
+    def prepare_stages(self, entries):
+        stages = {path: (path.with_name(staging_name(path, uuid.uuid4().hex)), stamp)
+                  for path, stamp in entries if path not in self.prepared_stages}
+        if stages:
+            write_stage_records(stages.values())
+            self.prepared_stages.update((path, staged) for path, (staged, _) in stages.items())
+
     def stage(self, path):
-        suffix = '.checklist-retiring-' + uuid.uuid4().hex
-        name = '.' + path.name + suffix
-        staged = path.with_name(name if len(os.fsencode(name)) <= 255 else suffix)
+        if path not in self.prepared_stages:
+            self.prepare_stages([(path, metadata_stamp(path.lstat()))])
+        staged = self.prepared_stages.pop(path)
         self.rename_exclusive(path, staged)
         return staged
 
@@ -1050,9 +1197,13 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     # A root released for ended tickets retires whole: no per-file hashing (CL-359).
     ticket_retire = ticket_released(item)
     released_retire = released_by(item)
-    recovery = next((path for path in before if RETIRING_NAME.fullmatch(path.name)), None)
-    if recovery is not None:
-        reason = 'interrupted retirement needs recovery; retained: ' + str(recovery)
+    retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
+    whole = retire_run or released_retire
+    # A previous partial move may have staged a child before this tree
+    # was marked or released. The current plan cannot rule out that history.
+    recovery_details = pending_recovery(item, before)
+    if recovery_details:
+        reason = recovery_reason(recovery_details['recovery_path'])
     elif item.is_symlink():
         reason = 'symbolic link; never followed'
     elif stat.S_ISREG(before[item][2]):
@@ -1091,8 +1242,6 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
 
     # Explicit root release authorizes whole-folder retirement. Fingerprinted
     # qualification runs keep their additional links/Git guard unless ticket-released.
-    retire_run = kind == 'qualification' and bool((read_marker(item) or {}).get('source_fingerprint'))
-    whole = retire_run or released_retire
     if retire_run and not ticket_retire and not reason and any(
             not stat.S_ISREG(entry[2]) or '.git' in relative_parts(path)
             for path, entry in files.items()):
@@ -1108,7 +1257,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
         return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size, 'reason': reason,
                 'reasons': {reason: size} if files else {},
                 'retained_legacy_paths': [str(p) for p in legacy], 'planned_move_count': 0,
-                'move_bytes': {}, 'moves': [], 'inventory': before}
+                'move_bytes': {}, 'moves': [], 'inventory': before, **recovery_details}
     if whole and not reason:
         # An owner's root release authorizes one rename of the checked tree.
         # Do not classify/hash its managed objects or split at Git/legacy paths:
@@ -1189,7 +1338,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
             'reasons': dict(reasons), 'retained_legacy_paths': [str(p) for p in legacy],
             'planned_move_count': len(moves),
             'move_bytes': {path: tree_bytes[path] for path in moves},
-            'moves': moves, 'inventory': before}
+            'moves': moves, 'inventory': before, **recovery_details}
 
 
 def preview_public(decision):
@@ -1209,13 +1358,13 @@ def _set_preview_objects(objects):
 
 
 def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released,
-                objects=None, sizer=None, *, previous=None, round_hold=None):
+                objects=None, sizer=None, *, previous=None, round_hold=None, inspect_recovery=False):
     """One read-only preview decision; module-level so a process pool can run it."""
     # An old --preview is never an executable deletion plan.
     if not in_scope(item, kind, session_id, include_released):
         raise ValueError('workspace ownership/release changed; retained')
     # Preview reads a held root's marker and du size only (CL-359 speed).
-    if held := held_preview(item, kind, keep, sizer):
+    if not inspect_recovery and (held := held_preview(item, kind, keep, sizer)):
         return held
     return preview_public(plan(item, kind, _PREVIEW_OBJECTS if objects is None else objects,
                                [item] if in_use else [], fingerprint, keep, now,
@@ -1241,6 +1390,7 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
     process pool from preview_executor()."""
     failed = False
     process_pool = executor is not None
+    recoveries = recorded_recovery_items(items)
     with (executor(objects) if process_pool else ThreadPoolExecutor(max_workers=max(1, workers))) as pool, \
             ThreadPoolExecutor(max_workers=max(1, workers)) as size_pool:
         futures = []
@@ -1248,14 +1398,15 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
             round_hold = (round_holds or {}).get(item.parent)
             # Held roots use the very same background size futures as size_report;
             # do not make each process launch a duplicate du of that subtree.
-            if sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
+            inspect_recovery = item in recoveries or bool(RETIRING_NAME.fullmatch(item.name))
+            if not inspect_recovery and sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
                 future = size_pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
                                           session_id, include_released, objects, sizer,
                                           previous=previous, round_hold=round_hold)
             else:
                 future = pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
                                      session_id, include_released, None if process_pool else objects,
-                                     previous=previous, round_hold=round_hold)
+                                     previous=previous, round_hold=round_hold, inspect_recovery=inspect_recovery)
             futures.append((item, future))
         for item, future in futures:
             try:
@@ -1491,6 +1642,13 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 prepared[path] = trash.prepare(path, decision['inventory'][path])
             except (OSError, ValueError) as error:
                 move_error(decision, error, path)
+    stage_batch = [(decision, path) for decision, path in batch if mover is not None or path in prepared]
+    try:
+        trash.prepare_stages((path, decision['inventory'][path]) for decision, path in stage_batch)
+    except (OSError, ValueError) as error:
+        for decision, path in stage_batch:
+            move_error(decision, error, path, stop=True)
+        return
     first = True
     moved = {}
     retry = []
@@ -1526,6 +1684,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
         staged = None
         try:
             try:
+                if recovery := recovery_sibling(path):
+                    raise ValueError(recovery_reason(recovery))
                 validate_move(decision, path, installations, shared, observed.get(parent, {}), hold, keep,
                               session_id, include_released, modes)
             except PermissionError as error:
@@ -1571,6 +1731,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 # The workspace scan can take time. Check for later shared
                 # cache and receipt changes before sampling processes.
                 confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
+                if recovery := recovery_sibling(path, staged):
+                    raise ValueError(recovery_reason(recovery))
                 if path_stamp(path) is not None:
                     raise ValueError('original name reappeared before Trash')
                 # A read-only open can leave those checks unchanged. After

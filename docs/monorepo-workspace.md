@@ -458,7 +458,16 @@ the original source.
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
 both entries and reports the staged location in `staged_path`. A later cleanup
-retains a discovered staging name for recovery.
+retains a discovered staging entry and reports its recovery path. Staging names
+sit beside the selected source and use a basename-free fallback for long names.
+Before staging, cleanup appends the nonce, staging name, path and source entry
+identity to `.checklist-scratch-stages.jsonl` beside the publication lock. It
+syncs the journal and its parent once per move batch. It verifies the name and
+entry identity when reporting a recorded stage. A prior partial move can leave a
+staged child anywhere in a workspace. Marking or releasing that workspace
+keeps the recovery hold. Cleanup retains earlier or unverified names because
+legacy stages and fixture lookalikes share the same spelling. The Trash rename
+uses a unique final destination and requires no intermediate Trash stage.
 
 Scratch apply and Checklist identity publishers take an exclusive advisory
 lock on `~/Library/Caches/ChecklistQualification/.checklist-publication.lock`.
