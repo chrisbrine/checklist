@@ -28,7 +28,7 @@ class CleanScratchTests(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         location = patch.object(publication, 'publication_path', return_value=self.root / 'publication.lock')
         location.start(); self.addCleanup(location.stop)
-        self.assertNotIn('scratchpad', self.root.parts)
+        self.assertFalse(any(path.name == 'scratchpad' for path in self.root.parents))
         caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
         self.repo = self.root / 'retained';self.repo.mkdir()
@@ -1386,8 +1386,11 @@ class CleanScratchTests(unittest.TestCase):
             self.assertTrue(folder.is_dir())
         self.assertEqual(list(self.trash.iterdir()), [])
 
+        container.chmod(0o555)
+        self.addCleanup(container.chmod, 0o755)
         result, records = self.run_cleanup(apply=True)
         self.assertEqual(result, 0)
+        self.assertEqual(stat.S_IMODE(container.stat().st_mode), 0o555)
         moves = [row for row in records if row['action'] == 'trash_move']
         self.assertEqual([Path(row['source']) for row in moves], released)
         self.assertEqual(set(self.trash.iterdir()), {Path(row['trash']) for row in moves})
@@ -1474,6 +1477,121 @@ class CleanScratchTests(unittest.TestCase):
                          list(map(str, released)))
         self.assertTrue(receipt.is_file())
 
+    def test_apply_moves_released_workspaces_while_open_sibling_and_loose_logs_change(self):
+        for phase in ('before staging', 'during staging', 'during staged observation'):
+            with self.subTest(phase=phase):
+                session = phase.replace(' ', '-')
+                container = self.item('round', session=session)
+                cache = self.write(container, '.build/cache/object')
+                released = [container / name for name in ('retired-a', 'retired-b')]
+                for workspace in released:
+                    self.write(workspace, 'src/work.py', b'released work')
+                    cleanup.write_marker(workspace, session, 'finished work', tickets=['CL-10'])
+                    cleanup.write_marker(workspace, session, release=True, released_for_tickets=['CL-10'])
+                active = container / 'in-progress'
+                sibling_receipt = self.write(active, 'src/build-info.json', b'{}')
+                cleanup.write_marker(active, session, 'open ticket', tickets=['CL-11'])
+                log = self.write(container, 'run-active.jsonl', b'first event\n')
+                unrelated = self.write(container, 'reports/last-active.txt', b'previous output')
+                writes = []
+
+                def write_activity():
+                    log.rename(container / 'run-active-previous.jsonl')
+                    log.write_bytes(b'second event\n')
+                    self.write(container, 'pid-active', b'1234')
+                    unrelated.rename(unrelated.with_name('previous.txt'))
+                    self.write(active, 'src/new.py', b'new work in open ticket')
+                    sibling_receipt.write_text(json.dumps({'source_fingerprint': self.fingerprint}))
+                    writes.append(True)
+
+                stage_source = cleanup.ScratchTrash.stage
+                staged = None
+
+                def stage(trash, path):
+                    nonlocal staged
+                    physical = stage_source(trash, path)
+                    if path == released[0]:
+                        staged = physical
+                        if phase == 'during staging':
+                            write_activity()
+                    return physical
+
+                def watch_processes():
+                    if phase == 'during staged observation' and staged is not None and not writes:
+                        write_activity()
+                    return [active / 'src']
+
+                with patch.object(cleanup.ScratchTrash, 'stage', new=stage):
+                    result, rows = self.run_cleanup(
+                        apply=True, session_id=session, process_reader=watch_processes,
+                        after_inspection=write_activity if phase == 'before staging' else None)
+
+                self.assertEqual(writes, [True])
+                self.assertEqual((result, [row['reason'] for row in rows if row['action'] == 'kept_error']),
+                                 (0, []))
+                self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                                 list(map(str, released)))
+                self.assertTrue(all(not workspace.exists() for workspace in released))
+                self.assertFalse(cleanup.read_marker(active)['released'])
+                self.assertEqual((active / 'src/new.py').read_bytes(), b'new work in open ticket')
+                self.assertEqual(log.read_bytes(), b'second event\n')
+                self.assertEqual((container / 'run-active-previous.jsonl').read_bytes(), b'first event\n')
+                self.assertTrue(cache.is_file())
+
+    def test_apply_keeps_workspaces_when_shared_cache_changes(self):
+        container = self.item('round')
+        existing = self.write(container, '.build/cache/old.o')
+        workspace = container / 'retired'
+        payload = self.write(workspace, 'src/work.py')
+        self.mark(workspace, release=True)
+
+        result, rows = self.run_cleanup(
+            apply=True, after_inspection=lambda: self.write(existing.parent, 'new.o'))
+
+        self.assertEqual(result, 1)
+        held, = rows
+        self.assertIn('shared round contents changed', held['reason'])
+        self.assertEqual(held['destinations'], [])
+        self.assertTrue(payload.is_file())
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_apply_rechecks_new_shared_receipt_after_staged_process_observation(self):
+        container = self.item('round')
+        self.write(container, '.build/cache/object')
+        workspace = container / 'retired'
+        payload = self.write(workspace, 'src/work.py')
+        self.mark(workspace, release=True)
+        receipt = container / 'staged/Checklist.app/Contents/Resources/build-info.json'
+
+        def watch_processes():
+            if not workspace.exists():
+                self.write(receipt.parent, receipt.name, json.dumps({
+                    'source_fingerprint': self.fingerprint,
+                }).encode())
+            return []
+
+        result, rows = self.run_cleanup(apply=True, process_reader=watch_processes)
+
+        self.assertEqual(result, 1)
+        held, = rows
+        self.assertIn('shared round contents changed', held['reason'])
+        self.assertEqual(held['destinations'], [])
+        self.assertTrue(payload.is_file())
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(list(self.trash.iterdir()), [])
+
+    def test_loose_scratch_file_is_retained_with_a_file_reason(self):
+        workspace = self.item()
+        loose = self.write(workspace.parent, 'run.jsonl', b'uncommitted log')
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                result, rows = self.run_cleanup(apply=apply)
+                row = next(row for row in rows if row.get('path') == str(loose))
+                self.assertEqual((result, row['reason']), (0, 'loose file at scratch root; retained'))
+                self.assertEqual(row['eligible_paths'], [])
+                self.assertEqual(row['kept_bytes'], len(b'uncommitted log'))
+                self.assertEqual(loose.read_bytes(), b'uncommitted log')
+
     def test_apply_rechecks_shared_round_receipt_before_trashing_checkout(self):
         container = self.item('round')
         self.write(container, '.build/CACHEDIR.TAG')
@@ -1520,10 +1638,11 @@ class CleanScratchTests(unittest.TestCase):
         with patch.object(cleanup, 'shared_round_receipts', side_effect=scan):
             result, rows = self.run_cleanup(apply=True, process_reader=lambda: list(observed_paths))
         self.assertEqual(result, 1)
-        self.assertEqual(len(scans), 4)
+        self.assertEqual(len(scans), 5)
         names = {str(checkout), str(sibling)}
         self.assertEqual(scans[:3], [names] * 3)  # Planning and both pre-stage scans.
         staged, = scans[-1] - names
+        self.assertEqual(scans[3:], [names | {staged}] * 2)  # Both staged scans.
         self.assertTrue(Path(staged).name.startswith('.idle.checklist-retiring-'))
         self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
                          [str(sibling)])
@@ -1810,6 +1929,8 @@ class CleanScratchTests(unittest.TestCase):
                 check_file = cleanup.validate_staged_file
                 check_round = cleanup.confirm_staged_round
                 read_stamp = cleanup.path_stamp
+                round_checks = 0
+                receipt_checks = 0
 
                 def file_check(decision, source, staged):
                     if change != 'shared receipt':
@@ -1818,15 +1939,23 @@ class CleanScratchTests(unittest.TestCase):
                     check_file(decision, source, staged)
 
                 def stamp(path, **options):
+                    nonlocal receipt_checks
                     sampled = read_stamp(path, **options)
                     if change == 'shared receipt' and Path(path) == receipt:
-                        # The final receipt bytes and the file stamp were read.
-                        inject()
+                        receipt_checks += 1
+                        if receipt_checks == 2:
+                            # The final receipt bytes and the file stamp were read.
+                            inject()
                     return sampled
 
-                def round_check(observed, contents):
-                    with patch.object(cleanup, 'path_stamp', side_effect=stamp):
-                        check_round(observed, contents)
+                def round_check(*args):
+                    nonlocal round_checks
+                    round_checks += 1
+                    if round_checks == 2:
+                        with patch.object(cleanup, 'path_stamp', side_effect=stamp):
+                            check_round(*args)
+                    else:
+                        check_round(*args)
 
                 def stop_at_trash(paths, *, staged):
                     self.assertEqual(paths, [checkout])
@@ -1918,6 +2047,7 @@ class CleanScratchTests(unittest.TestCase):
                     stage_source, read_stat = cleanup.ScratchTrash.stage, os.lstat
                     check_policy = cleanup.check_staged_policy
                     confirm_round = cleanup.confirm_staged_round
+                    checkout_round_checks = 0
 
                     def stage(trash, path):
                         nonlocal physical
@@ -1947,11 +2077,15 @@ class CleanScratchTests(unittest.TestCase):
                         if phase == 'before commit' and case != 'process' and not injected and physical in actual:
                             inject()
 
-                    def confirm(observed, contents):
-                        confirm_round(observed, contents)
+                    def confirm(*args):
+                        nonlocal checkout_round_checks
+                        confirm_round(*args)
                         # The new process is the case that must be detected
-                        # after all commit-time filesystem checks have returned.
-                        if phase == 'before commit' and case == 'process' and not injected and physical.is_dir():
+                        # after the final shared receipt observation.
+                        if physical != checkout and physical.is_dir():
+                            checkout_round_checks += 1
+                        if (phase == 'before commit' and case == 'process' and not injected
+                                and checkout_round_checks == 2):
                             inject()
 
                     def receipt_metadata(path, *, follow_symlinks=False):

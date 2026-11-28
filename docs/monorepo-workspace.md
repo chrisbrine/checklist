@@ -407,21 +407,27 @@ An unmarked round folder with its own `.build` can still hold independently
 registered workspaces (CL-524). When the cache is the parent folder's only
 private-copy indicator, scratch cleanup previews each marked child with its own
 reason. A protected child can stay while eligible released siblings move to the
-Trash. The parent cache, loose evidence and unmarked children stay. When a
-receipt in the shared files identifies the installed or immediate rollback build,
-every workspace in the round stays. Apply prepares same-volume Trash destinations
-in bounded groups. Before staging each path, it scans the shared round again
-and checks the planned inventory, permissions, markers, keeps, release state,
-installed identities and process use.
+Trash. The parent cache, loose evidence and unmarked children stay. Each
+workspace depends on the round directory's identity, directory metadata within
+its shared build caches and build identity receipts outside the independently
+discovered workspaces. A shared receipt for the installed or immediate rollback
+build keeps every workspace in the round. Loose log creation and rotation and
+writes inside marked sibling workspaces leave these shared checks unchanged.
+Regular files directly in a scratch root are reported as
+`loose file at scratch root; retained` in preview and apply.
+
+Apply prepares same-volume Trash destinations in bounded groups. Before staging
+each path, it rescans the shared scope and checks the planned inventory,
+permissions, markers, keeps, release state, installed identities and process use.
 
 Apply renames an idle path to a hidden `.<name>.checklist-retiring-<id>` name
 in the same parent. It walks the full checkout under that name and compares
 each entry with the plan. It rechecks the markers, keeps, release state,
-installed and rollback fingerprints, and the contents of the round's shared
-receipts. An early staged process sample can refuse a busy workspace before
-the final confirmation. Apply finishes its scope, receipt, byte and inventory
-checks, then samples process use of the staged path and original workspace
-again. After that sample, only in-memory path matching and the prepared
+installed and rollback fingerprints, and the round's shared scope. An early
+staged process sample can refuse a busy workspace. Apply rescans the shared
+scope again to catch new receipts, confirms the workspace's own inventory, then
+samples process use of the staged path and original workspace again. After that
+sample, only in-memory path matching and the prepared
 exclusive rename to the Trash remain. The same order applies to whole
 workspaces and partial moves. Only the Trash rename produces a receipt,
 which still names the original source.
