@@ -1,5 +1,6 @@
 """Scratch cleanup tests use temporary fixtures only; never real scratch or Trash."""
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 import io
 import json
@@ -9,12 +10,14 @@ import subprocess
 import stat
 import sys
 import tempfile
+from threading import Event
 import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
 import clean_scratch as cleanup
+import publication_lock as publication
 from retire_old_bundles import trash
 
 
@@ -23,6 +26,8 @@ class CleanScratchTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix='checklist-clean-scratch-test-', dir=Path('/tmp').resolve())
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        location = patch.object(publication, 'publication_path', return_value=self.root / 'publication.lock')
+        location.start(); self.addCleanup(location.stop)
         self.assertNotIn('scratchpad', self.root.parts)
         caller = patch.dict(os.environ, {'CODEX_THREAD_ID': 'session', 'CLAUDE_SESSION_ID': '', 'CLAUDE_CODE_SESSION_ID': '', 'CHECKLIST_SESSION_ID': ''})
         caller.start();self.addCleanup(caller.stop)
@@ -1710,6 +1715,146 @@ class CleanScratchTests(unittest.TestCase):
                     self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
                                      expected_moves)
                     self.assertEqual(sibling.is_dir(), case in round_wide)
+
+    def test_fingerprinted_qualification_marker_is_published_under_lock(self):
+        root = self.item(qualification=True)
+        write = cleanup.write_marker
+
+        def checked_write(*args, **kwargs):
+            with self.assertRaisesRegex(publication.PublicationBusy, 'qualification marker'):
+                with publication.publication_lock('fixture contender', timeout=0):
+                    self.fail('publication lock was free during qualification')
+            return write(*args, **kwargs)
+
+        with patch.object(cleanup, 'write_marker', side_effect=checked_write):
+            cleanup.mark_qualification(root, self.fingerprint, 'fixture qualification')
+        with publication.publication_lock('fixture after marker', timeout=0):
+            self.assertEqual(cleanup.read_marker(root)['source_fingerprint'], self.fingerprint)
+
+    def test_apply_refuses_at_publication_wait_bound_before_planning(self):
+        workspace = self.item()
+        self.write(workspace, '.build/object')
+        argv = ['clean_scratch.py', '--apply', '--sessions-root', str(self.sessions),
+                '--qualification-root', str(self.qualification), '--repo', str(self.repo),
+                '--installed-info', str(self.installed)]
+        output = io.StringIO()
+        with publication.publication_lock('fixture publisher'):
+            preview_code, preview = self.run_cleanup()
+            self.assertEqual(preview_code, 0)
+            self.assertEqual(preview[0]['eligible_paths'], [str(workspace)])
+            started = time.monotonic()
+            with patch.object(sys, 'argv', argv), redirect_stdout(output), \
+                 patch.object(cleanup, 'plan', side_effect=AssertionError('planned under publisher')), \
+                 patch.object(cleanup, 'storage_report', side_effect=AssertionError('sized after refusal')):
+                code = cleanup.main()
+            elapsed = time.monotonic() - started
+        self.assertEqual(code, 1)
+        held = json.loads(output.getvalue())
+        self.assertEqual(held['action'], 'kept_error')
+        self.assertIn('busy after 2 s', held['reason'])
+        self.assertIn(f'fixture publisher (PID {os.getpid()})', held['reason'])
+        self.assertGreaterEqual(elapsed, publication.SCRATCH_WAIT_SECONDS)
+        self.assertLess(elapsed, publication.SCRATCH_WAIT_SECONDS + 5)
+        self.assertTrue(workspace.exists())
+        self.assertEqual(list(self.trash.iterdir()), [])
+        print(f'publication contention refused scratch apply in {elapsed:.3f} s')
+        with publication.publication_lock('fixture retry', timeout=0):
+            pass
+
+    def test_v524k_publications_wait_at_final_checks_then_protect_workspace(self):
+        for change in ('installed', 'rollback', 'shared receipt'):
+            with self.subTest(change=change):
+                session = 'late-' + change.replace(' ', '-')
+                parent = self.item('round', session=session)
+                self.write(parent, '.build/CACHEDIR.TAG')
+                checkout = parent / 'checkout'
+                payload = self.write(checkout, 'src/work.py', b'unique workspace')
+                self.mark(checkout, session=session, release=True)
+                other = 'b' * 64
+                def identity(fingerprint):
+                    return json.dumps({'source_fingerprint': fingerprint}).encode()
+                receipt = self.write(parent, 'staged/deep/build-info.json', identity(other))
+                apps = self.root / session
+                self.installed = self.write(apps, 'Checklist.app/Contents/Resources/build-info.json',
+                                            identity(self.fingerprint))
+                previous = self.write(apps, '.Checklist-previous-20261128T000000Z-1.app/'
+                                      'Contents/Resources/build-info.json', identity('c' * 64))
+                publications = {
+                    'installed': (self.installed, other),
+                    'rollback': (previous, other),
+                    'shared receipt': (receipt, self.fingerprint),
+                }
+                file, match = publications[change]
+                initial_stamp = file.stat()
+                original_bytes = file.read_bytes()
+                begin, waiting, published = Event(), Event(), Event()
+
+                def publish():
+                    if not begin.wait(15):
+                        raise AssertionError('did not reach the V524k publication point')
+                    try:
+                        with publication.publication_lock(change, timeout=0):
+                            raise AssertionError('publisher entered the final Trash interval')
+                    except publication.PublicationBusy:
+                        waiting.set()
+                    with publication.publication_lock(change, timeout=15):
+                        file.write_bytes(identity(match))
+                        published.set()
+
+                def inject():
+                    begin.set()
+                    self.assertTrue(waiting.wait(15), 'publisher did not contend for the lock')
+                    self.assertEqual(file.read_bytes(), original_bytes)
+                    self.assertFalse(published.is_set())
+
+                check_file = cleanup.validate_staged_file
+                check_round = cleanup.confirm_staged_round
+                read_stamp = cleanup.path_stamp
+
+                def file_check(decision, source, staged):
+                    if change != 'shared receipt':
+                        # The final installed/rollback observation has returned.
+                        inject()
+                    check_file(decision, source, staged)
+
+                def stamp(path, **options):
+                    sampled = read_stamp(path, **options)
+                    if change == 'shared receipt' and Path(path) == receipt:
+                        # The final receipt bytes and the file stamp were read.
+                        inject()
+                    return sampled
+
+                def round_check(observed, contents):
+                    with patch.object(cleanup, 'path_stamp', side_effect=stamp):
+                        check_round(observed, contents)
+
+                def stop_at_trash(paths, *, staged):
+                    self.assertEqual(paths, [checkout])
+                    self.assertEqual((staged / 'src/work.py').read_bytes(), b'unique workspace')
+                    self.assertFalse(published.is_set())
+                    self.assertEqual(file.read_bytes(), original_bytes)
+                    raise OSError('fixture paused before Trash')
+
+                with ThreadPoolExecutor(max_workers=1) as workers:
+                    publisher = workers.submit(publish)
+                    with patch.object(cleanup, 'validate_staged_file', side_effect=file_check), \
+                         patch.object(cleanup, 'confirm_staged_round', side_effect=round_check):
+                        code, rows = self.run_cleanup(apply=True, session_id=session, mover=stop_at_trash)
+                    publisher.result(timeout=20)
+
+                self.assertEqual(code, 1)
+                self.assertIn('fixture paused before Trash', rows[0]['reason'])
+                self.assertTrue(published.is_set())
+                self.assertEqual(file.stat().st_ino, initial_stamp.st_ino)
+                self.assertEqual(file.read_bytes(), identity(match))
+                code, rows = self.run_cleanup(apply=True, session_id=session)
+                self.assertEqual(code, 0)
+                held, = rows
+                expected = 'previous' if change == 'rollback' else 'latest'
+                self.assertIn(f'qualified copy of {expected} installed round', held['reason'])
+                self.assertEqual(held['eligible_paths'], [])
+                self.assertEqual(payload.read_bytes(), b'unique workspace')
+                self.assertEqual(list(self.trash.iterdir()), [])
 
     def test_two_phase_move_rejects_changes_across_staging_boundaries(self):
         changes = (

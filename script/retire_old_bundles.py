@@ -10,6 +10,8 @@ import subprocess
 import sys
 import uuid
 
+from publication_lock import inherited_fd, publication_lock
+
 
 REPO = Path(__file__).resolve().parents[1]
 TRASH_TOOL = Path('/usr/bin/trash')
@@ -186,6 +188,11 @@ def main():
     if not args.after_install and args.keep is not None: parser.error('--keep requires --after-install')
     applications = args.applications_root.expanduser().resolve()
     if not applications.is_dir(): raise ValueError('Applications folder does not exist: ' + str(applications))
+    with publication_lock('rollback bundle retirement', inherited=inherited_fd()):
+        return retire_selected(args, applications)
+
+
+def retire_selected(args, applications):
     if args.after_install:
         keep = application_path(args.keep, applications) if args.keep else None
         if keep and not (keep.name.startswith('.Checklist-previous-') and keep.name.endswith('.app')):

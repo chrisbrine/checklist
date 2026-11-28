@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
 spec = importlib.util.spec_from_file_location('test_instances', Path(__file__).resolve().parents[1] / 'script/test_instances.py')
 harness = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harness)
+import publication_lock as publication
 import verify_install
 
 
@@ -3815,7 +3816,8 @@ raise SystemExit(int(os.environ.get('UPGRADE_EXIT','0')))
                                             env=dict(os.environ, MODE=mode, ROOT_DIR='/fixture root', DEST='/fixture/app',
                                                      INCOMING='/fixture/new', PREVIOUS='/fixture/previous', REJECTED='/fixture/rejected',
                                                      INSTALL_STARTED='100', UPGRADE_PREPARATION='{"needs_upgrade": false}',
-                                                     RESULT=str(exit_code)), text=True, capture_output=True, timeout=10)
+                                                     RESULT=str(exit_code), PUBLICATION_FD='9'),
+                                            text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, exit_code, result.stderr)
                     output = result.stdout.splitlines()
                     self.assertEqual(output[:8], ['/fixture root/script/install_recovery.py', '/fixture root',
@@ -3991,6 +3993,7 @@ class InstalledVerificationTests(unittest.TestCase):
     def test_promotion_never_reports_success_after_installed_verification_failure(self):
         selected = {'build_id': 'build', 'source_fingerprint': 'fingerprint', 'stage_path': '/synthetic/stage', 'seed': {'kind': 'empty'}}
         with test_directory() as directory, patch.object(harness, 'BASE', Path(directory).resolve()), \
+             patch.object(publication, 'publication_path', return_value=Path(directory) / 'publication.lock'), \
              patch.object(harness, 'load', return_value=selected), patch.object(harness, 'bundle_check'), \
              patch.object(harness, 'promotion_gates', return_value={'selected_build_check': True, 'live_snapshot_check_same_build': True}), \
              patch.object(harness.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'stub installed verification')):
@@ -3999,6 +4002,39 @@ class InstalledVerificationTests(unittest.TestCase):
                 harness.promote(SimpleNamespace(dry_run=False), harness.checked(1))
             self.assertIn('installer output for the verification and recovery outcome', str(error.exception))
             self.assertNotIn('Promoted build', output.getvalue())
+            with publication.publication_lock('fixture after failed promotion', timeout=0):
+                pass
+
+    def test_promotion_holds_publication_lock_and_passes_it_only_to_real_dispatch(self):
+        selected = {'build_id': 'build', 'source_fingerprint': 'fingerprint',
+                    'stage_path': '/synthetic/stage', 'seed': {'kind': 'empty'}}
+        gates = {'selected_build_check': True, 'live_snapshot_check_same_build': True}
+        observed = []
+
+        def dispatch(command, *, check, pass_fds, env):
+            self.assertEqual(command[1:], ['--install-stage', selected['stage_path']])
+            self.assertTrue(check)
+            fd, = pass_fds
+            self.assertEqual(env[publication.INHERITED_FD], str(fd))
+            publication.borrow(fd, publication.publication_path())
+            with self.assertRaisesRegex(publication.PublicationBusy, 'test slot promote'):
+                with publication.publication_lock('fixture contender', timeout=0):
+                    self.fail('publication lock was free during promotion')
+            observed.append(fd)
+
+        with test_directory() as directory:
+            lock = Path(directory) / 'publication.lock'
+            with patch.object(harness, 'BASE', Path(directory).resolve()), \
+                 patch.object(harness, 'load', return_value=selected), patch.object(harness, 'bundle_check'), \
+                 patch.object(harness, 'promotion_gates', return_value=gates), \
+                 patch.object(publication, 'publication_path', return_value=lock), \
+                 patch.object(harness.subprocess, 'run', side_effect=dispatch), redirect_stdout(io.StringIO()):
+                harness.promote(SimpleNamespace(dry_run=True), harness.checked(1))
+                self.assertFalse(lock.exists())
+                harness.promote(SimpleNamespace(dry_run=False), harness.checked(1))
+                self.assertEqual(len(observed), 1)
+                with publication.publication_lock('fixture after promotion', timeout=0):
+                    pass
 
 
 if __name__ == '__main__':

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'script'))
 import build_input_inventory
 import build_support
+import publication_lock as publication
 import verify_stage
 
 
@@ -91,8 +92,14 @@ class BuildScriptTests(unittest.TestCase):
         for folder in ['script', 'Sources', 'Resources', 'tools']:
             (self.root / folder).mkdir()
         for name in ['build_and_run.sh', 'build_input_inventory.py', 'build_support.py', 'version.py', 'verify_stage.py',
-                     'evidence_folder.py', 'clean_scratch.py', 'retire_old_bundles.py', 'install_signer_guard.py']:
+                     'evidence_folder.py', 'clean_scratch.py', 'retire_old_bundles.py', 'install_signer_guard.py',
+                     'publication_lock.py']:
             shutil.copyfile(ROOT / 'script' / name, self.root / 'script' / name)
+        self.publication = self.root / 'publication.lock'
+        helper = self.root / 'script/publication_lock.py'
+        helper.write_text(helper.read_text().replace(
+            "Path.home() / 'Library/Caches/ChecklistQualification/.checklist-publication.lock'",
+            f'Path({str(self.publication)!r})'))
         script = self.root / 'script/build_and_run.sh'
         script.write_text(script.read_text().replace('DEST="/Applications/Checklist.app"',
                                                    'DEST="$ROOT_DIR/installed-fixture.app"'))
@@ -106,9 +113,15 @@ class BuildScriptTests(unittest.TestCase):
             (self.root / 'Resources' / name).write_bytes(plistlib.dumps({'Label': name}))
         self.calls = self.root / 'calls.jsonl'
         tool = '''#!/usr/bin/env python3
-import hashlib,json,os,pathlib,shutil,sys,time
+import fcntl,hashlib,json,os,pathlib,shutil,sys,time
 name=pathlib.Path(sys.argv[0]).name;args=sys.argv[1:]
 with open(os.environ['CALLS'],'a') as out: out.write(json.dumps([name,*args])+'\\n')
+if os.environ.get('VERIFY_PUBLICATION') and name in ('codesign', 'mv'):
+ if name=='codesign' or '/stage-' in args[0]:
+  with open(os.environ['VERIFY_PUBLICATION'], 'r+') as lock:
+   try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+   except BlockingIOError: pass
+   else: raise SystemExit('stage publication lock was not held')
 if name=='swift':
  if args==['--version']: print('Swift fixture');sys.exit()
  source=pathlib.Path(args[args.index('--package-path')+1]);scratch=pathlib.Path(args[args.index('--scratch-path')+1]);bin=scratch/'bin'
@@ -153,6 +166,57 @@ elif name=='plutil': pass
 
     def capture(self):
         return next((self.root/'.local/build').glob('*/capture-manifest.json')).parent
+
+    def test_stage_holds_publication_lock_when_writing_and_publishing_app(self):
+        result = self.run_stage(VERIFY_PUBLICATION=str(self.publication))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.capture() / 'Checklist.app/Contents/Resources/build-info.json').is_file())
+        with patch.object(publication, 'publication_path', return_value=self.publication):
+            with publication.publication_lock('fixture after stage', timeout=0):
+                pass
+
+    def test_install_dispatch_passes_and_closes_its_publication_descriptor(self):
+        script = (self.root / 'script/build_and_run.sh').read_text()
+        helpers = script[script.index('PUBLICATION_HELPER='):script.index('# Only generated output')]
+        start = script.index('# Installed verification is mandatory')
+        dispatch = script[start:script.index('phase stop install', start)]
+        fake = self.root / 'script/install_recovery.py'
+        fake.write_text("""from publication_lock import PublicationBusy, inherited_fd, publication_lock
+fd = inherited_fd()
+assert fd is not None
+with publication_lock('fixture install', inherited=fd):
+    try:
+        with publication_lock('contender', timeout=0):
+            raise AssertionError('install dispatch did not hold the lock')
+    except PublicationBusy:
+        pass
+""")
+        steps = helpers + """
+publication_acquire 'build install'
+published_fd="$PUBLICATION_FD"
+""" + dispatch + """
+publication_release
+test -z "${CHECKLIST_PUBLICATION_FD:-}"
+if { true <&"$published_fd"; } 2>/dev/null; then exit 17; fi
+"""
+        variables = dict(self.env, ROOT_DIR=str(self.root), MODE='--install-stage',
+                         DEST=str(self.root / 'installed-fixture.app'), INCOMING='fixture-incoming',
+                         PREVIOUS='fixture-previous', REJECTED='fixture-rejected', UPGRADE_PREPARATION='{}',
+                         INSTALL_STARTED='0')
+        with patch.object(publication, 'publication_path', return_value=self.publication):
+            result = subprocess.run(['bash', '-eu', '-c', steps], env=variables, capture_output=True,
+                                    text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with publication.publication_lock('fixture promote', timeout=0) as fd:
+                environment = dict(variables, **{publication.INHERITED_FD: str(fd)})
+                result = subprocess.run(['bash', '-eu', '-c', steps], env=environment, pass_fds=(fd,),
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with self.assertRaises(publication.PublicationBusy):
+                    with publication.publication_lock('fixture after child', timeout=0):
+                        self.fail('child released its parent publication lock')
+            with publication.publication_lock('fixture after installer', timeout=0):
+                pass
 
     def test_stage_registers_tickets_next_to_the_capture_and_refuses_without(self):
         # CL-359 item 0: no stage build folder exists without its ticket keys.

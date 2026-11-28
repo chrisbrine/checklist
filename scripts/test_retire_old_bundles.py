@@ -15,6 +15,9 @@ from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'script'))
+import publication_lock as publication
+
 SCRIPT = REPO / 'script/retire_old_bundles.py'
 spec = importlib.util.spec_from_file_location('retire_old_bundles', SCRIPT)
 retirement = importlib.util.module_from_spec(spec)
@@ -26,6 +29,15 @@ class RetireOldBundlesTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        self.lock = self.root / 'publication.lock'
+        location = patch.object(publication, 'publication_path', return_value=self.lock)
+        location.start(); self.addCleanup(location.stop)
+        self.fixture_script = self.root / SCRIPT.name
+        shutil.copyfile(SCRIPT, self.fixture_script)
+        helper = (SCRIPT.parent / 'publication_lock.py').read_text().replace(
+            "Path.home() / 'Library/Caches/ChecklistQualification/.checklist-publication.lock'",
+            f'Path({str(self.lock)!r})')
+        (self.root / 'publication_lock.py').write_text(helper)
         self.applications = self.root / 'Applications';self.applications.mkdir()
         self.trash = self.root / 'Trash';self.trash.mkdir()
         self.environment = dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash))
@@ -38,7 +50,7 @@ class RetireOldBundlesTests(unittest.TestCase):
         return bundle
 
     def run_script(self, *arguments):
-        return subprocess.run([sys.executable, str(SCRIPT), '--applications-root', str(self.applications), *arguments],
+        return subprocess.run([sys.executable, '-B', str(self.fixture_script), '--applications-root', str(self.applications), *arguments],
                               env=self.environment, capture_output=True, text=True)
 
     def test_after_install_moves_older_copies_and_reports_each_decision_and_size(self):
@@ -126,6 +138,23 @@ class RetireOldBundlesTests(unittest.TestCase):
         self.assertTrue(old.exists());self.assertFalse(newest.exists())
         self.assertIn('moved: ' + str(newest), output.getvalue())
 
+    def test_rollback_retirement_holds_lock_while_removing_selected_bundle(self):
+        bundle = self.bundle('.Checklist-previous-20261020T010000Z-20.app')
+        argv = [str(SCRIPT), '--applications-root', str(self.applications), '--retire-previous', str(bundle)]
+        trash_bundle = retirement.trash
+
+        def checked_trash(path):
+            with self.assertRaisesRegex(publication.PublicationBusy, 'rollback bundle retirement'):
+                with publication.publication_lock('fixture contender', timeout=0):
+                    self.fail('rollback bundle retirement did not hold the publication lock')
+            return trash_bundle(path)
+
+        with patch.object(sys, 'argv', argv), patch.object(retirement, 'executable_paths', return_value=()), \
+             patch.object(retirement, 'trash', side_effect=checked_trash), redirect_stdout(io.StringIO()):
+            self.assertEqual(retirement.main(), 0)
+        with publication.publication_lock('fixture after retirement', timeout=0):
+            self.assertFalse(bundle.exists())
+
     def test_receipt_without_previous_bundle_is_a_noop(self):
         record = self.root / '.local/build/last-install.json';record.parent.mkdir(parents=True)
         record.write_text(json.dumps({'previous_bundle': None}))
@@ -196,7 +225,7 @@ class RetireOldBundlesTests(unittest.TestCase):
         start = script.index('# Installed verification is mandatory')
         recovery = script[start:script.index('phase stop install', start)]
         hooks = script[script.index('echo "Installed $DEST"'):script.index('# Interactive modes can wait')]
-        hook = script.index('if ! python3 "$ROOT_DIR/script/retire_old_bundles.py"')
+        hook = script.index('python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install')
         self.assertLess(hook, script.index('lldb --'))
         self.assertLess(hook, script.index('/usr/bin/log stream'))
         binary = self.root / 'bin';binary.mkdir();trace = self.root / 'trace.jsonl'
@@ -232,8 +261,10 @@ raise SystemExit(int(exit_code))
                                    INCOMING=str(self.applications / '.incoming.app'), REJECTED=str(self.applications / '.rejected.app'),
                                    UPGRADE_PREPARATION='{"needs_upgrade":false}',
                                    VERIFY_EXIT=str(verify), RETIRE_EXIT=str(retire), CLEANUP_EXIT=str(cleanup),
+                                   PUBLICATION_FD='9',
                                    PATH=str(binary) + os.pathsep + os.environ['PATH'])
-                setup = 'set -euo pipefail\nrmdir() { mv "$1" "$BUILD_ROOT/released-lock"; }\n'
+                setup = ('set -euo pipefail\nrmdir() { mv "$1" "$BUILD_ROOT/released-lock"; }\n'
+                         'publication_release() { :; }\n')
                 result = subprocess.run(['bash', '-c', setup + recovery + hooks + '\nwait'],
                                         env=environment, capture_output=True, text=True, timeout=15)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]

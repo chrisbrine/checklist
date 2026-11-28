@@ -425,9 +425,27 @@ Only that rename produces a receipt, which still names the original source.
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
 both entries and reports the staged location in `staged_path`. A later cleanup
-retains a discovered staging name for recovery. A process with an open
-descriptor can still change the staged tree after its last observation.
-Staging and validation do not lock out other writers.
+retains a discovered staging name for recovery.
+
+Scratch apply and Checklist identity publishers take an exclusive advisory
+lock on `~/Library/Caches/ChecklistQualification/.checklist-publication.lock`.
+Apply takes the lock before planning and releases it after the last move or
+restore. A second apply must also wait. After two seconds of contention, apply
+reports a refusal and the recorded holder when available, then exits without
+moving any paths. Preview proceeds without taking the lock.
+
+The build script holds the lock while it publishes the source capture and while
+it assembles, stamps and publishes the staged app and its receipts. Compilation
+runs between these sections. Installation holds the lock across the stop, the
+replacement and any recovery, until the installed and rollback identities are
+final. Slot promotion passes its lock to the installer. Standalone bundle
+stamping, rollback retirement and fingerprinted qualification markers use
+the same file. Leave the lock file in place between operations.
+
+Cooperating publishers can publish before apply plans or after apply releases
+the lock. The lock orders those operations by when they acquire it. Manual
+edits and writes through existing handles can bypass it. Apply still checks
+for those changes, and a writer can act after its last observation.
 
 On 28 November 2026, the read-only p11 preview took 30.908 s on the base
 and 35.449 s with staged cleanup. Both runs reported 46 retained workspaces
@@ -440,8 +458,8 @@ so the fixture isolates the filesystem work from native process scan time.
 See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 
-Size budget (CL-359): each `clean_builds.py` and `clean_scratch.py` run ends with
-one `size_report` JSON line. It gives the `du -sk` sizes of the session scratch
+Size budget (CL-359): after scanning, `clean_builds.py` and `clean_scratch.py`
+emit a `size_report` JSON line. It gives the `du -sk` sizes of the session scratch
 folders, `.local/evidence`, `.local/build` and
 `~/Library/Caches/ChecklistQualification` (a `--only` run reports only its own
 group). Above `--budget-gb` (default 50, or `CHECKLIST_CLEANUP_BUDGET_GB`), the run

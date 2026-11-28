@@ -1,7 +1,7 @@
 """Checklist version allocation and explicit, local production release preparation.
 
 Reservations use a per-user lock shared by all checkouts, independently of the
-checkout-local compilation lock. This helper never installs or publishes.
+checkout-local compilation lock. Stamping a bundle uses the publication lock.
 """
 import argparse
 import fcntl
@@ -171,6 +171,14 @@ def require_installable(info):
 
 
 def stamp(capture, stage):
+    # Version reservation also runs from independent copies of this module.
+    from publication_lock import inherited_fd, publication_lock
+
+    with publication_lock('stamp build identity', inherited=inherited_fd()):
+        stamp_locked(capture, stage)
+
+
+def stamp_locked(capture, stage):
     import datetime
     capture, stage = Path(capture), Path(stage)
     manifest = json.loads((capture / 'capture-manifest.json').read_text())

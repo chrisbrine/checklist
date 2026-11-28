@@ -48,6 +48,30 @@ INCOMING=""
 STAGE_ASSEMBLY=""
 BUILD_SOURCE=""
 VERIFICATION_RECEIPT=""
+PUBLICATION_HELPER="$ROOT_DIR/script/publication_lock.py"
+PUBLICATION_FD=""
+publication_acquire() {
+  if [ -n "${CHECKLIST_PUBLICATION_FD:-}" ]; then
+    case "$CHECKLIST_PUBLICATION_FD" in *[!0-9]*) echo "Invalid publication lock descriptor." >&2; return 1;; esac
+    PUBLICATION_FD="$CHECKLIST_PUBLICATION_FD"
+    python3 "$PUBLICATION_HELPER" --borrow "$PUBLICATION_FD"
+  else
+    local lock_path
+    lock_path="$(python3 "$PUBLICATION_HELPER" --path)"
+    exec 9<>"$lock_path"
+    python3 "$PUBLICATION_HELPER" --acquire 9 "$1" "$$"
+    PUBLICATION_FD=9
+  fi
+}
+publication_release() {
+  if [ -n "$PUBLICATION_FD" ]; then
+    # Bash 3 needs the validated descriptor number in the redirection.
+    # Close a borrowed copy too, before any post-install background process.
+    eval "exec $PUBLICATION_FD>&-"
+    unset CHECKLIST_PUBLICATION_FD
+  fi
+  PUBLICATION_FD=""
+}
 # Only generated output is made writable; never pass the immutable source here.
 remove_generated() { chmod -R u+w "$1" && rm -rf "$1"; }
 cleanup() {
@@ -190,6 +214,7 @@ STAGE_FINAL="$CAPTURE_DIR/Checklist.app"
 STAGE="$STAGE_FINAL"
 BUILD_HELPER="$SOURCE/script/build_support.py"
 }
+publication_acquire 'build source capture'
 capture_source
 if [ -n "$BUILD_TICKETS" ]; then
   # Record the keys next to the stage; a shared capture gains each later key.
@@ -197,6 +222,7 @@ if [ -n "$BUILD_TICKETS" ]; then
     --purpose "build_and_run.sh $MODE ($BUILD_SCOPE)" "$CAPTURE_DIR" >/dev/null
 fi
 phase stop capture
+publication_release
 compile_products() {
   phase start compile
   # Test-only barrier: keep Bash in an interruptible builtin, not waiting on Swift.
@@ -246,7 +272,7 @@ assemble_stage() {
 </dict></array>
 </dict></plist>
 PLIST
-  python3 "$SOURCE/script/version.py" --stamp "$CAPTURE_DIR" "$STAGE"
+  CHECKLIST_PUBLICATION_FD="$PUBLICATION_FD" python3 "$SOURCE/script/version.py" --stamp "$CAPTURE_DIR" "$STAGE"
   for resource in skills plugins templates; do
     if [ -d "$SOURCE/$resource" ]; then ditto "$SOURCE/$resource" "$STAGE/Contents/Resources/$resource"; fi
   done
@@ -275,11 +301,15 @@ if [ ! -d "$STAGE_FINAL" ] || [ "$MODE" = --rebuild-stage ] || [ "$MODE" = --cle
   # stable. Only verified capture bytes enter it; checkout edits cannot enter.
   BUILD_SOURCE="$BUILD_ROOT/lane-$TOOLCHAIN_ID/source"
   compile_products
+  publication_acquire 'build stage'
   assemble_stage
   sign_stage
 fi
 fi
 if [ "$MODE" = --install-stage ]; then phase stop capture; fi
+if [ "$MODE" != --install-stage ] && [ -z "$PUBLICATION_FD" ]; then
+  publication_acquire 'build stage'
+fi
 phase start verify
 VERIFICATION_RECEIPT="$CAPTURE_DIR/build-verification.$$.json"
 codesign --verify --deep --strict "$STAGE"
@@ -365,6 +395,7 @@ with (capture/'build-timings.jsonl').open('a') as output:output.write(json.dumps
 PYTIMING
 }
 save_timing
+publication_release
 case "$MODE" in --stage|--rebuild-stage|--clean-stage) echo "Staged $STAGE"; exit 0;; esac
 phase start install
 INSTALL_STARTED="$(date +%s)"
@@ -374,6 +405,7 @@ PREVIOUS="/Applications/.Checklist-previous-$INSTALL_ID.app"
 REJECTED="/Applications/.Checklist-rejected-$INSTALL_ID.app"
 HAD_PREVIOUS=0
 if [ -e "$INCOMING" ] || [ -e "$PREVIOUS" ]; then echo "Install paths already exist; reconcile them before retrying." >&2; exit 1; fi
+publication_acquire 'build install'
 if [ -e "$DEST" ]; then
   IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
   if [ "$IDENTIFIER" != org.checklist.app ]; then echo "Refusing to replace an unrelated application at $DEST." >&2; exit 1; fi
@@ -392,7 +424,7 @@ python3 "$SOURCE/script/upgrade_offline.py" "$UPGRADE_PREPARATION" "$CAPTURE_DIR
 # Interactive modes retain their debugger/log launch behavior.
 RECOVERY_ARGS=()
 case "$MODE" in --debug|--logs|--telemetry) RECOVERY_ARGS+=(--replace-only);; esac
-python3 "$ROOT_DIR/script/install_recovery.py" "$ROOT_DIR" "$DEST" "$INCOMING" "$PREVIOUS" "$REJECTED" \
+CHECKLIST_PUBLICATION_FD="$PUBLICATION_FD" python3 "$ROOT_DIR/script/install_recovery.py" "$ROOT_DIR" "$DEST" "$INCOMING" "$PREVIOUS" "$REJECTED" \
   "$UPGRADE_PREPARATION" "$INSTALL_STARTED" ${RECOVERY_ARGS[@]+"${RECOVERY_ARGS[@]}"}
 INCOMING=""
 phase stop install
@@ -415,9 +447,10 @@ if [ "$HAD_PREVIOUS" != 1 ]; then PREVIOUS=""; fi
 python3 "$ROOT_DIR/script/install_skill.py" --apply --source "$DEST/Contents/Resources/skills/checklist" >"$CAPTURE_DIR/skill-install.jsonl" 2>"$CAPTURE_DIR/skill-install.stderr" || echo "Warning: the Checklist skill copies were not all installed; report: $CAPTURE_DIR/skill-install.jsonl" >&2
 if [ -s "$CAPTURE_DIR/skill-install.stderr" ]; then cat "$CAPTURE_DIR/skill-install.stderr" >&2 || true; fi
 echo "Skill install report: $CAPTURE_DIR/skill-install.jsonl"
-if ! python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$PREVIOUS"; then
+if ! CHECKLIST_PUBLICATION_FD="$PUBLICATION_FD" python3 "$ROOT_DIR/script/retire_old_bundles.py" --after-install --keep "$PREVIOUS"; then
   echo "Warning: old Checklist bundles could not all move to the Trash; see the retirement output." >&2
 fi
+publication_release
 echo "After the installed checks pass, retire the previous bundle: python3 \"$ROOT_DIR/script/retire_old_bundles.py\" --retire-previous"
 # Keep cleanup after installed checks and off the installation result path.
 post_install_cleanup() {

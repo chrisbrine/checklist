@@ -12,6 +12,7 @@ import sys
 import time
 from uuid import uuid4
 
+from publication_lock import inherited_fd, publication_lock
 from verify_install import VerificationDeadlineExpired, deadline_seconds, failure_guidance, process_executables, verify
 
 
@@ -199,7 +200,12 @@ def launch_job_state(deadline, runner, clock):
     return match[1].strip()
 
 
-def install(root, destination, incoming, previous, rejected, preparation, install_started, *,
+def install(root, destination, incoming, previous, rejected, preparation, install_started, **options):
+    with publication_lock('install recovery', inherited=inherited_fd()):
+        return install_locked(root, destination, incoming, previous, rejected, preparation, install_started, **options)
+
+
+def install_locked(root, destination, incoming, previous, rejected, preparation, install_started, *,
             replace_only=False, runner=subprocess.run, processes=process_executables, stop=stop_checklist,
             stop_replacement=stop_candidate, clock=time.monotonic, sleep=time.sleep):
     needs_upgrade = preparation.get('needs_upgrade') if isinstance(preparation, dict) else None

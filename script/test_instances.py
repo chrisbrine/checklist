@@ -31,6 +31,7 @@ from urllib.parse import unquote, urlsplit
 import uuid
 
 from clean_scratch import caller_session, mark_qualification, read_marker, requested_tickets, validate_fingerprint
+from publication_lock import INHERITED_FD, publication_lock
 from test_instance_restage import FRESH_COPY, backup_completion, reuse_proof
 from verify_stage import sha, signing_teams, verify as verify_stage
 from verify_install import describe_status, status_still_starting, upgrading_message, upgrading_status
@@ -2585,7 +2586,9 @@ def promote(arguments, p):
     if not arguments.dry_run:
         print('Promotion: installer will print the expected offline window before stopping the service and the measured window after its first healthy answer.', flush=True)
         try:
-            subprocess.run(command, check=True)
+            with publication_lock('test slot promote') as fd:
+                subprocess.run(command, check=True, pass_fds=(fd,),
+                               env=dict(os.environ, **{INHERITED_FD: str(fd)}))
         except subprocess.CalledProcessError as error:
             raise ValueError('Promotion failed. See the installer output for the verification and recovery outcome.') from error
         print('Promoted build ' + selected['build_id'] + '; installed app and service verification passed.')

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
 import install_recovery as recovery
+import publication_lock as publication
 
 
 def bundle(path, number):
@@ -37,6 +38,8 @@ class InstallRecoveryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        lock = patch.object(publication, 'publication_path', return_value=self.root / 'publication.lock')
+        lock.start(); self.addCleanup(lock.stop)
         self.installed = self.root / 'Checklist.app'
         self.incoming = self.root / '.incoming.app'
         self.previous = self.root / '.previous.app'
@@ -172,6 +175,8 @@ class InstallRecoveryTests(unittest.TestCase):
 
     def test_unresponsive_stage_restores_previous_at_the_deadline(self):
         self.assertFalse(self.install())
+        with publication.publication_lock('fixture after recovery', timeout=0):
+            pass
         self.assertEqual(self.number(self.installed), 328)
         self.assertEqual(self.number(self.rejected), 331)
         self.assertFalse(self.previous.exists())
@@ -232,6 +237,30 @@ class InstallRecoveryTests(unittest.TestCase):
         self.assertFalse(self.rejected.exists())
         self.assertFalse(any(event[0] in {'lsregister', 'defaults'} for event in self.events))
         self.assertIn('40.0 s (stop request to first healthy service answer from the new build)', self.output.getvalue())
+
+    def test_install_keeps_publication_lock_from_stop_through_bundle_verification(self):
+        self.new_ready = 1020
+        stop, runner = self.stop, self.runner
+
+        def require_lock():
+            with self.assertRaisesRegex(publication.PublicationBusy, 'install recovery'):
+                with publication.publication_lock('fixture contender', timeout=0):
+                    self.fail('publication lock was free during install')
+
+        def checked_stop(*args):
+            require_lock()
+            return stop(*args)
+
+        def checked_runner(*args, **kwargs):
+            require_lock()
+            return runner(*args, **kwargs)
+
+        with patch.object(self, 'stop', side_effect=checked_stop), \
+             patch.object(self, 'runner', side_effect=checked_runner):
+            self.assertTrue(self.install())
+        with publication.publication_lock('fixture after install', timeout=0):
+            self.assertEqual(self.number(self.installed), 331)
+            self.assertEqual(self.number(self.previous), 328)
 
     def test_upgrade_gets_existing_wait_and_never_swaps_back(self):
         self.assertFalse(self.install(needs_upgrade=True))

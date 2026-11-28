@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'script'))
+import publication_lock as publication
 import version
 import verify_install
 
@@ -313,6 +314,8 @@ class BundleVersionTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.bundle=self.root/'Checklist.app'
+        lock = patch.object(publication, 'publication_path', return_value=self.root / 'publication.lock')
+        lock.start(); self.addCleanup(lock.stop)
         (self.bundle/'Contents/Resources').mkdir(parents=True)
         (self.bundle/'Contents/Info.plist').write_bytes(plistlib.dumps({}))
         self.manifest={'version':'0.0.1.1','production_version':'0.0.1','build_number':118,'build_id':'0123456789abcdef','source_fingerprint':'0123456789abcdef'*4,'source_root':'/synthetic','configuration':'debug','toolchain':'synthetic','captured_at':'synthetic','signing_identity_sha256':'synthetic','signing_profile':'ad-hoc'}

@@ -9,6 +9,7 @@ import argparse
 import ctypes
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import tempfile
 import time
 import uuid
 
+from publication_lock import PublicationBusy, SCRATCH_WAIT_SECONDS, publication_lock
 from retire_old_bundles import previous_timestamp
 
 REPO = Path(__file__).resolve().parents[1]
@@ -440,8 +442,10 @@ def caller_session(session_id=None):
 
 
 def mark_qualification(root, fingerprint, purpose, session_id=None, tickets=None):
-    return write_marker(root, caller_session(session_id), purpose,
-                        source_fingerprint=validate_fingerprint(fingerprint), tickets=tickets)
+    owner = caller_session(session_id)
+    fingerprint = validate_fingerprint(fingerprint)
+    with publication_lock('qualification marker'):
+        return write_marker(root, owner, purpose, source_fingerprint=fingerprint, tickets=tickets)
 
 
 def write_marker(root, session_id, purpose=None, release=False, source_fingerprint=None,
@@ -1541,6 +1545,15 @@ def clean(sessions, qualification, repo, installed_info, keep=(), apply=False,
           session_id=None, include_released=False, after_inspection=None, preview_pool=None):
     if not session_id:
         raise ValueError('caller session unknown; supply --session-id for your own session')
+    lease = publication_lock('scratch apply', timeout=SCRATCH_WAIT_SECONDS) if apply else nullcontext()
+    with lease:
+        return clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
+                                process_reader, mover, clock, session_id, include_released,
+                                after_inspection, preview_pool)
+
+
+def clean_candidates(sessions, qualification, repo, installed_info, keep, apply, process_reader,
+                     mover, clock, session_id, include_released, after_inspection, preview_pool):
     failed = False
     # Unknown runs are visible for reconciliation, never inferred disposable.
     for item in children(qualification):
@@ -1694,8 +1707,10 @@ def main():
         return release_finished(ticket_roots(sessions, qualification, args.session_id), args.session_id, reader)
     if args.mark is not None or args.release is not None:
         root = (args.mark if args.mark is not None else args.release).expanduser()
-        value = write_marker(root, args.session_id, args.purpose, args.release is not None, args.source_fingerprint,
-                             tickets=args.ticket)
+        if args.source_fingerprint is not None:
+            value = mark_qualification(root, args.source_fingerprint, args.purpose, args.session_id, args.ticket)
+        else:
+            value = write_marker(root, args.session_id, args.purpose, args.release is not None, tickets=args.ticket)
         print(json.dumps({'path': str(root.resolve()), 'action': 'released' if args.release else 'marked', **value}))
         return 0
     for root in [args.sessions_root.expanduser(), args.qualification_root.expanduser()]:
@@ -1712,11 +1727,15 @@ def main():
                                                   args.session_id, args.include_released)]
         sizers.append(background_sizes(groups, targets=targets, target_split=2))
         return sizers[-1]
-    result = clean(args.sessions_root.expanduser().resolve(), args.qualification_root.expanduser().resolve(),
-                   args.repo.expanduser().resolve(), args.installed_info.expanduser(),
-                   [path.expanduser().resolve() for path in args.keep_qualified], args.apply,
-                   session_id=args.session_id, include_released=args.include_released,
-                   after_inspection=None if args.apply else start_sizes, preview_pool=None if args.apply else preview_executor)
+    try:
+        result = clean(sessions.resolve(), qualification.resolve(), args.repo.expanduser().resolve(),
+                       args.installed_info.expanduser(), [path.expanduser().resolve() for path in args.keep_qualified],
+                       args.apply, session_id=args.session_id, include_released=args.include_released,
+                       after_inspection=None if args.apply else start_sizes,
+                       preview_pool=None if args.apply else preview_executor)
+    except PublicationBusy as error:
+        print(json.dumps({'action': 'kept_error', 'reason': str(error)}), flush=True)
+        return 1
     storage_report(groups, args.budget_gb * 1e9, sizers[0] if sizers else None)
     return result
 

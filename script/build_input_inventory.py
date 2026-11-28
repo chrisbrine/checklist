@@ -10,7 +10,7 @@ INPUT_ROOTS = [
     'VERSION', 'Package.swift', 'Package.resolved', 'Sources', 'Tests', 'Resources',
     'Packages', 'skills', 'plugins', 'templates', 'script/build_and_run.sh',
     'script/version.py', 'script/build_input_inventory.py', 'script/build_support.py', 'script/verify_stage.py', 'script/verify_install.py', 'script/upgrade_offline.py',
-    'script/install_recovery.py', 'script/install_signer_guard.py',
+    'script/install_recovery.py', 'script/install_signer_guard.py', 'script/publication_lock.py',
 ]
 # Exact tooling/private metadata names, not generic names such as cache or build.
 PACKAGE_METADATA = {'.build', '.swiftpm', '.local', '__pycache__'}
