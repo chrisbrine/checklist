@@ -191,7 +191,8 @@
             "additionalProperties": false,
             "properties": {
               "method": {
-                "const": "task_purge_preview"
+                "const": "task_purge_preview",
+                "description": "Prepares an exact snapshot under size and observation-time budgets."
               },
               "params": {
                 "type": "object",
@@ -296,7 +297,7 @@
             "properties": {
               "method": {
                 "const": "task_purge",
-                "description": "Uses the same receipt retirement rules as automatic ticket purge. Proven unrelated operation receipts stay readable."
+                "description": "Retires exact scoped receipts and applies the purge atomically within the writer time budget. Proven unrelated operation receipts stay readable."
               },
               "params": {
                 "type": "object",
@@ -338,6 +339,30 @@
             ]
           }
         ]
+      }
+    },
+    "purge_refusals": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": { "enum": ["CLEANUP_INVENTORY_LIMIT", "PURGE_LIMIT"] },
+          "message": { "type": "string", "minLength": 1 },
+          "retryable": { "const": false },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "limit": { "enum": ["selected_plan_bytes", "observation_seconds", "writer_seconds"] },
+              "maximum": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["limit", "maximum"]
+          }
+        },
+        "required": ["code", "message", "retryable", "details"]
       }
     }
   },

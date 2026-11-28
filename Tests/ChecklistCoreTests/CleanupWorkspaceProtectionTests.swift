@@ -14,18 +14,17 @@ extension TicketRetirementTests {
         XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT count(*) FROM records WHERE type='project'")},4098)
     }
 
-    func testV28ExactProjectReferencesExceedNamedRecordLimit() throws {
+    func testCL514ManualPurgeKeepsExactProjectReferencesAboveAutomaticLimit() throws {
         let (project,task) = try fixture()
         let tid = try XCTUnwrap(task["id"] as? String)
         let trashed = try trash(project,task)
         try fixtureWrite {db in try insertCleanupProjects(db,count:4097,reference:tid)}
-        XCTAssertThrowsError(try call("task_purge_preview",params(project,trashed))) { error in
-            XCTAssertEqual((error as? CoreError)?.code,"CLEANUP_INVENTORY_LIMIT")
-            XCTAssertTrue((error as? CoreError)?.message.contains("4,096-record") == true)
-        }
+        let preview = try call("task_purge_preview",params(project,trashed))
         let batch = try router.dbQueue.read {try self.router.ticketCleanupInventories($0,tasks:[trashed])}
         XCTAssertTrue(batch.errors[tid]?.message.contains("4,096-record") == true)
-        XCTAssertEqual(try read(project,trashed)["trashed"] as? Bool,true)
+        let result = try purge(project,trashed,preview)
+        XCTAssertEqual((result["task"] as? JSON)?["purged"] as? Bool,true)
+        XCTAssertEqual(try router.dbQueue.read {try Int.fetchOne($0,sql:"SELECT count(*) FROM records WHERE type='project' AND json_extract(data,'$.reference')=?",arguments:[tid])},4097)
     }
 
     func testV28WorkspaceProjectionMatchesPreviousCanonicalPrefixCheck() throws {

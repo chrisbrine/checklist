@@ -238,15 +238,95 @@ final class ChecklistMCPServerTests: XCTestCase {
         XCTAssertEqual(fixture.calls.map {$0.0},["service_info"])
     }
 
-    func testMCPCatalogRefreshAndDirectCLIServiceValidation() async throws {
-        for (command,method) in [("mcp","service_info"),("call","task_list")] {
-            let fixture = try Fixture(provider:"codex")
-            fixture.setDiscoveries([.available(fixture.context)])
-            let bridge = Bridge(configuration:.init(workspace:fixture.context.workspacePath,command:command),environment:fixture.environment)
-            _ = try await bridge.connect()
-            _ = try await bridge.call(method,.object([:]))
-            XCTAssertEqual(fixture.calls.map {$0.0},command == "call" ? [method] : ["tool_catalog",method])
+    func testMCPUsesOneServiceRequestPerToolCallAfterListing() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        let session = try await start(fixture)
+        _ = try await session.client.listTools()
+        for method in ["service_info", "task_list", "service_info"] {
+            let before = fixture.calls.count
+            let result = try await session.client.callTool(name: method)
+            XCTAssertEqual(result.isError, false)
+            XCTAssertEqual(fixture.calls.dropFirst(before).map(\.0), [method])
         }
+        XCTAssertEqual(fixture.calls.filter { $0.0 == "tool_catalog" }.count, 1)
+    }
+
+    func testMCPRefusalsMatchPerCallCatalogCheckAcrossCatalogVariants() async throws {
+        let candidateTools = ["service_info", "task_list", "project_list", "message_send"]
+        let neverAdvertised = ["tool_catalog", "connection_list", "synthetic_unknown"]
+        let hookOnly = ["codex_hook_pickup", "codex_hook_confirm"]
+        func previousRefusal(_ name: String, advertised: [String]) -> String? {
+            if hookOnly.contains(name) { return "METHOD_UNAVAILABLE: Only the Checklist hook uses this command: \(name)" }
+            if !advertised.contains(name) { return "METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)" }
+            return nil
+        }
+
+        for mask in 0..<16 {
+            let advertised = candidateTools.enumerated().compactMap { index, name in mask & (1 << index) == 0 ? nil : name }
+            let fixture = try Fixture(provider: "codex")
+            fixture.setDiscoveries([.available(fixture.context)])
+            fixture.requestHandler = { method, _ in
+                if method == "tool_catalog" {
+                    return ["data": ["tools": advertised.map { ["name": $0, "inputSchema": ["type": "object"]] as [String: Any] }]]
+                }
+                return ["data": ["executed": method]]
+            }
+            let session = try await start(fixture)
+            _ = try await session.client.listTools()
+            for name in candidateTools + neverAdvertised + hookOnly {
+                let before = fixture.calls.count
+                let result = try await session.client.callTool(name: name)
+                if let refusal = previousRefusal(name, advertised: advertised) {
+                    XCTAssertEqual(result.isError, true, name)
+                    XCTAssertEqual(text(result.content), refusal)
+                    XCTAssertEqual(fixture.calls.count, before)
+                } else {
+                    XCTAssertEqual(result.isError, false, name)
+                    XCTAssertEqual(fixture.calls.dropFirst(before).map(\.0), [name])
+                }
+            }
+        }
+    }
+
+    func testMCPUpdatesAdvertisedToolsWhenGrantsChange() async throws {
+        let fixture = try Fixture(provider: "codex")
+        fixture.setDiscoveries([.available(fixture.context)])
+        func useGrantedTools(_ names: [String]) {
+            fixture.requestHandler = { method, _ in
+                if method == "tool_catalog" {
+                    return ["data": ["tools": names.map { ["name": $0, "inputSchema": ["type": "object"]] as [String: Any] }]]
+                }
+                guard names.contains(method) else {
+                    throw ChecklistError("FORBIDDEN", "This command is not available to this connection role.")
+                }
+                return ["data": ["executed": method]]
+            }
+        }
+        useGrantedTools(["service_info", "task_list"])
+        let session = try await start(fixture)
+        let initial = try await session.client.listTools()
+        XCTAssertEqual(initial.tools.map(\.name), ["service_info", "task_list"])
+
+        useGrantedTools(["service_info", "project_list"])
+        let before = fixture.calls.count
+        let removed = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(removed.isError, true)
+        XCTAssertEqual(text(removed.content), "METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: task_list")
+        XCTAssertEqual(fixture.calls.dropFirst(before).map(\.0), ["task_list"])
+        let removalNotices = try await noticeCount(session)
+        XCTAssertEqual(removalNotices, 1)
+        let refreshed = try await session.client.listTools()
+        XCTAssertEqual(refreshed.tools.map(\.name), ["service_info", "project_list"])
+
+        useGrantedTools(["service_info", "project_list", "task_list"])
+        let expanded = try await session.client.listTools()
+        XCTAssertEqual(expanded.tools.map(\.name), ["service_info", "project_list", "task_list"])
+        _ = try await session.client.listTools()
+        let expansionNotices = try await noticeCount(session)
+        XCTAssertEqual(expansionNotices, 2)
+        let added = try await session.client.callTool(name: "task_list")
+        XCTAssertEqual(added.isError, false)
     }
 
     func testProjectArchiveReasonsThroughMCPHistorySelector() async throws {
@@ -512,6 +592,7 @@ final class ChecklistMCPServerTests: XCTestCase {
         }
         let calls = fixture.calls.filter { $0.0 == "task_get" }
         XCTAssertEqual(calls.count, 20)
+        XCTAssertEqual(fixture.calls.filter { $0.0 == "tool_catalog" }.count, 1)
         XCTAssertTrue(calls.allSatisfy { $0.1.installation == "synthetic-thread" && $0.1.workspace == fixture.context.workspacePath && $0.1.nativeContext != nil })
         XCTAssertGreaterThan(gauge.maximum, 1)
         XCTAssertLessThan(elapsed, .seconds(5))
@@ -1431,6 +1512,10 @@ final class ChecklistMCPServerTests: XCTestCase {
             XCTAssertTrue(limited.tools[1].description?.contains("own folder") == true)
             let unavailable=try await session.client.callTool(name:"task_list")
             XCTAssertEqual(unavailable.isError,true)
+            XCTAssertEqual(text(unavailable.content), "METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: task_list")
+            let hook = try await session.client.callTool(name: "codex_hook_pickup")
+            XCTAssertEqual(hook.isError, true)
+            XCTAssertEqual(text(hook.content), "METHOD_UNAVAILABLE: Only the Checklist hook uses this command: codex_hook_pickup")
             XCTAssertFalse(fixture.calls.contains{$0.0 == "tool_catalog"})
             let created=try await session.client.callTool(name:"project_create",arguments:[
                 "command_id":.string(UUID().uuidString),"name":.string("Synthetic"),"key_prefix":.string("SYN")])

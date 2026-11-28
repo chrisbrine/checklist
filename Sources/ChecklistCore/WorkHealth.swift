@@ -140,7 +140,7 @@ extension CommandRouter {
     }
 
     /// The one known-wait read for work_health_get and the relay check (CL-389).
-    private func healthKnownWaits(_ db: Database, task: JSON, selected: JSON) throws -> [JSON] {
+    private func healthKnownWaits(_ db: Database, task: JSON, blockers: [JSON]) throws -> [JSON] {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
         var waits: [JSON] = []
         if let aid = task["active_attempt_id"] as? String, let a = try? scoped(db, aid, pid, type: "attempt"), let resource = a["waiting_for_resource"] {
@@ -149,7 +149,6 @@ extension CommandRouter {
         if let reported = (task["work_health"] as? JSON)?["reported_wait"] as? JSON { waits.append(["kind": "reported", "reason": reported["reason"] ?? "", "since": reported["since"] ?? NSNull()]) }
         let requests = try scopedTaskRows(db, type: "request", task: task, predicate: "json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1", limit: 25)
         waits += try requests.map { ["kind": "human", "request_id": (try StoredRecord($0, family: "record").requiredValue("id")), "reason": $0["title"] ?? "Owner answer"] }
-        let blockers = selected["prerequisite_blockers"] as? [JSON] ?? []
         waits += blockers.prefix(25).map { ["kind": "dependency", "detail": $0] }
         return waits
     }
@@ -167,7 +166,7 @@ extension CommandRouter {
         value["last_progress_at"] = reading.at.map(healthStamp) ?? NSNull()
         value["last_progress_clock"] = reading.at == nil ? NSNull() : reading.clock ?? NSNull()
         let selected = try selectedProjection ?? selectedTaskHealthFacts(db,task:task)
-        let waits = try healthKnownWaits(db, task: task, selected: selected)
+        let waits = try healthKnownWaits(db, task: task, blockers: selected["prerequisite_blockers"] as? [JSON] ?? [])
         let jobs = try scopedTaskRows(db, type: "source_execution", task: task, predicate: "json_extract(data,'$.state') IN ('queued','running')", limit: 25)
         value["running_jobs"] = jobs.map { job -> JSON in
             var row: JSON = [:]; for key in ["id", "state", "started_at", "timeout_seconds", "attempt_id"] { row[key] = job[key] }; return row
@@ -220,7 +219,7 @@ extension CommandRouter {
     }
 
     private var healthActor: Caller { Caller(role: "owner", installation: "work-health-service", projectIDs: []) }
-    @discardableResult private func healthNote(_ db: Database, task: JSON, body: String, target: JSON?, request: JSON? = nil, at date: Date = Date()) throws -> JSON {
+    @discardableResult private func healthNote(_ db: Database, task: JSON, body: String, target: JSON?, request: JSON? = nil, at date: Date = Date(), currentTarget: JSON? = nil) throws -> JSON {
         let pid = (try StoredRecord(task, family: "task").string("project_id"))
         var message: JSON = ["id": uuid(), "project_id": pid, "task_id": (try StoredRecord(task, family: "record").requiredValue("id")), "kind": "work_health", "origin": "system",
                              "body": body, "author": "work-health-service", "author_display": "Checklist work health", "author_session_id": "service",
@@ -233,18 +232,24 @@ extension CommandRouter {
             recipients = [["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"]]
         }
         // CL-248: work-health notices always reach both roles: the current holder and the Triage orchestrator.
-        let current = try workHealthTarget(db, task: task)
-        if target == nil, current["kind"] as? String == "attempt", let sid = current["session_id"] as? String,
-           let session = try? scoped(db, sid, pid, type: "session"), session["role"] as? String == "worker",
-           canReceive(session, project: pid), sessionGeneration(session) == current["generation"] as? String {
-            recipients.append(["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"])
+        if target == nil {
+            let current = try currentTarget ?? workHealthTarget(db, task: task)
+            if current["kind"] as? String == "attempt", let sid = current["session_id"] as? String,
+               let session = try? scoped(db, sid, pid, type: "session"), session["role"] as? String == "worker",
+               canReceive(session, project: pid), sessionGeneration(session) == current["generation"] as? String {
+                recipients.append(["session_id": sid, "authorization_generation": sessionGeneration(session), "recipient_role": "health_handler"])
+            }
         }
-        if let group = try ticketOrchestratedTriage(db, task: task), let copy = triageOrchestratorRecipient(db, group: group),
-           !recipients.contains(where: { $0["session_id"] as? String == copy["session_id"] as? String }) {
-            recipients.append(copy)
+        if let group = try ticketOrchestratedTriage(db, task: task) {
+            if let copy = triageOrchestratorRecipient(db, group: group) {
+                if !recipients.contains(where: { $0["session_id"] as? String == copy["session_id"] as? String }) { recipients.append(copy) }
+            } else {
+                // Only a missing copy can leave stale-binding evidence. Avoid
+                // looking up the same Triage again on the normal delivery path.
+                let omissions = try staleTriageCopyOmissions(db, message: message, recipients: recipients)
+                if !omissions.isEmpty { message["delivery_omissions"] = omissions; try save(db,message,type:"message") }
+            }
         }
-        let omissions = try staleTriageCopyOmissions(db, message: message, recipients: recipients)
-        if !omissions.isEmpty { message["delivery_omissions"] = omissions; try save(db,message,type:"message") }
         let deliveries = try queueHealthDeliveries(db, message: message, recipients: recipients, at: date)
         try event(db, caller: healthActor, project: pid, entity: task["id"] as? String, kind: "work_health_note", data: ["message_id": (try StoredRecord(message,
             family: "record").requiredValue("id"))])
@@ -285,10 +290,10 @@ extension CommandRouter {
         return true
     }
 
-    private func healthOutcome(_ db: Database, task: JSON, request: inout JSON, outcome: String, body: String) throws {
+    private func healthOutcome(_ db: Database, task: JSON, request: inout JSON, outcome: String, body: String, currentTarget: JSON? = nil) throws {
         guard request["outcome"] == nil else { return }
         request["outcome"] = outcome; request["outcome_at"] = now()
-        let note = try healthNote(db, task: task, body: body, target: nil)
+        let note = try healthNote(db, task: task, body: body, target: nil, currentTarget: currentTarget)
         try notifyHealthCoordinators(db, task: task, request: request, note: note)
         request["outcome_note_id"] = note["id"]
     }
@@ -340,28 +345,38 @@ extension CommandRouter {
         var journal: WorkHealthPreparationChanges.Snapshot?
         for item in page.items {
             var admitted = false
+            var timing: WorkHealthApplyTiming?
+            defer { timing?.reportIfSlow() }
             let outcome = try withMaintenanceWriter(label: "work_health_apply") {db,deadline in
                 admitted = true
                 var result = CandidateOutcome.stale
+                timing = WorkHealthApplyTiming()
+                defer { timing?.finished = ProcessInfo.processInfo.systemUptime }
                 try withValidatedDomainTransaction(db,deadline:deadline) {
+                    timing?.bodyStarted = ProcessInfo.processInfo.systemUptime
+                    defer { timing?.bodyFinished = ProcessInfo.processInfo.systemUptime }
                     guard let current = try fence.readSnapshot(db,version:version,previous:journal) else {
                         result = .journalRefused
                         return .rollback
                     }
                     journal = current
                     guard try workHealthPreparationIsCurrent(db,changes:current.changes,dependencies:item.dependencies) else {return .rollback}
-                    try fence.stop(db)
                     switch item.action {
                     case .unheld(let category):
+                        try fence.stop(db)
                         result = .applied(inspected:false,changed:try endUnheldWorkHealth(db,task:item.task,category:category))
                     case .inspect(let progress):
+                        try fence.stop(db)
                         result = .applied(inspected:true,changed:try checkWorkHealth(db,task:item.task,at:date,prepared:progress))
                     case .skip:
                         result = .applied(inspected:false,changed:false)
+                        return .rollback
                     }
                     try fence.resume(db)
+                    timing?.commitRequested = true
                     return .commit
                 }
+                timing?.completed = true
                 return result
             }
             if case .journalRefused? = outcome {blocked = true;break}
@@ -468,13 +483,13 @@ extension CommandRouter {
         }
         return dependencies
     }
-    func checkWorkHealth(_ db: Database, task original: JSON, at date: Date, prepared: WorkHealthPreparedProgress? = nil) throws -> Bool {
+    private func checkWorkHealth(_ db: Database, task original: JSON, at date: Date, prepared: WorkHealthPreparedProgress) throws -> Bool {
         var task = original
         let project = try record(db, (try StoredRecord(task, family: "task").string("project_id")), type: "project"), settings = workHealthSettings(project)
         guard bool(settings, "enabled") else { return false }
-        let target = try prepared?.target ?? workHealthTarget(db, task: task), stamp = healthStamp(date)
-        let reading = try prepared?.reading ?? healthProgressReading(db, task: task, target: target), progress = reading.at
-        let progressToken = try prepared?.token ?? healthProgressToken(db, task: task, target: target)
+        let target = prepared.target, stamp = healthStamp(date)
+        let reading = prepared.reading, progress = reading.at
+        let progressToken = prepared.token
         var health = task["work_health"] as? JSON ?? [:]
         let previous = health
         if let old = health["target"] as? JSON, !sameHealthTarget(old, target) { health = [:] }
@@ -503,20 +518,29 @@ extension CommandRouter {
         if let mid = health["request_id"] as? String, var message = try? scoped(db, mid, (try StoredRecord(task, family: "task").string("project_id")), type: "message"),
             var request = message["health_request"] as? JSON, request["outcome"] == nil {
             if let progress, let sent = healthTime(request["requested_at"]), progress > sent || (request["progress_token"] as? String).map({ $0 != progressToken }) == true {
-                try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from \(reading.clock == "triage_checkpoint" ? "the Triage checkpoint" : "the ticket's own attempt") answered check \(mid). Work authority is unchanged.")
+                try healthOutcome(db, task: task, request: &request, outcome: "progress_observed", body: "Work health resumed: substantive progress from \(reading.clock == "triage_checkpoint" ? "the Triage checkpoint" : "the ticket's own attempt") answered check \(mid). Work authority is unchanged.", currentTarget: target)
+                message["health_request"] = request; try save(db, message, type: "message")
                 health.removeValue(forKey: "request_id"); health.removeValue(forKey: "deadline"); health.removeValue(forKey: "reported_wait"); health["state"] = "current"; health["attention"] = false; health["baseline_at"] = healthStamp(progress); health["next_check_at"] = healthStamp(progress.addingTimeInterval(interval))
             } else if let deadline = healthTime(request["deadline"]), date >= deadline, health["state"] as? String != "no_response" {
-                let note = try healthNote(db, task: task, body: "No response to work health check \(mid) by \(healthStamp(deadline)). Delivery is not acknowledgment or useful progress. The handler may be busy, waiting or unavailable; no abandonment, completion, release or reassignment is inferred.", target: nil)
+                let note = try healthNote(db, task: task, body: "No response to work health check \(mid) by \(healthStamp(deadline)). Delivery is not acknowledgment or useful progress. The handler may be busy, waiting or unavailable; no abandonment, completion, release or reassignment is inferred.", target: nil, currentTarget: target)
                 try notifyHealthCoordinators(db, task: task, request: request, note: note)
                 health["state"] = "no_response"; health.removeValue(forKey: "next_check_at"); health["attention"] = true; health["no_response_note_id"] = note["id"]
             }
-            message["health_request"] = request; try save(db, message, type: "message")
+            // The open request only changes when progress answers it. A missed
+            // deadline leaves it open for a late reply and records a separate note.
         // A wait named in a reply stops further requests until new progress (CL-414).
         } else if health["reported_wait"] == nil, date >= max(due, baseline.addingTimeInterval(interval)) {
             let deadline = healthStamp(date.addingTimeInterval(grace))
             // CL-389: a request relays only for new progress, never during a known wait, and at most three times per attempt.
             let relayTarget = target["id"] as? String, relayCount = health["relay_target"] as? String == relayTarget ? int(health, "relay_count", default: 0) : 0
-            let relayed = try target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays && healthKnownWaits(db, task: task, selected: selectedTaskHealthFacts(db,task:task)).isEmpty
+            var relayed = false
+            if target["session_id"] != nil && health["relayed_progress_token"] as? String != progressToken && relayCount < Self.maximumHealthRelays {
+                // Attention was already selected on the reader and fenced. The
+                // writer still checks the canonical ticket and all current waits.
+                _ = try canonicalTaskID(db,task:task)
+                let blockers = prerequisiteBlockers(try selectedTaskPrerequisites(db,task:task))
+                relayed = try healthKnownWaits(db,task:task,blockers:blockers).isEmpty
+            }
             var request: JSON = ["target": target, "task_revision": int(task, "revision"), "acceptance_revision": int(task, "acceptance_revision"), "manifest_id": task["current_manifest_id"] ?? NSNull(), "requested_at": stamp, "last_progress_at": progress.map(healthStamp) ?? NSNull(), "progress_clock": progress == nil ? NSNull() : reading.clock ?? NSNull(), "progress_token": progressToken, "deadline": deadline]
             if relayed { request["native_relay"] = true }
             let note = try healthNote(db, task: task, body: "Work health check: does work continue? Last substantive progress: \(progress.map { healthStamp($0) + (reading.clock == "triage_checkpoint" ? " (the Triage checkpoint)" : " (the ticket's own attempt)") } ?? "not recorded"). Reply to this exact note with current progress, or call work_health_respond with request_id from this note and known_wait for a known wait. Response due \(deadline). This is an advisory check, not a new claim. It is also available on MCP pickup while this exact session remains eligible.", target: target, request: request, at: date)

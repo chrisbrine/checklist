@@ -20,7 +20,11 @@ final class ServiceCommandQueue: @unchecked Sendable {
 
     func async(source: String = #fileID, line: Int = #line, function: String = #function,
                execute work: @escaping @Sendable () -> Void) {
-        dispatchQueue.async { self.perform(work: "\(function) [\(source):\(line)]", work) }
+        async(work: "\(function) [\(source):\(line)]", execute: work)
+    }
+
+    func async(work label: String, execute work: @escaping @Sendable () -> Void) {
+        dispatchQueue.async { self.perform(work: label, work) }
     }
 
     func sync<T>(source: String = #fileID, line: Int = #line, function: String = #function,

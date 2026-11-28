@@ -127,14 +127,14 @@ extension CommandRouter {
 
     /// One bounded reference inventory per command, never a full-table scan per row.
     /// Unknown references conservatively retain a shared record; they never grant unlink authority.
-    func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil,doneEvidence: Bool = false,historyObservation: TicketCleanupEventObservation? = nil,backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,referenceGraph: TicketPurgeReferenceGraph? = nil,allowSourceCacheEnumeration: Bool = true) throws -> TicketPurgePlan {
+    func ticketPurgePlan(_ db: Database, task: JSON, inventory: TicketCleanupInventory? = nil,doneEvidence: Bool = false,historyObservation: TicketCleanupEventObservation? = nil,backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,referenceGraph: TicketPurgeReferenceGraph? = nil,allowSourceCacheEnumeration: Bool = true,manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws -> TicketPurgePlan {
         let pid = (try StoredRecord(task, family: "task").string("project_id")), tid = (try StoredRecord(task, family: "task").string("id")), taskKey = Data(tid.utf8)
         var objects = candidateObjects,scannedOwnership: Set<Data>? = nil
-        let inventory = try inventory ?? ticketCleanupInventory(db,task:task,objectsForReferences:{rows in
+        let inventory = try inventory ?? ticketCleanupInventory(db,task:task,manualPurgeBudget:manualPurgeBudget,objectsForReferences:{rows in
             let owned = self.ticketPurgeOwnedKeys(all:rows,pid:pid,tid:tid)
             scannedOwnership = owned
             if let objects {return objects}
-            let candidates = try self.ticketObjectDeletionObjects(db,owned:rows.filter {owned.contains($0.key)}.map {($0.type,$0.value)},allowSourceCacheEnumeration:allowSourceCacheEnumeration)
+            let candidates = try self.ticketObjectDeletionObjects(db,owned:rows.filter {owned.contains($0.key)}.map {($0.type,$0.value)},allowSourceCacheEnumeration:allowSourceCacheEnumeration,manualPurgeBudget:manualPurgeBudget)
             objects = candidates
             return candidates
         })
@@ -147,11 +147,23 @@ extension CommandRouter {
         }
         let owned = preparedGraph.owned,groups = preparedGraph.groups,groupValues = preparedGraph.groupValues,references = preparedGraph.references,relevant = preparedGraph.relevant,removed = preparedGraph.removed,shared = preparedGraph.shared
         let removedKeys = Set(removed.map(\.key))
-        let observation = try historyObservation ?? ticketCleanupEventObservation(db,tasks:[task],inventories:[tid:inventory],referenceGraphs:[tid:preparedGraph])
+        func observeEvents() throws -> TicketCleanupEventObservation {
+            try ticketCleanupEventObservation(db,tasks:[task],inventories:[tid:inventory],referenceGraphs:[tid:preparedGraph],manualPurgeBudget:manualPurgeBudget)
+        }
+        let observation = try historyObservation ?? manualPurgeBudget?.measuring("purge_event_observation_ms",observeEvents) ?? observeEvents()
         let events = try observation.events(task:tid,matching:removedKeys.union([taskKey]))
         let counts = removed.reduce(into:[String:Int]()) {$0[$1.type,default:0] += 1}
         let managed = all.filter {owned.contains($0.key) && $0.type == "attachment" && $0.value["mode"] as? String == "managed"}
-        let backups = try backupObservation?.summaries ?? Row.fetchAll(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) AS value FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key").map {jsonObject($0["value"])}
+        var backups = backupObservation?.summaries ?? []
+        if backupObservation == nil {
+            let cursor = try String.fetchCursor(db,sql:"SELECT json_object('known_at',json_extract(value,'$.known_at'),'created_at',json_extract(value,'$.created_at')) FROM metadata WHERE key LIKE 'backup-generation:%' ORDER BY key")
+            while let value = try cursor.next() {
+                try autoreleasepool {
+                    try manualPurgeBudget?.retain(512 + 4 * value.utf8.count)
+                    backups.append(jsonObject(value))
+                }
+            }
+        }
         let relationCount = all.filter {$0.project == pid && $0.type == "relation" && equals($0.value["target_task_id"],tid) && !equals($0.value["source_task_id"],tid)}.count
         // Done cleanup preserves historical records, but their own references
         // are evidence metadata rather than an independent user of those bytes.
@@ -165,7 +177,7 @@ extension CommandRouter {
         let byteProtected = try doneEvidence ? ticketCleanupProtectedOwners(graph.filter {$0["id"] as? String != tid},owners:byteOwners,tokens:references) : Set<Data>()
         let excluded = doneEvidence ? byteOwners.subtracting(byteProtected) : removedKeys
         let remaining = all.filter {!excluded.contains($0.key) && $0.key != taskKey}.map {row -> JSON in var value = groupValues[row.key] ?? row.value;value["record_type"] = row.type;return value}
-        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:references,historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:objects,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:doneEvidence,allowSourceCacheEnumeration:allowSourceCacheEnumeration)
+        let byteDeletion = try ticketObjectDeletionPlan(db,owned:all.filter {owned.contains($0.key)}.map {($0.type,$0.value)},remaining:remaining,referenceTokens:references,historicalOwners:doneEvidence ? excluded : [],backupObservation:backupObservation,candidateObjects:objects,mediaAuthorityComplete:mediaAuthorityComplete,preserveTicketMedia:doneEvidence,allowSourceCacheEnumeration:allowSourceCacheEnumeration,manualPurgeBudget:manualPurgeBudget)
         let impact: JSON = [
             "task_id": tid, "project_id": pid, "expected_revision": (try StoredRecord(task, family: "task").requiredValue("revision")), "record_counts": counts,
             "removed_record_count": removed.count, "shared_record_count": shared.count, "history_events": events.count, "preserved_relation_count": relationCount,
@@ -218,14 +230,14 @@ extension CommandRouter {
         }
     }
 
-    func withManualTicketPurgePreparation<T>(_ p: JSON,_ c: Caller,commit: (PreparedManualTicketPurge?) throws -> T) throws -> T {
+    func withManualTicketPurgePreparation<T>(_ p: JSON,_ c: Caller,observeStoragePhase: ((String,TimeInterval) -> Void)? = nil,commit: (PreparedManualTicketPurge?) throws -> T) throws -> T {
         let reader = try ticketPurgeReader()
         defer {try? reader.close()}
         for attempt in 0..<2 {
             do {
                 let version = try Self.ticketPurgeReadVersion(reader)
                 let prepared = try reader.read {db in
-                    try autoreleasepool {try self.prepareManualTicketPurge(db,p,c,reader:reader,version:version)}
+                    try autoreleasepool {try self.prepareManualTicketPurge(db,p,c,reader:reader,version:version,observeStoragePhase:observeStoragePhase)}
                 }
                 // Avoid taking the writer for a snapshot already known stale.
                 try prepared?.validate()
@@ -236,28 +248,26 @@ extension CommandRouter {
         throw CoreError("PURGE_PREVIEW_STALE","The store changed during purge preparation. Read a new permanent-removal preview before retrying.")
     }
 
-    private func prepareManualTicketPurge(_ db: Database,_ p: JSON,_ c: Caller,reader: DatabaseQueue,version: Int64) throws -> PreparedManualTicketPurge? {
+    private func prepareManualTicketPurge(_ db: Database,_ p: JSON,_ c: Caller,reader: DatabaseQueue,version: Int64,observeStoragePhase: ((String,TimeInterval) -> Void)?) throws -> PreparedManualTicketPurge? {
         try owner(c)
         let command = try text(p,"command_id",max:100)
         // The existing writer transaction owns idempotency and rechecks the
         // receipt. A known command does not need another full observation.
         if try Bool.fetchOne(db,sql:"SELECT EXISTS(SELECT 1 FROM commands WHERE principal=? AND command_id=?)",arguments:[c.principal,command]) == true {return nil}
-        let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid)
-        guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")}
-        try revision(p,task);try requirePurgeSafe(db,task:task)
-        return try Self.ticketPurgeReadDeadline().observing(db) {
-            let plan = try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        let budget = ManualTicketPurgeBudget(observe:observeStoragePhase)
+        return try budget.readDeadline.observing(db) {
+            let pid = try scope(db,p,c,write:true),task = try self.task(db,p,pid)
+            guard !bool(task,"purged") else {throw CoreError("TICKET_PURGED","This ticket was permanently removed. Its remaining reference cannot be edited or restored.")}
+            try revision(p,task);try requirePurgeSafe(db,task:task)
+            let plan = try budget.measuring("purge_plan_ms") {
+                try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false,manualPurgeBudget:budget)
+            }
             guard try text(p,"preview_digest") == plan.digest else {throw Self.ticketPurgeStalePreview}
-            let commands = try ticketPurgeExpiringCommands(db,task:task,plan:plan)
+            let commands = try budget.measuring("purge_receipt_observation_ms") {
+                try ticketPurgeExpiringCommands(db,task:task,plan:plan,budget:budget)
+            }
             return .init(plan:plan,expiredCommands:commands,reader:reader,version:version)
         }
-    }
-
-    private static func ticketPurgeReadDeadline() -> CleanupObservationDeadline {
-        let seconds = CleanupObservationDeadline.preparedSeconds
-        return .init(seconds:seconds,failure:CoreError("CLEANUP_INVENTORY_LIMIT",
-            "Permanent ticket removal could not complete its reference proof within the time budget. No content was removed.",
-            details:["limit":"observation_seconds","maximum":seconds]))
     }
 
     private static var ticketPurgeStalePreview: CoreError {
@@ -265,10 +275,12 @@ extension CommandRouter {
     }
 
     func taskPurgePreview(_ db: Database,_ p: JSON,_ c: Caller) throws -> JSON {
-        try owner(c);let pid = try scope(db,p,c),task = try self.task(db,p,pid)
-        try revision(p,task);try requirePurgeSafe(db,task:task)
-        let plan = try Self.ticketPurgeReadDeadline().observing(db) {
-            try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
+        try owner(c)
+        let budget = ManualTicketPurgeBudget()
+        let plan = try budget.readDeadline.observing(db) {
+            let pid = try scope(db,p,c),task = try self.task(db,p,pid)
+            try revision(p,task);try requirePurgeSafe(db,task:task)
+            return try ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false,manualPurgeBudget:budget)
         }
         return ["preview_id":plan.digest,"digest":plan.digest,"impact":plan.impact,"can_purge":true,"blockers":[],
             "removes":"Permanently removes this ticket's private content and exclusively owned notes, work, requests, reviews and file records. Earlier history rows keep their place with their content cleared. Earlier cached command results are expired.",
@@ -276,14 +288,14 @@ extension CommandRouter {
             "backup_warning":"Backups and exports made before this purge may contain this ticket. Checklist does not change existing backups or exports; delete those copies yourself if needed. Recorded backup observation times are not guaranteed creation times."]
     }
 
-    func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan) throws -> [Row] {
+    func ticketPurgeExpiringCommands(_ db: Database,task: JSON,plan: TicketPurgePlan,budget: ManualTicketPurgeBudget? = .init()) throws -> [Row] {
         let tid = try StoredRecord(task,family:"task").string("id")
-        let observation = try ticketPurgeExpiringCommands(db,tasks:[task],plans:[tid:plan])
+        let observation = try ticketPurgeExpiringCommands(db,tasks:[task],plans:[tid:plan],manualPurgeBudget:budget)
         if let error = observation.errors[tid] {throw error}
         return observation.commands[tid] ?? []
     }
 
-    func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil) throws -> JSON {
+    func taskPurge(_ db: Database,_ p: JSON,_ c: Caller, automatic: Bool = false, prepared: TicketPurgePlan? = nil, expiredCommands: [Row]? = nil, writerDeadline: MaintenanceDeadline? = nil) throws -> JSON {
         try owner(c);let pid = try scope(db,p,c,write:!automatic),task = try self.task(db,p,pid)
         try revision(p,task);try requirePurgeSafe(db,task:task,automatic:automatic)
         let plan = try prepared ?? ticketPurgePlan(db,task:task,allowSourceCacheEnumeration:false)
@@ -291,8 +303,9 @@ extension CommandRouter {
         let tid = (try StoredRecord(task, family: "task").string("id"))
         // Expiring receipts keeps idempotency ownership/digests but prevents a
         // retry of an earlier create/note/read-modify command returning purged text.
-        let receipts = try expiredCommands ?? ticketPurgeExpiringCommands(db,task:task,plan:plan)
+        let receipts = try expiredCommands ?? ticketPurgeExpiringCommands(db,task:task,plan:plan,budget:automatic ? nil : .init())
         for receipt in receipts {
+            try writerDeadline?.check()
             try db.execute(sql:"UPDATE commands SET result=? WHERE principal=CAST(? AS TEXT) AND command_id=CAST(? AS TEXT)",arguments:[Self.prunedResult,receipt["cleanup_principal"] as Data,receipt["cleanup_command_id"] as Data])
         }
         // Retire in-flight operation snapshots before they can publish private
@@ -300,8 +313,12 @@ extension CommandRouter {
         try CommandOperationPurgeEpoch.advance(db,project:pid)
         let expired = receipts.count
         let deletion = try enqueueTicketObjectDeletion(db,project:pid,task:tid,cause:"task_purge",plan:plan.byteDeletion)
-        for row in plan.removed {try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(pid.utf8),Data(row.type.utf8)])}
+        for row in plan.removed {
+            try writerDeadline?.check()
+            try db.execute(sql:"DELETE FROM records WHERE id=CAST(? AS TEXT) AND project_id=CAST(? AS TEXT) AND type=CAST(? AS TEXT)",arguments:[Data(row.id.utf8),Data(pid.utf8),Data(row.type.utf8)])
+        }
         for group in plan.groups {
+            try writerDeadline?.check()
             let current = try record(db,group.id,type:group.type)
             try save(db,revised(ticketPurgeGroupValue(current,removing:tid)),type:group.type)
         }
@@ -310,7 +327,10 @@ extension CommandRouter {
             "purged": true, "purged_at": now(), "purged_by": automatic ? "system:ticket_cleanup" : c.principal, "trashed": true, "archived": true,
         ]
         try save(db,tombstone,type:"task")
-        for row in plan.events {try db.execute(sql:"UPDATE events SET data='{}' WHERE seq=? AND project_id=CAST(? AS TEXT)",arguments:[row["seq"] as Int64,Data(pid.utf8)])}
+        for row in plan.events {
+            try writerDeadline?.check()
+            try db.execute(sql:"UPDATE events SET data='{}' WHERE seq=? AND project_id=CAST(? AS TEXT)",arguments:[row["seq"] as Int64,Data(pid.utf8)])
+        }
         var counts: JSON = ["removed_records":plan.removed.count,"retained_shared_records":plan.shared.count,"scrubbed_history_events":plan.events.count,"expired_command_results":expired,"managed_bytes_deleted":0]
         if automatic {counts["origin"] = "automatic_cleanup"}
         try event(db,caller:c,project:pid,entity:tid,kind:"task_purged",data:counts)

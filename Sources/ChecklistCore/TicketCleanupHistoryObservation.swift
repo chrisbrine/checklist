@@ -56,15 +56,18 @@ private struct CleanupHistoryRows {
         }
     }
 
-    mutating func add(_ row: Row,tokens: Set<Data>,bytes: Int,tasks: Set<String>,commands: Bool = false) {
+    mutating func add(_ row: Row,tokens: Set<Data>,bytes: Int,tasks: Set<String>,commands: Bool = false,manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws {
         var admitted = tasks.filter {errors[$0] == nil}
-        let rowOverflow = Set(admitted.filter {(members[$0]?.count ?? 0) >= CommandRouter.ticketCleanupSelectedHistoryRowLimit})
-        fail(rowOverflow,CommandRouter.ticketCleanupSelectedHistoryLimit(commands:commands))
-        admitted.subtract(rowOverflow)
+        if manualPurgeBudget == nil {
+            let rowOverflow = Set(admitted.filter {(members[$0]?.count ?? 0) >= CommandRouter.ticketCleanupSelectedHistoryRowLimit})
+            fail(rowOverflow,CommandRouter.ticketCleanupSelectedHistoryLimit(commands:commands))
+            admitted.subtract(rowOverflow)
+        }
         let oversized = Set(admitted.filter {(ticketBytes[$0] ?? 0) + bytes > TicketCleanupInventory.byteLimit})
         fail(oversized,CoreError("CLEANUP_INVENTORY_LIMIT",commands ? "Selected command results exceed the 16 MiB cleanup bound." : "Selected ticket history exceeds the 16 MiB cleanup bound."))
         admitted.subtract(oversized)
         guard !admitted.isEmpty else {return}
+        try manualPurgeBudget?.retainPayload(bytes,tokens:tokens)
         // Include a conservative charge for Data/Set/dictionary entries, rather
         // than counting only JSON bytes while retaining a large token graph.
         let tokenCharge = tokens.reduce(0) {$0 + $1.count + 96}
@@ -117,7 +120,7 @@ extension CommandRouter {
     /// Event payloads are parsed/tokenized once for the selected projects, then
     /// admitted only against the exact removal closure. History belonging to
     /// foreign-protected shared records cannot consume a ticket's history budget.
-    func ticketCleanupEventObservation(_ db: Database,tasks: [JSON],inventories: [String:TicketCleanupInventory],referenceGraphs: [String:TicketPurgeReferenceGraph]? = nil) throws -> TicketCleanupEventObservation {
+    func ticketCleanupEventObservation(_ db: Database,tasks: [JSON],inventories: [String:TicketCleanupInventory],referenceGraphs: [String:TicketPurgeReferenceGraph]? = nil,manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws -> TicketCleanupEventObservation {
         guard tasks.count <= 32 else {throw CoreError("PURGE_LIMIT","Cleanup selects at most 32 tickets per observation.")}
         var projects: [String:Set<String>] = [:],needles: [String:[Data:Set<String>]] = [:]
         for task in tasks {
@@ -150,6 +153,7 @@ extension CommandRouter {
             while let row = try cursor.next() {
                 guard targets.contains(where:{result.selected.errors[$0] == nil}) else {break}
                 try autoreleasepool {
+                    try manualPurgeBudget?.readDeadline.check()
                     let entity = (row["entity_id"] as String?).map {Data($0.utf8)}
                     var matched = entity.flatMap {projectNeedles[$0]} ?? []
                     let payloadSQL = "SELECT data AS payload FROM events WHERE seq=?"
@@ -169,7 +173,7 @@ extension CommandRouter {
                         try refuse(CoreError(error.code,error.message,details:["limit":budget < 0 ? "history_row_tokens" : "history_row_depth","maximum":budget < 0 ? 2000000 : 64]));return
                     }
                     for key in tokens {matched.formUnion(projectNeedles[key] ?? [])}
-                    result.selected.add(row,tokens:tokens,bytes:row["payload_bytes"],tasks:matched)
+                    try result.selected.add(row,tokens:tokens,bytes:row["payload_bytes"],tasks:matched,manualPurgeBudget:manualPurgeBudget)
                 }
             }
         }
@@ -250,7 +254,7 @@ extension CommandRouter {
     /// Manual and automatic purge use the same command-result snapshot.
     /// Ordinary results need an exact reference. Failure receipts, oversized
     /// operation results and import previews can also carry private text alone.
-    func ticketPurgeExpiringCommands(_ db: Database,tasks: [JSON],plans: [String:TicketPurgePlan]) throws -> TicketCleanupCommandObservation {
+    func ticketPurgeExpiringCommands(_ db: Database,tasks: [JSON],plans: [String:TicketPurgePlan],manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws -> TicketCleanupCommandObservation {
         guard tasks.count <= 32 else {throw CoreError("PURGE_LIMIT","Cleanup selects at most 32 tickets per observation.")}
         var needles: [Data:Set<String>] = [:],projects: [Data:Set<String>] = [:],targets = Set<String>()
         for task in tasks {
@@ -261,11 +265,13 @@ extension CommandRouter {
             for key in Set(plan.removed.map(\.key)).union([Data(tid.utf8)]) {needles[key,default:[]].insert(tid)}
         }
         var selected = CleanupHistoryRows()
+        var manual: [String:[Row]] = [:]
         guard !targets.isEmpty else {return TicketCleanupCommandObservation()}
         let keys = try jsonString(needles.keys.map {String(decoding:$0,as:UTF8.self)})
         let cursor = try Row.fetchCursor(db,sql: Self.ticketPurgeReceiptScopesSQL() + "\n" + """
             SELECT c.rowid AS cleanup_row,c.principal,c.command_id,CAST(c.principal AS BLOB) AS cleanup_principal,
                    CAST(c.command_id AS BLOB) AS cleanup_command_id,
+                   octet_length(c.principal) + octet_length(c.command_id) AS identity_bytes,
                    length(CAST(c.result AS BLOB)) AS result_bytes,
                    CASE WHEN length(CAST(c.result AS BLOB))<=? THEN c.result END AS result,
                    scopes.position IS NOT NULL AS private_receipt,CAST(scopes.project AS BLOB) AS receipt_project
@@ -275,6 +281,7 @@ extension CommandRouter {
         while let row = try cursor.next() {
             guard targets.contains(where:{selected.errors[$0] == nil}) else {break}
             try autoreleasepool {
+                try manualPurgeBudget?.readDeadline.check()
                 var matched = Set<String>()
                 if row["private_receipt"] as Bool {
                     if let project: Data = row["receipt_project"] {matched = projects[project] ?? []}
@@ -296,11 +303,22 @@ extension CommandRouter {
                         } else {matched = targets}
                     }
                 }
-                // A large result is scrubbed by row identity without retaining
-                // its payload in the purge plan. The per-ticket row bound applies.
-                selected.add(row,tokens:[],bytes:raw == nil ? 0 : row["result_bytes"],tasks:matched,commands:true)
+                if let manualPurgeBudget {
+                    guard !matched.isEmpty else {return}
+                    let identityBytes: Int = row["identity_bytes"]
+                    try manualPurgeBudget.retain(512 + 4 * identityBytes)
+                    // Keep only the exact primary key and the diagnostic row
+                    // identity. The private result stays in SQLite until commit.
+                    let identity = Row(["cleanup_row":row["cleanup_row"] as Int64,
+                                        "principal":row["principal"] as String,"command_id":row["command_id"] as String,
+                                        "cleanup_principal":row["cleanup_principal"] as Data,"cleanup_command_id":row["cleanup_command_id"] as Data])
+                    for task in matched {manual[task,default:[]].append(identity)}
+                } else {
+                    try selected.add(row,tokens:[],bytes:raw == nil ? 0 : row["result_bytes"],tasks:matched,commands:true)
+                }
             }
         }
+        if manualPurgeBudget != nil {return TicketCleanupCommandObservation(commands:manual)}
         var result = TicketCleanupCommandObservation(errors:selected.errors)
         for task in targets where selected.errors[task] == nil {result.commands[task] = (selected.members[task] ?? []).compactMap {selected.rows[$0]?.row}}
         return result

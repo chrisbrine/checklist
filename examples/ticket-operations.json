@@ -120,5 +120,25 @@
         "preview_digest": "0000000000000000000000000000000000000000000000000000000000000000"
       }
     }
+  ],
+  "purge_refusals": [
+    {
+      "code": "CLEANUP_INVENTORY_LIMIT",
+      "message": "The selected ticket exceeds the 64 MiB purge plan budget. No content was removed.",
+      "retryable": false,
+      "details": {"limit": "selected_plan_bytes", "maximum": 67108864}
+    },
+    {
+      "code": "CLEANUP_INVENTORY_LIMIT",
+      "message": "Permanent ticket removal could not complete its reference proof within the time budget. No content was removed.",
+      "retryable": false,
+      "details": {"limit": "observation_seconds", "maximum": 300}
+    },
+    {
+      "code": "PURGE_LIMIT",
+      "message": "Permanent ticket removal exceeded its atomic writer time budget. No content was removed.",
+      "retryable": false,
+      "details": {"limit": "writer_seconds", "maximum": 5}
+    }
   ]
 }

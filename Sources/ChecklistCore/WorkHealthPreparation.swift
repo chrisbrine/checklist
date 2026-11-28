@@ -1,5 +1,41 @@
+import Darwin
 import Foundation
 import GRDB
+
+/// Measure the whole SQLite attempt, including time after the callback returns.
+/// The caller emits the diagnostic after giving the writer back to foreground work.
+struct WorkHealthApplyTiming {
+    private let startedAt = Date()
+    private let started = ProcessInfo.processInfo.systemUptime
+    var bodyStarted: TimeInterval?
+    var bodyFinished: TimeInterval?
+    var finished: TimeInterval?
+    var commitRequested = false
+    var completed = false
+
+    func reportIfSlow() {
+        guard let finished, finished - started >= 0.25 else { return }
+        var load = [Double](repeating: 0, count: 3)
+        let count = getloadavg(&load, 3)
+        var value: JSON = [
+            "kind": "work_health_apply_timing",
+            "started_at": StoredClock.shared.string(from: startedAt),
+            "observed_at": now(),
+            "loadavg": Array(load.prefix(max(0, Int(count)))),
+            "duration_ms": (finished - started) * 1000,
+            "commit_requested": commitRequested,
+            "transaction_completed": completed
+        ]
+        if let bodyStarted, let bodyFinished {
+            value["begin_ms"] = (bodyStarted - started) * 1000
+            value["body_ms"] = (bodyFinished - bodyStarted) * 1000
+            value["validation_and_finish_ms"] = (finished - bodyFinished) * 1000
+        } else {
+            value["begin_ms"] = (finished - started) * 1000
+        }
+        if let line = try? jsonString(value) { fputs(line + "\n", stderr) }
+    }
+}
 
 /// These facts come from one read snapshot. All decisions about current waits,
 /// correlated replies and delivery authority still run on the writer.

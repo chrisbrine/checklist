@@ -967,4 +967,6 @@ The 500,000-object and 500 MiB per-file limits protect filesystem traversal and 
 
 Portable project export retains a 128 MiB metadata budget and a five-second writer preparation deadline. The deadline covers validation, projections and acquisition of reader holds. Export still has a protected file-copy phase.
 
+The [routine canonical retention policy](routine-record-retention.md) preserves the settled import jobs and delivery receipts that carry replay, repair, pickup and acknowledgment authority.
+
 The snapshot manifest format and store schema stay at their existing versions. Builds 328 and 331 can recognize a format-3 receipt and still refuse verification when a snapshot exceeds their former 100,000-record limit. Their retention readers count such receipts as complete. Rollback to those builds needs a separately verified compatible generation protected from automatic retirement.

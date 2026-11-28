@@ -12,7 +12,9 @@ extension CommandRouter {
         let record = try StoredTaskRecord(task)
         let selected = try selectedTaskRecordIDs(db,type:type,task:task)
         let selection = selected == nil ? "" : "rowid IN (SELECT value FROM json_each(?)) AND "
-        var sql = "SELECT "+Self.canonicalRecordColumns+" FROM records WHERE "+selection
+        // For a bounded row ID selection SQLite can seek the table directly.
+        let records = selected == nil ? "records" : "records NOT INDEXED"
+        var sql = "SELECT "+Self.canonicalRecordColumns+" FROM "+records+" WHERE "+selection
             + "type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("
             + predicate+") ORDER BY rowid"+(descending ? " DESC" : "")
         var args: [DatabaseValueConvertible] = try selected.map {[try jsonString($0)]} ?? []
@@ -25,9 +27,10 @@ extension CommandRouter {
         let record = try StoredTaskRecord(task)
         let selected = try selectedTaskRecordIDs(db,type:type,task:task)
         let selection = selected == nil ? "" : "rowid IN (SELECT value FROM json_each(?)) AND "
+        let records = selected == nil ? "records" : "records NOT INDEXED"
         var arguments: [DatabaseValueConvertible] = try selected.map {[try jsonString($0)]} ?? []
         arguments += [type,Data(record.projectID.utf8),Data(record.id.utf8)]
-        let sql = "SELECT COUNT(*) FROM records WHERE "+selection
+        let sql = "SELECT COUNT(*) FROM "+records+" WHERE "+selection
             + "type=? AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND ("
             + predicate+")"
         return try Int.fetchOne(storeStatement(db,sql),arguments:StatementArguments(arguments)) ?? 0

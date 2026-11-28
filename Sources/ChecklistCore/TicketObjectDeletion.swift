@@ -370,7 +370,7 @@ extension CommandRouter {
     }
 
     /// Capture candidate descriptors once before a selected batch observes backup indexes.
-    func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)],allowSourceCacheEnumeration: Bool = true) throws -> [JSON] {
+    func ticketObjectDeletionObjects(_ db: Database,owned: [(String,JSON)],allowSourceCacheEnumeration: Bool = true,manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws -> [JSON] {
         let files = try StorageObjectFiles(root:root)
         let objectLimit = TicketCleanupDeletionCohort.objectLimit
         var objects: [String:JSON] = [:]
@@ -380,6 +380,12 @@ extension CommandRouter {
             }
         }
         func add(path: String?, family: String, owner: String, representation: String, sha: String? = nil, size: Int64? = nil, link: String? = nil, capture: String? = nil, executable: Bool = false, reason: String? = nil,trash: Bool = false) throws {
+            // Include the descriptor's alternate path spellings, candidate and
+            // held copies, and the durable byte receipt's serialized form.
+            if let manualPurgeBudget {
+                let fieldBytes = [path,link,capture,owner,sha].compactMap {$0}.reduce(0) {$0 + $1.utf8.count}
+                try manualPurgeBudget.retain(1024 + 8 * fieldBytes)
+            }
             var item: JSON = ["owner_ids":[owner],"representation":representation,"kind":link == nil ? "file" : "symlink","executable":executable,"state":"pending","size":max(0,size ?? 0)]
             if trash {item["disposal"] = "trash"}
             if let path {item["stored_path"] = path;item["name"] = URL(fileURLWithPath:path).lastPathComponent}
@@ -393,8 +399,19 @@ extension CommandRouter {
                 else {
                     // Previews and capture sidecars have no immutable digest field.
                     // Capture their exact current descriptor; unlink verifies it again.
-                    do {let bytes = try files.read(relative,maximum:StorageSnapshotBudget.manifestByteLimit);item["sha256"] = hash(bytes);item["size"] = Int64(bytes.count)}
-                    catch {reasons.append("identity_unavailable")}
+                    do {
+                        if let manualPurgeBudget {
+                            let size = try files.size(relative)
+                            guard size <= StorageSnapshotBudget.manifestByteLimit,
+                                  let verified = try TicketObjectRemovalVerification(root:root,relative:relative,size:size,check:manualPurgeBudget.readDeadline.check) else {
+                                throw StorageSnapshotFailure.limit
+                            }
+                            item["sha256"] = verified.sha256;item["size"] = verified.size
+                        } else {
+                            let bytes = try files.read(relative,maximum:StorageSnapshotBudget.manifestByteLimit)
+                            item["sha256"] = hash(bytes);item["size"] = Int64(bytes.count)
+                        }
+                    } catch {reasons.append("identity_unavailable")}
                 }
             } else if reasons.isEmpty {reasons.append("outside_managed_store")}
             if reasons.isEmpty,let relative = item["relative_path"] as? String {
@@ -434,6 +451,7 @@ extension CommandRouter {
             }
         }
         for (type,value) in owned {
+            try manualPurgeBudget?.readDeadline.check()
             let id = (try StoredRecord(value, family: "value").string("id"))
             if type == "attachment" {
                 let mediaTrash = value["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(value)
@@ -442,7 +460,7 @@ extension CommandRouter {
             } else if type == "source_capture" {try capture(value,owner:id)}
             else if type == "manifest",let evidence = value["evidence"] as? JSON,let source = evidence["source_capture"] as? JSON {try capture(source,owner:id)}
         }
-        for item in try sourceBuildCacheDeletionObjects(db,owned:owned,allowEnumeration:allowSourceCacheEnumeration,maximumObjects:objectLimit - objects.count) {
+        for item in try sourceBuildCacheDeletionObjects(db,owned:owned,allowEnumeration:allowSourceCacheEnumeration,maximumObjects:objectLimit - objects.count,manualPurgeBudget:manualPurgeBudget) {
             if let path = item["relative_path"] as? String {
                 try checkNewObject(path)
                 objects[path] = item
@@ -451,18 +469,31 @@ extension CommandRouter {
         return Array(objects.values)
     }
 
-    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,preserveTicketMedia: Bool = false,allowSourceCacheEnumeration: Bool = true) throws -> TicketObjectDeletionPlan {
-        let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned,allowSourceCacheEnumeration:allowSourceCacheEnumeration)
+    func ticketObjectDeletionPlan(_ db: Database, owned: [(String,JSON)], remaining: [JSON], referenceTokens: [Data:Set<Data>]? = nil,historicalOwners: Set<Data> = [],backupObservation: TicketCleanupBackupObservation? = nil,candidateObjects: [JSON]? = nil,mediaAuthorityComplete: Bool? = nil,preserveTicketMedia: Bool = false,allowSourceCacheEnumeration: Bool = true,manualPurgeBudget: ManualTicketPurgeBudget? = nil) throws -> TicketObjectDeletionPlan {
+        let objects = try candidateObjects ?? ticketObjectDeletionObjects(db,owned:owned,allowSourceCacheEnumeration:allowSourceCacheEnumeration,manualPurgeBudget:manualPurgeBudget)
+        let check: () throws -> Void = {if let manualPurgeBudget {try manualPurgeBudget.readDeadline.check()}}
         let backup: StorageBackupRetentionIndex?
         if let backupObservation {backup = backupObservation.index}
+        else if let manualPurgeBudget {
+            backup = manualPurgeBudget.measuring("purge_backup_observation_ms") {observeTicketCleanupBackupRetentionIndex(db,objects:objects)}
+        }
         else {backup = observeTicketCleanupBackupRetentionIndex(db,objects:objects)}
         let references = try TicketObjectDeletionReferenceIndex(remaining,tokens:referenceTokens,historicalOwners:historicalOwners)
-        let workspaces = try ticketObjectDeletionWorkspaces(db,objects:objects)
-        let mediaComplete = mediaAuthorityComplete ?? ((try? ticketCleanupValidateMediaAuthority(db)) != nil)
+        let workspaces = try ticketObjectDeletionWorkspaces(db,objects:objects,check:check)
+        let mediaComplete: Bool?
+        if manualPurgeBudget != nil, backup?.cleanupFailureReason != nil {
+            // Backup authority already prevents any byte removal in this plan.
+            // Observe media before a later byte-removal attempt can proceed.
+            mediaComplete = mediaAuthorityComplete
+        } else {
+            mediaComplete = mediaAuthorityComplete ?? ((try? ticketCleanupValidateMediaAuthority(db,check:check)) != nil)
+        }
+        try check()
         var result: [JSON] = []
         for var item in objects {
+            try check()
             if item["state"] as? String == "pending" {
-                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:preserveTicketMedia)
+                let holds = try ticketObjectDeletionHolds(db,object:item,references:references,workspaces:workspaces,backup:backup,mediaAuthorityComplete:mediaComplete,preserveTicketMedia:preserveTicketMedia,check:check)
                 if !holds.isEmpty {item["state"] = "retained";item["reasons"] = holds.sorted()}
             }
             result.append(item)
@@ -484,7 +515,7 @@ extension CommandRouter {
         return try CleanupWorkspaceProtection(db,paths:paths,check:check)
     }
 
-    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, workspaces: CleanupWorkspaceProtection, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool,preserveTicketMedia: Bool = false,check: () throws -> Void = {}) throws -> Set<String> {
+    func ticketObjectDeletionHolds(_ db: Database, object: JSON, references: TicketObjectDeletionReferenceIndex, workspaces: CleanupWorkspaceProtection, backup: StorageBackupRetentionIndex?,mediaAuthorityComplete: Bool?,preserveTicketMedia: Bool = false,check: () throws -> Void = {}) throws -> Set<String> {
         try check()
         guard let relative = object["relative_path"] as? String,let sha = object["sha256"] as? String,let size = (object["size"] as? NSNumber)?.int64Value else {return ["identity_unavailable"]}
         var holds = try sourceBuildCacheDeletionHolds(db,object:object)
@@ -508,7 +539,7 @@ extension CommandRouter {
                 if attachment["media_cleanup_round_id"] is String || Self.isKeptMediaRoundAttachment(attachment) {holds.insert("media_trash_required")}
             }
         }
-        if !mediaAuthorityComplete {holds.insert("media_authority_unavailable")}
+        if mediaAuthorityComplete == false {holds.insert("media_authority_unavailable")}
         let absolute = root.appendingPathComponent(relative).path
         if workspaces.protects(absolute) {holds.insert("workspace_file")}
         var tokens = Set((object["owner_ids"] as? [String] ?? []).map {Data($0.utf8)})

@@ -885,19 +885,26 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
         // Drain caller-thread JSON/serialization and hook temporaries for each
         // request, including off-queue reads and deferred change replies.
         let received = ProcessInfo.processInfo.systemUptime
-        let read = autoreleasepool { () -> IndependentRequest? in
-            guard let connection, let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any],
-                  let method = object["method"] as? String,
-                  CommandReply.readMethods.contains(method) || method == "connection_bootstrap" else {return nil}
-            return IndependentRequest(object:object,method:method,peerPID:connection.processIdentifier)
+        let (read, work) = autoreleasepool { () -> (IndependentRequest?, String) in
+            guard let object = (try? JSONSerialization.jsonObject(with:request)) as? [String:Any],
+                  let method = object["method"] as? String else {return (nil, Self.commandQueueWork(""))}
+            let work = Self.commandQueueWork(method)
+            guard let connection, CommandReply.readMethods.contains(method) || method == "connection_bootstrap" else {return (nil, work)}
+            return (IndependentRequest(object:object,method:method,peerPID:connection.processIdentifier), work)
         }
         if let read {
             coordinator.requestReadQueue.async { [self] in
                 executeRead(read,rawRequest:request,received:received,reply:reply)
             }
         } else {
-            coordinator.queue.async { [self] in executeOnQueue(request,received:received,reply:reply) }
+            coordinator.queue.async(work: work) { [self] in executeOnQueue(request,received:received,reply:reply) }
         }
+    }
+
+    private static func commandQueueWork(_ method: String) -> String {
+        let valid = !method.isEmpty && method.utf8.count <= 80
+            && method.utf8.allSatisfy { (97...122).contains($0) || $0 == 95 }
+        return valid ? "command." + method : "command.invalid_method"
     }
 
     private func executeRead(_ request: IndependentRequest,rawRequest: Data,received: TimeInterval,
@@ -963,8 +970,7 @@ final class Peer: NSObject, ChecklistRPC, @unchecked Sendable {
                 coordinator.performNativeLifecycleWrite { [self] in executeOnQueue(request, received: received, reply: reply) }
                 return
             }
-            let label = method.utf8.count <= 80 && method.utf8.allSatisfy({ (97...122).contains($0) || $0 == 95 }) ? method : "invalid_method"
-            coordinator.queue.activity("command." + label) {
+            coordinator.queue.activity(Self.commandQueueWork(method)) {
             let timing = object?["diagnostics_timing"] as? Bool == true ? ServiceCallTiming(received:received, admission:admission) : nil
             timing?.queued(since: received, until: dequeued)
             if let timing { coordinator.timingDiagnosticsEnabled = true;CallTimingLog.write(["scope":"service_admission","request_id":timing.requestID,"method":object?["method"] as? String ?? "","received_uptime_s":received,"start_uptime_s":ProcessInfo.processInfo.systemUptime]) }

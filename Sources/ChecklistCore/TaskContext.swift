@@ -4,6 +4,17 @@ import GRDB
 extension CommandRouter {
     private var contextRecordTypes: [String] { ["message","request","attachment","attempt","review_request","review","finding","finding_resolution","manifest","checkpoint","direction_disposition","source_capture","source_execution","batch"] }
 
+    // Include the partial-index predicate explicitly so SQLite can seek the
+    // selected message IDs before ordering the newest receipts.
+    static let compactDirectionDeliveryWindowSQL = """
+        SELECT \(canonicalRecordColumns)
+        FROM records INDEXED BY records_delivery_message
+        WHERE type='delivery' AND project_id=CAST(? AS TEXT)
+          AND json_extract(data,'$.message_id') IS NOT NULL
+          AND json_extract(data,'$.message_id') COLLATE BINARY IN (SELECT value FROM json_each(?))
+        ORDER BY rowid DESC LIMIT 51
+        """
+
     func contextRecord(_ source: JSON, type: String, caller: Caller) -> JSON {
         var value = source
         for key in ["token_hash","claim_token","incarnation"] { value.removeValue(forKey:key) }
@@ -75,8 +86,14 @@ extension CommandRouter {
         let active = try (task["active_attempt_id"] as? String).map {try scoped(db,$0,pid,type:"attempt")}
         // Restore creation order within the bounded newest-note window before timestamp sorting.
         let messages = chronologicalMessages(try scopedTaskRows(db,type:"message",task:task,limit:11,descending:true).reversed().map {$0})
-        let directionIDs = try jsonString(directions.compactMap {$0["id"] as? String})
-        let deliveries = try self.fetchStoreRows(db,sql:"SELECT "+Self.canonicalRecordColumns+" FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT) AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 51",arguments:[Data(pid.utf8),directionIDs]).reversed().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        let deliveries: [JSON]
+        if directions.isEmpty {
+            deliveries = []
+        } else {
+            let directionIDs = try jsonString(directions.compactMap {$0["id"] as? String})
+            deliveries = try self.fetchStoreRows(db,sql:Self.compactDirectionDeliveryWindowSQL,arguments:[Data(pid.utf8),directionIDs])
+                .reversed().map {try GRDBRecordEnvelopeAdapter.decode($0).object}
+        }
         let next: String
         if !directions.isEmpty { next = "address_owner_directions" }
         else if try scopedTaskCount(db,type:"request",task:task,predicate:"json_extract(data,'$.state')='pending' AND json_extract(data,'$.blocking')=1") > 0 { next = "await_human_answer" }
@@ -116,7 +133,9 @@ extension CommandRouter {
         counts["blocking_findings"]=try scopedTaskCount(db,type:"finding",task:task,predicate:"json_extract(data,'$.state')='open' AND COALESCE(json_extract(data,'$.severity'),'')<>'advice'")
         counts["messages"]=messages.count<11 ? messages.count : try scopedTaskCount(db,type:"message",task:task)
         counts["attempts"]=attempts.count<limit+1 ? attempts.count : try scopedTaskCount(db,type:"attempt",task:task)
-        counts["direction_deliveries"]=try self.storeInt(db,sql:"SELECT COUNT(*) FROM records d JOIN records m ON m.type='message' AND m.project_id=d.project_id AND m.id=json_extract(d.data,'$.message_id') WHERE d.type='delivery' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL("m"))",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
+        // The direction query and the full count share the exact message
+        // predicate. No delivery can match when it returned no direction.
+        counts["direction_deliveries"] = directions.isEmpty ? 0 : try self.storeInt(db,sql:"SELECT COUNT(*) FROM records d JOIN records m ON m.type='message' AND m.project_id=d.project_id AND m.id=json_extract(d.data,'$.message_id') WHERE d.type='delivery' AND m.project_id=CAST(? AS TEXT) AND json_extract(m.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY AND json_extract(m.data,'$.origin')='human_ui' AND json_extract(m.data,'$.requires_action')=1 AND COALESCE(json_extract(m.data,'$.addressed'),0)=0 AND \(Self.unretractedDirectionSQL("m"))",arguments:[Data(pid.utf8),Data(tid.utf8)]) ?? 0
         result["counts"]=counts
         let truncatedSections: [Bool] = [directions.count > limit,findings.count > limit,requests.count > limit,reviews.count > limit,messages.count > 10,deliveries.count > 50]
         result["truncated"] = truncatedSections.contains(true)

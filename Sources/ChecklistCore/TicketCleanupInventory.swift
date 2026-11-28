@@ -38,6 +38,7 @@ struct TicketCleanupInventory {
     var holdDigests = Set<Data>()
     var prefixes = Set<String>()
     var retainedBytes = 0
+    var manualPurgeBudget: ManualTicketPurgeBudget? = nil
 
     static func strings(_ value: Any,_ visit: (String) -> Void,depth: Int = 0,budget: inout Int) throws {
         budget -= 1
@@ -88,14 +89,15 @@ struct TicketCleanupInventory {
     mutating func add(_ row: PurgeRow,bytes: Int,observation: TokenObservation) throws {
         guard tokens[row.key] == nil else {return}
         try checkAdmission(bytes:bytes)
+        try manualPurgeBudget?.retainPayload(bytes,tokens:observation.tokens)
         retainedBytes += bytes;rows.append(row);tokens[row.key] = observation.tokens
     }
     private func checkAdmission(bytes: Int) throws {
-        try Self.checkAdmission(rows:rows.count+1,retainedBytes:retainedBytes,rowBytes:bytes)
+        try Self.checkAdmission(rows:rows.count+1,retainedBytes:retainedBytes,rowBytes:bytes,checkRowCount:manualPurgeBudget == nil)
     }
-    static func checkAdmission(rows: Int,retainedBytes: Int,rowBytes: Int) throws {
+    static func checkAdmission(rows: Int,retainedBytes: Int,rowBytes: Int,checkRowCount: Bool = true) throws {
         guard rowBytes <= rowByteLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected cleanup record exceeds the 4 MiB payload limit; bytes retained.")}
-        guard rows <= rowLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the 4,096-record cleanup inventory limit; bytes retained.")}
+        guard !checkRowCount || rows <= rowLimit else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the 4,096-record cleanup inventory limit; bytes retained.")}
         guard rowBytes <= byteLimit - retainedBytes else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The selected ticket exceeds the 16 MiB cleanup inventory limit; bytes retained.")}
     }
     mutating func path(_ path: String,root: URL,prefix: Bool = false) {
@@ -220,17 +222,18 @@ extension CommandRouter {
         }
     }
 
-    func ticketCleanupInventory(_ db: Database,task: JSON,objectsForReferences: (([PurgeRow]) throws -> [JSON])? = nil) throws -> TicketCleanupInventory {
+    func ticketCleanupInventory(_ db: Database,task: JSON,manualPurgeBudget: ManualTicketPurgeBudget? = nil,objectsForReferences: (([PurgeRow]) throws -> [JSON])? = nil) throws -> TicketCleanupInventory {
         let tid = (try StoredRecord(task, family: "task").string("id")), pid = (try StoredRecord(task, family: "task").string("project_id"))
         let taskKey = Data(tid.utf8)
         let containers: Set<String> = ["project","session","profile","status","tag","policy_revision","project_context_revision","taxonomy_revision","group","batch","batch_claim","relation","task"]
         let parents = ["message_id","attempt_id","parent_attempt_id","request_id","review_request_id","manifest_id","membership_id","delegation_id","conversation_id","source_capture_id"]
-        var result = TicketCleanupInventory(),owned = Set<Data>()
+        var result = TicketCleanupInventory(manualPurgeBudget:manualPurgeBudget),owned = Set<Data>()
         // Ownership is transitive. A finite number of streaming rounds discovers
         // children even when a child precedes its parent in physical order.
         for depth in 0..<65 {
             let before = owned.count
             try streamTicketCleanupRows(db,fullPayloads:objectsForReferences != nil) {row,size in
+                try manualPurgeBudget?.readDeadline.check()
                 guard row.project == pid else {return}
                 let direct = row.type == "relation" && (row.value["source_task_id"] as? String).map {Data($0.utf8) == taskKey} == true
                 let eligible = !containers.contains(row.type) && !MediaRecordRegistry.families.contains(row.type) && row.type != "storage_hold" && !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind)
@@ -245,9 +248,12 @@ extension CommandRouter {
             if before == owned.count {break}
             guard depth < 64 else {throw CoreError("PURGE_LIMIT","Cleanup ownership depth exceeds its bound; bytes retained.")}
         }
-        for row in try mediaDoneCleanupHistory(db,task:task) {try result.add(row,bytes:jsonString(row.value).utf8.count) {row.value}}
+        try streamMediaDoneCleanupHistory(db,task:task,manualPurgeBudget:manualPurgeBudget) {row,bytes in
+            try result.add(row,bytes:manualPurgeBudget == nil ? jsonString(row.value).utf8.count : bytes) {row.value}
+        }
         result.needles = Set(result.rows.map(\.key)).union([Data(tid.utf8)])
         for row in result.rows {
+            try manualPurgeBudget?.readDeadline.check()
             if row.type == "attachment" {
                 for key in ["path","preview_path"] {if let p = row.value[key] as? String {result.path(p,root:root)}}
             }
@@ -260,11 +266,12 @@ extension CommandRouter {
                 }
                 if let cid = capture["id"] as? String {result.needles.insert(Data(cid.utf8))}
             }
-            if row.type == "source_execution",let path = try sourceBuildCachePath(db,execution:row.value) {result.path(path,root:root,prefix:true)}
+            if row.type == "source_execution",let path = try sourceBuildCachePath(db,execution:row.value,manualPurgeBudget:manualPurgeBudget) {result.path(path,root:root,prefix:true)}
         }
         // Digest-only typed holds also protect the selected bytes.
         var digests = Set<Data>()
         for row in result.rows {
+            try manualPurgeBudget?.readDeadline.check()
             var budget = 2000000
             try TicketCleanupInventory.strings(row.value,{s in if s.utf8.count == 64 {digests.insert(Data(s.utf8))}},budget:&budget)
         }
@@ -275,6 +282,7 @@ extension CommandRouter {
             result.objects(try objectsForReferences(result.rows),root:root)
         }
         try streamTicketCleanupRows(db,needles:result.needles,holdDigests:result.holdDigests,prefixes:result.prefixes,fullPayloads:true) {row,size in
+            try manualPurgeBudget?.readDeadline.check()
             // Deletion receipts are accounting, never reference authority. The
             // stream still validates their complete canonical payload first.
             guard !(row.type == "storage_job" && row.value["kind"] as? String == Self.ticketObjectDeletionKind) else {return}
@@ -302,7 +310,8 @@ extension CommandRouter {
 extension CommandRouter {
     /// Validate media roots and their declared dependencies by indexed lookup,
     /// rather than retaining every ordinary note/attachment in the store.
-    func ticketCleanupValidateMediaAuthority(_ db: Database) throws {
+    func ticketCleanupValidateMediaAuthority(_ db: Database,check: () throws -> Void = {}) throws {
+        try check()
         let types = (MediaRecordRegistry.families.union(["storage_job","storage_hold"])).sorted()
         let placeholders = types.map {_ in "?"}.joined(separator:",")
         // Known deletion receipts are accounting, never media roots. Their
@@ -318,6 +327,7 @@ extension CommandRouter {
         var dependencies: [Data:(envelope: DecodedEnvelope, bytes: Int)] = [:]
         var cachedBytes = 0
         while let root = try cursor.next() {
+            try check()
             try autoreleasepool {
                 var selected: [Data:DecodedEnvelope] = [:],pending: [String] = [],bytes = 0
                 func charge(_ count: Int) throws {
@@ -338,6 +348,7 @@ extension CommandRouter {
                 try charge((root["_envelope_data_bytes"] as Data).count)
                 try add(GRDBRecordEnvelopeAdapter.decode(root))
                 while let id = pending.popLast() {
+                    try check()
                     let key = Data(id.utf8)
                     if selected[key] != nil {continue}
                     if let cached = dependencies[key] {

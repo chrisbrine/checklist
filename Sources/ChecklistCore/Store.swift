@@ -31,6 +31,7 @@ public final class CommandRouter: @unchecked Sendable {
     private let preparationLock = NSLock()
     let root: URL
     private let gateFiles: StorageObjectFiles
+    private var walCheckpoint: WALCheckpointLane?
     let managedCapturePaths: [Data:String]
     let incarnation: String
     /// Registration provenance must bind to this store lifetime, including after restore.
@@ -54,6 +55,7 @@ public final class CommandRouter: @unchecked Sendable {
     /// waits until these snapshots finish; ordinary domain writes remain fenced.
     var mediaRoundDeletionPreparations: [Data:Set<String>] = [:]
     let commandOperations = CommandOperations()
+    let workClaimRecordChanges = WorkClaimRecordChanges()
     // Per-command/transaction state, accessed only on the sole writer connection.
     var taskReferenceFrame: TaskReferenceFrame?
     var managedAttachmentPreparation: ManagedAttachmentPreparation?
@@ -192,6 +194,13 @@ public final class CommandRouter: @unchecked Sendable {
         }
         if fixtureTrackEpicReferences { try dbQueue.writeWithoutTransaction { try epicReferenceIndex.install($0) } }
         try backupWrites.restore(root:root,incarnation:incarnation,admission:storageAdmission)
+        opened.queue.add(transactionObserver:workClaimRecordChanges)
+        if let serviceLease, let checkpoint = try? WALCheckpointLane(files:gateFiles,incarnation:incarnation,
+                                                                   admission:storageAdmission,serviceLease:serviceLease),
+           dbQueue.writeWithoutTransaction(work:"sqlite_checkpoint_lane_setup", { checkpoint.install(on:$0) }) {
+            walCheckpoint = checkpoint
+            checkpoint.request()
+        }
         backupWrites.resume(router:self)
     }
     static let canonicalRecordColumns = "id,project_id,type,revision,data,CAST(id AS BLOB) AS _envelope_id_bytes,CAST(project_id AS BLOB) AS _envelope_project_id_bytes,CAST(type AS BLOB) AS _envelope_type_bytes,CAST(data AS BLOB) AS _envelope_data_bytes"
@@ -264,7 +273,11 @@ public final class CommandRouter: @unchecked Sendable {
         } else {
             try executeStoreStatement(db,sql:"INSERT INTO records(id,project_id,type,revision,data) VALUES (CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,type=excluded.type,revision=excluded.revision,data=excluded.data",arguments:[Data(envelope.id.utf8),envelope.projectID.map { Data($0.utf8) },Data(envelope.type.utf8),envelope.revision,Data(raw.utf8)])
         }
-        invalidateTaskRecordSelection(db,type:type)
+        if type == "attempt", previous == nil, db.configuration.label != MediaPreparationOverlay.label, fixtureStoreStatement == nil {
+            includeInsertedAttemptInTaskRecordSelection(db,attempt:envelope.object,rowID:db.lastInsertedRowID)
+        } else {
+            invalidateTaskRecordSelection(db,type:type)
+        }
         if let previousType = previous?["type"] as String?,previousType != type {invalidateTaskRecordSelection(db,type:previousType)}
         recordTaskReferenceWrite(referenceWrite)
         if type == "task",let pid = envelope.projectID,let statusID = value["status_id"] as? String,
@@ -626,10 +639,10 @@ public final class CommandRouter: @unchecked Sendable {
         // checks the same reservation before creating or replaying a ticket.
         var firstDigest: String?
         if method != "task_create",!Self.readMethods.contains(method),let command = params["command_id"] as? String {
+            let digest = hash(Data((method + (try jsonString(params))).utf8))
             let waiting = storagePhaseStart()
             try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) { _ in
                 finishStoragePhase("object_gate_wait_ms",since:waiting)
-                let digest = hash(Data((method + (try jsonString(params))).utf8))
                 firstDigest = digest
                 try requirePendingExportIntent(command:command,digest:digest,caller:caller)
             }
@@ -659,7 +672,7 @@ public final class CommandRouter: @unchecked Sendable {
         }
         // CL-410 F6: with a reader pool, the recipient scans run after the writer and the object gate are free.
         var noticesAfterWriter = false
-        let write: (Database,ArchiveStoragePermit,PreparedManualTicketPurge?) throws -> JSON = {db,permit,preparedPurge in
+        let write: (Database,ArchiveStoragePermit,PreparedManualTicketPurge?,PreparedWorkClaimRecordSelection?) throws -> JSON = {db,permit,preparedPurge,preparedClaim in
             // Decode/encode temporaries belong to this command. Drain on the writer's thread;
             // a pool on the calling service queue cannot guarantee that lifetime.
             self.commandPreparation = preparation; self.inlineSourceCaptures = []; self.consumedSourceCaptures = []; self.exportPublications = []
@@ -675,7 +688,10 @@ public final class CommandRouter: @unchecked Sendable {
             defer { self.managedAttachmentPreparation = nil }
             var output: JSON = [:]
             let transactionStarted = storagePhaseStart()
-            do { try self.withValidatedDomainTransaction(db) {
+            let purgeDeadline = preparedPurge.map { _ in MaintenanceDeadline(seconds:ManualTicketPurgeBudget.writerSeconds) }
+            var beganPurgeTransaction = false
+            func transact() throws { try self.withValidatedDomainTransaction(db,deadline:purgeDeadline) {
+                beganPurgeTransaction = purgeDeadline != nil
                 let bodyStarted = storagePhaseStart()
                 defer {finishStoragePhase("domain_transaction_body_ms",since:bodyStarted)}
                 if !caller.isOwner,let pid = params["project_id"] as? String {
@@ -715,12 +731,17 @@ public final class CommandRouter: @unchecked Sendable {
                 var data: JSON
                 if method == "task_purge" {
                     // Same connection for both version reads. Check after the
-                    // writer transaction has obtained its snapshot, before
-                    // writing anything. An external WAL writer that races the
-                    // check also prevents SQLite from upgrading that snapshot.
+                    // writer transaction has obtained its lock, before writing
+                    // anything. The snapshot and transaction exclude WAL races.
                     guard let preparedPurge else {throw TicketPurgeSnapshotChanged()}
                     try preparedPurge.validate()
-                    data = try self.taskPurge(db,params,caller,prepared:preparedPurge.plan,expiredCommands:preparedPurge.expiredCommands)
+                    data = try self.taskPurge(db,params,caller,prepared:preparedPurge.plan,expiredCommands:preparedPurge.expiredCommands,writerDeadline:purgeDeadline)
+                } else if let preparedClaim {
+                    // Authorization and the original command receipt have
+                    // already established the writer's SQLite snapshot.
+                    data = try self.withPreparedWorkClaimRecordSelection(db,prepared:preparedClaim) {
+                        try self.dispatch(db,method:method,p:params,c:caller)
+                    }
                 } else {data = try self.dispatch(db,method:method,p:params,c:caller)}
                 if Self.triageStatusMethods.contains(method),let pid = params["project_id"] as? String { data["triage_effect"] = try self.triageCommandEffect(db,before:membershipBefore,project:pid,method:method) }
                 output = ["data":data,"event_cursor":try self.cursor(db,caller:caller,scope:try self.authorizationScope(db,caller))]
@@ -731,10 +752,21 @@ public final class CommandRouter: @unchecked Sendable {
                     try self.executeStoreStatement(db,sql:"INSERT INTO commands(principal,command_id,digest,result) VALUES (?,?,?,?)",arguments:[caller.principal,command,digest,try jsonString(durable)])
                 }
                 return .commit
-            }
+            } }
+            do {
+                if let purgeDeadline {try purgeDeadline.withSQLite(db,transact)}
+                else {try transact()}
                 finishStoragePhase("domain_transaction_ms",since:transactionStarted)
             } catch {
                 finishStoragePhase("domain_transaction_ms",since:transactionStarted)
+                if purgeDeadline != nil,
+                   error is MaintenanceStepDeferred || (error as? DatabaseError)?.resultCode == .SQLITE_INTERRUPT {
+                    throw ManualTicketPurgeBudget.writerLimit
+                }
+                if purgeDeadline != nil,!beganPurgeTransaction,let databaseError = error as? DatabaseError,
+                   [.SQLITE_BUSY,.SQLITE_LOCKED].contains(databaseError.resultCode) {
+                    throw CoreError("STORE_BUSY","Permanent ticket removal could not take the database writer. Retry the same command after the writer is free.")
+                }
                 // The failed read transaction has rolled back. Persist only its
                 // bounded availability observation in a separate transaction.
                 try? self.persistManagedAttachmentReadFailure(db,method:method,params:params,caller:caller,error:error)
@@ -757,18 +789,34 @@ public final class CommandRouter: @unchecked Sendable {
             }
             return self.commandManagedPathProjection(self.addingStorageMaintenanceNotice(output, warning: maintenanceWarning),caller:caller,command:params["command_id"] as? String)
         }
-        func commit(_ preparedPurge: PreparedManualTicketPurge?) throws -> JSON {
+        func commit(_ preparedPurge: PreparedManualTicketPurge? = nil,claim: PreparedWorkClaimRecordSelection? = nil) throws -> JSON {
             let waiting = storagePhaseStart()
             return try ArchiveStorageGate.withExclusive(root:root,files:gateFiles) {permit in
                 finishStoragePhase("object_gate_wait_ms",since:waiting)
+                let acquired = method == "task_purge" ? storagePhaseStart() : nil
+                defer {finishStoragePhase("object_gate_hold_ms",since:acquired)}
                 let writerQueued = storagePhaseStart()
                 return try dbQueue.writeWithoutTransaction {db in
                     finishStoragePhase("storage_writer_queue_ms",since:writerQueued)
-                    return try autoreleasepool {try write(db,permit,preparedPurge)}
+                    let writerAcquired = method == "task_purge" ? storagePhaseStart() : nil
+                    defer {finishStoragePhase("storage_writer_hold_ms",since:writerAcquired)}
+                    return try autoreleasepool {try write(db,permit,preparedPurge,claim)}
                 }
             }
         }
-        let writerOutput = try method == "task_purge" ? withManualTicketPurgePreparation(params,caller,commit:commit) : commit(nil)
+        let writerOutput: JSON
+        switch method {
+        case "task_purge":
+            writerOutput = try withManualTicketPurgePreparation(params,caller,observeStoragePhase:observeStoragePhase) {try commit($0)}
+        case "work_claim":
+            let preparedAt = storagePhaseStart()
+            writerOutput = try withWorkClaimRecordPreparation(params:params,caller:caller) {selection in
+                finishStoragePhase(selection == nil ? "claim_record_selection_fallback_ms" : "claim_record_selection_ms",since:preparedAt)
+                return try commit(claim:selection)
+            }
+        default:
+            writerOutput = try commit()
+        }
         guard noticesAfterWriter,let readers else { return writerOutput }
         return autoreleasepool { addingRecipientNotices(readers,output:writerOutput,params:params,caller:caller) }
     }
@@ -794,12 +842,20 @@ public final class CommandRouter: @unchecked Sendable {
         data["claim_token"] = token
         output["data"] = data
     }
+    func requireNamedStoreRoot() throws {
+        try gateFiles.requireNamedRoot(root)
+    }
     /// Closes the read-only connections before the writer, so the writer's close can
     /// checkpoint the WAL as the store's last connection. The lifecycle owner must
     /// first stop new work and finish all active commands/maintenance; this method
     /// does not establish that drain itself.
     public func closeStore() throws {
         epicReferenceIndex.stop()
+        if let walCheckpoint {
+            dbQueue.writeWithoutTransaction(work:"sqlite_checkpoint_lane_close") { walCheckpoint.remove(from:$0) }
+            try walCheckpoint.close()
+            self.walCheckpoint = nil
+        }
         try ticketCleanupReaders?.close()
         try readerPool.close()
         try dbQueue.close()

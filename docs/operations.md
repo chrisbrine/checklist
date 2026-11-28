@@ -215,13 +215,49 @@ the CLI's first timing stamp. A fresh process can therefore miss a one-second
 deadline before contacting Checklist. Measure the full wall time and keep the
 pre-main, IPC delivery and service queue intervals visible in the result.
 
-With the coordinator changes, the longest authenticated probe in the repeated
-32-client workload took 4.757 s at load 453.90 / 403.63 / 361.11. It spent 1.909 s
-before the first CLI stamp and 547 ms in the service across bootstrap and the
-status request. Round links waited 0.819 ms at p95 on their worker queue,
-190 ms at the object gate and 5.9 ms in the SQLite writer queue. Those
-measurements describe this workload. Later calls depend on the backlog and
-host load.
+Build 432 repeated the workload twice on 28 November 2026. Both bursts kept
+26–32 client attachment operations in flight and the host's median CPU busy
+was 100%. Load rose from 59.36 / 47.51 / 47.21 to 276.09 / 204.93 / 128.04
+between 04:06:57 and 04:14:24 UTC. Of 1,787 probes per route, 202 fresh
+`service status` calls and 216 fresh `service_info` calls exceeded one second.
+For those slow replies, the longest service intervals were 62 ms and 224 ms
+respectively. Median CLI CPU times were 41.2 ms and 31.6 ms. Median ratios
+of wall time to CLI CPU time were 31.1× and 40.6×.
+
+The second burst ran from 04:45:59 to 04:52:20 UTC, with load rising from
+143.40 / 163.05 / 147.88 to 473.17 / 333.28 / 232.50. Fresh CLI `service_info`
+returned in 994 ms at p95. Of 1,524 replies, 73 exceeded one second. Those
+73 used a median of 26.0 ms of CLI CPU, with a maximum of 35.6 ms and a
+median wall-to-CPU ratio of 44.8×. The largest service interval across
+bootstrap and the command was 69.7 ms. Aggregate service queue and handler
+time peaked at 6.8 ms and 16.8 ms respectively. The companion `service status`
+stream returned in 984 ms at p95. Its 71 overages in 1,524 replies had a maximum
+service time of 10.6 ms, median CLI CPU time of 34.1 ms and a median
+wall-to-CPU ratio of 36.3×.
+
+A fresh CLI process on a fully busy host can take more than one second
+before sending its first request or after receiving its last reply. The
+build 432 service intervals above stayed under the 250 ms step limit even
+on slow replies. Low process CPU and high host load point to scheduling
+delay. The off-CPU interval can also include IPC and client-side waits.
+Keep full wall time and the measured phase boundaries when comparing runs.
+
+In the second build 432 replay, `media_round_link_task` wall time was
+84.6/331.9 ms at p50/p95 for 100 edits before the attachment burst and
+386.2/876.5 ms for 851 burst edits. The pre-burst edits ran from 04:45:46.553
+to 04:45:57.953 UTC. Load rose from 141.50 / 163.39 / 147.82 to 143.40 /
+163.05 / 147.88, with 99.4% median CPU busy. Service time across both CLI
+requests rose from 19.9/32.3 ms to 30.5/65.0 ms (1.53×/2.01×). Burst p95
+waits were 0.129 ms on the worker
+queue, 20.4 ms at the object gate and 3.16 ms in the SQLite writer queue.
+Their observed maxima were 1.39 ms, 129.8 ms and 16.0 ms. The writer
+transaction itself took 15.9 ms at p95 under the burst. Median CLI CPU rose
+from 22.3 ms to 23.7 ms. Median wall time outside the service rose from
+62.4 ms to 349.6 ms. The part outside measured IPC after subtracting all
+CLI CPU rose from 24.7 ms to 268.1 ms at the median. This interval includes
+host scheduling and any remaining client or launcher waits. The round-link
+reply waits for earlier admitted links and for storage admission. The wait
+varies with the backlog and the host's load.
 
 `script/measure_cli_latency.py` starts at least 50 fresh CLI processes and saves
 complete replies, timing lines, process lifetimes and host load outside the source

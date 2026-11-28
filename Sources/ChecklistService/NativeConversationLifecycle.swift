@@ -159,7 +159,7 @@ extension Coordinator {
         nativeLifecycle.observationWaitingForClosure = true
         nativeLifecycle.closureQueue.async { [self] in
             let outcome = applyNativeClosure(work)
-            queue.async { [self] in
+            queue.async(work: "native_closure_finish") { [self] in
                 finishNativeBootstrapWork {
                     do { _ = try finishNativeClosure(work,outcome:outcome) }
                     catch { recordNativeClosureFailure(error,key:work.key) }

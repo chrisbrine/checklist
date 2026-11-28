@@ -182,7 +182,13 @@ extension CommandRouter {
             let result: JSON
             do {
                 result = try StorageSnapshotRetention.withCapture(root:root) { retention in
-                    try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
+                    do {
+                        return try createStorageBackup(params:params,caller:caller,budget:budget,retention:retention)
+                    } catch {
+                        let reported = budget.reporting(error)
+                        quarantineFailedBackupPublication(params:params,caller:caller,error:reported,retention:retention)
+                        throw reported
+                    }
                 }
             } catch {
                 let reported = budget.reporting(error)
@@ -193,7 +199,6 @@ extension CommandRouter {
             return result
         } catch {
             let reported = budget.reporting(error)
-            quarantineFailedBackupPublication(params:params,caller:caller,error:reported)
             guard let failure = reported as? StorageSnapshotFailure else {throw reported}
             let code: String, message: String
             switch failure {

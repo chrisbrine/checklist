@@ -19,16 +19,17 @@ final class CommandQueueBusyPeriodsTests: XCTestCase {
         let root = try root(); defer { retire(root) }
         let url = root.appendingPathComponent("busy.json")
         let queue = ServiceCommandQueue(logURL: url)
-        queue.sync {
+        queue.async(work: "command.synthetic") {
             queue.activity("synthetic_held_closure") { Thread.sleep(forTimeInterval: 1.02) }
         }
+        queue.sync {}
         queue.busyPeriods.flush()
         let periods = try JSONDecoder().decode([CommandQueueBusyPeriods.Period].self, from: Data(contentsOf: url))
         let period = try XCTUnwrap(periods.last)
         XCTAssertEqual(periods.count, 1)
         XCTAssertNotNil(ISO8601DateFormatter.withFractionalSeconds.date(from: period.started_at))
         XCTAssertGreaterThan(period.duration_ms, 1000)
-        XCTAssertTrue(period.work.contains("testRealOccupiedQueuePeriod"))
+        XCTAssertEqual(period.work, "command.synthetic")
         XCTAssertGreaterThan(try XCTUnwrap(period.activities_ms["synthetic_held_closure"]), 1000)
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)

@@ -78,14 +78,15 @@ extension CommandRouter {
         }
 
         let previewCutoff = StoredClock.shared.string(from: now.addingTimeInterval(-Self.cleanupPreviewRetention))
+        let previewSelection = RoutineCanonicalRecordRetirement.cleanupPreview.selectionSQL
         let previews = try reader.read { db in
-            try Int64.fetchAll(db, sql: Self.routineCleanupPreviewSQL + " LIMIT ?", arguments: [previewCutoff, Self.pruneBatch])
+            try Int64.fetchAll(db, sql: previewSelection + " LIMIT ?", arguments: [previewCutoff, Self.pruneBatch])
         }
         if !previews.isEmpty {
             counts.cleanupPreviews = try apply("routine_prune_cleanup_previews") { db in
                 // Re-evaluate eligibility for only the selected row IDs. A preview
                 // refreshed during the reader scan keeps its current lease.
-                let sql = Self.routineCleanupPreviewSQL + " AND p.rowid IN (\(placeholders(previews.count)))"
+                let sql = previewSelection + " AND p.rowid IN (\(placeholders(previews.count)))"
                 try db.execute(sql: "DELETE FROM records WHERE rowid IN (\(sql))",
                                arguments: StatementArguments([previewCutoff]) + StatementArguments(previews))
                 return db.changesCount
@@ -99,15 +100,6 @@ extension CommandRouter {
         }
         return counts
     }
-
-    private static let routineCleanupPreviewSQL = """
-        SELECT p.rowid FROM records p
-        LEFT JOIN records t ON t.type='task' AND t.id=CASE WHEN json_valid(p.data) THEN json_extract(p.data,'$.task_id') END
-        WHERE p.type='cleanup_preview' AND CASE WHEN json_valid(p.data) THEN
-          (t.id IS NULL OR json_extract(p.data,'$.task_revision') <> CASE WHEN json_valid(t.data) THEN json_extract(t.data,'$.revision') END
-           OR COALESCE(json_extract(p.data,'$.created_at'),'9999') < ?)
-        ELSE 0 END
-        """
 
     private struct PruneToken: Equatable {
         let protection: Int64

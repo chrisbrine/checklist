@@ -29,7 +29,14 @@ extension CommandRouter {
         let attention = try selectedTaskActiveAttention(db,task:task)
         var result = assembledTaskProjection(task,status:status,activeAttention:attention,tags:tags,relation:relation)
         if let cleanedOriginalCount {result["cleaned_original_count"] = cleanedOriginalCount}
-        else {result["cleaned_original_count"] = try self.storeInt(db,sql:"SELECT COUNT(*) FROM records WHERE type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'",arguments:[pid,tid]) ?? 0}
+        else {
+            let selected = try selectedTaskRecordIDs(db,type:"attachment",task:task)
+            let scope = "type='attachment' AND project_id=? AND json_extract(data,'$.task_id')=? AND json_extract(data,'$.availability')='original_cleaned'"
+            let source = selected == nil ? "records WHERE " : "records NOT INDEXED WHERE rowid IN (SELECT value FROM json_each(?)) AND "
+            var arguments: StatementArguments = [pid,tid]
+            if let selected { arguments = [try jsonString(selected),pid,tid] }
+            result["cleaned_original_count"] = try storeInt(db,sql:"SELECT COUNT(*) FROM " + source + scope,arguments:arguments) ?? 0
+        }
         return try withStatusReason(db,task:result)
     }
     func selectedTaskPrerequisites(_ db: Database, task: JSON) throws -> [JSON] {

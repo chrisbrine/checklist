@@ -50,7 +50,14 @@ public actor Bridge {
         blockingExecutor.asUnownedSerialExecutor()
     }
 
-    private var client: any BridgeClient
+    private var client: any BridgeClient {
+        didSet { invalidateCatalog() }
+    }
+    // Only the advertised names are needed for dispatch. The service still
+    // verifies the current caller, grants and schema on the actual command.
+    private var catalogNames: Set<String>?
+    private var catalogLoad: Task<Set<String>, Error>?
+    private var catalogGeneration = 0
     private let environment: BridgeEnvironment
     private let expectedSession: String?
     private let automatic: Bool
@@ -60,7 +67,7 @@ public actor Bridge {
     private let installation: String
     private var delegating = false
     private var launchState = ShimLaunchState.current
-    private var updateNoticePending = false
+    private var catalogNoticePending = false
     private var bootstrapResponse: Value?
     /// Selected by Codex wire metadata or the native context of a restart-refused
     /// bootstrap. It never changes, and later calls must identify this same thread.
@@ -544,7 +551,20 @@ public actor Bridge {
             if setupContext != nil { tools.append(Self.workspaceProjectCreate) }
             return tools
         }
-        return try Self.catalogTools(client)
+        let tools = try Self.catalogTools(client)
+        if command == "mcp" {
+            let names = Set(tools.map(\.name))
+            if let catalogNames, catalogNames != names { catalogNoticePending = true }
+            catalogNames = names
+            catalogLoad = nil
+        }
+        return tools
+    }
+
+    private func invalidateCatalog() {
+        catalogNames = nil
+        catalogLoad = nil
+        catalogGeneration += 1
     }
 
     private static func catalogTools(_ client: any BridgeClient) throws -> [Tool] {
@@ -573,7 +593,7 @@ public actor Bridge {
     /// What a tool call needs from actor state, captured so its blocking service
     /// request or child CLI run happens off the actor's serial queue (CL-352).
     private enum CallRoute: Sendable {
-        case service(any BridgeClient, checksCatalog: Bool)
+        case service(any BridgeClient)
         case delegate(DelegateTarget)
     }
 
@@ -583,7 +603,40 @@ public actor Bridge {
         if delegating { return .delegate(delegateTarget()) }
         guard startupError == nil, serviceError == nil, codexRestartError == nil, registryStart.error == nil, registryStart.connection == nil,
               connectionNotice == nil, setupNotice == nil, setupContext == nil else { return nil }
-        return .service(client, checksCatalog: command != "call")
+        return .service(client)
+    }
+
+    private static func requireAdvertisedTool(_ name: String, in names: Set<String>) throws {
+        guard names.contains(name) else {
+            throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
+        }
+    }
+
+    private func toolCallRoute(_ name: String) async throws -> CallRoute? {
+        while true {
+            let route = try callRoute()
+            guard case .service(let client)? = route else { return route }
+            try Self.refuseHookOnly(name)
+            if command == "call" { return route }
+            if let catalogNames {
+                try Self.requireAdvertisedTool(name, in: catalogNames)
+                return route
+            }
+            // Some clients call a tool before listing. Share that one discovery
+            // and let later requests enter the actor while it is in flight.
+            let generation = catalogGeneration
+            let load = catalogLoad ?? Task {
+                try await Self.offload { Set(try Self.catalogTools(client).map(\.name)) }
+            }
+            catalogLoad = load
+            let result = await load.result
+            // A new binding, explicit list or replacement may have arrived
+            // during discovery. Recheck the route and request identity.
+            if generation == catalogGeneration, catalogNames == nil, !delegating {
+                if catalogLoad == load { catalogLoad = nil }
+                catalogNames = try result.get()
+            }
+        }
     }
 
     /// The MCP tool call. Several calls of one conversation are in flight at once and
@@ -592,24 +645,30 @@ public actor Bridge {
     /// notices are applied on the actor. The arguments, including command_id, pass unchanged.
     public nonisolated func concurrentCall(_ name: String, _ arguments: Value) async throws -> Value {
         if name == OperationWait.toolName, try await callRoute() != nil { return try await operationWaitTool(arguments) }
-        guard let route = try await callRoute() else { return try await call(name, arguments) }
-        let reply: Data
+        var route: CallRoute?
         do {
+            route = try await toolCallRoute(name)
+            guard let route else { return try await call(name, arguments) }
             switch route {
             case .delegate(let target): return try await Self.offload { try Self.runDelegateCall(target, name, arguments) }
-            case .service(let client, let checksCatalog): reply = try await Self.offload { try Self.serviceCall(client, checksCatalog: checksCatalog, name, arguments) }
+            case .service(let client):
+                let reply = try await Self.offload { try Self.serviceCall(client, name, arguments) }
+                return try await finishServiceCall(reply)
             }
         } catch let error as ChecklistError where error.code == ClientUpdateRequired.code {
-            if case .service = route, await refuseOutdatedClient() { return try await call(name, arguments) }
+            if case .delegate? = route { throw error }
+            if await refuseOutdatedClient() { return try await call(name, arguments) }
             throw Self.reconnectGuidance(error)
-        } catch { throw Self.reconnectGuidance(error) }
-        return try await finishServiceCall(reply)
+        } catch {
+            if case .service? = route { throw await serviceCallError(error, name: name) }
+            throw Self.reconnectGuidance(error)
+        }
     }
 
     /// One read of a wait loop (CL-364), with its own reply budget and no catalog check.
     /// It runs on a dispatch worker, so other calls of this conversation continue.
     nonisolated func statusRead(_ name: String, _ arguments: Value, budget: TimeInterval) async throws -> Value {
-        guard case .service(let client, _)? = try await callRoute() else { return try await concurrentCall(name, arguments) }
+        guard case .service(let client)? = try await callRoute() else { return try await concurrentCall(name, arguments) }
         do {
             let reply = try await Self.offload { () throws -> Data in
                 guard let parameters = try jsonObject(arguments) as? [String: Any] else { throw BridgeError("Tool arguments must be a JSON object.") }
@@ -627,15 +686,27 @@ public actor Bridge {
         return try await readResource(uri)
     }
 
-    private static func serviceCall(_ client: any BridgeClient, checksCatalog: Bool, _ name: String, _ arguments: Value) throws -> Data {
-        try refuseHookOnly(name)
-        if checksCatalog, try !catalogTools(client).contains(where: { $0.name == name }) {
-            throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
-        }
+    private static func serviceCall(_ client: any BridgeClient, _ name: String, _ arguments: Value) throws -> Data {
         guard let parameters = try jsonObject(arguments) as? [String: Any] else {
             throw BridgeError("Tool arguments must be a JSON object.")
         }
         return try jsonData(client.call(name, parameters))
+    }
+
+    private func serviceCallError(_ error: Error, name: String) -> Error {
+        guard command == "mcp", let failure = error as? ChecklistError else { return Self.reconnectGuidance(error) }
+        let noLongerAdvertised = (failure.code == "FORBIDDEN" && failure.message == "This command is not available to this connection role.")
+            || (failure.code == "SETUP_REQUIRED" && name != "service_info")
+        if noLongerAdvertised || failure.code == "ASSISTANT_GRANTS_CHANGED" {
+            if catalogNames != nil {
+                invalidateCatalog()
+                catalogNoticePending = true
+            }
+        }
+        if noLongerAdvertised {
+            return BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
+        }
+        return Self.reconnectGuidance(error)
     }
 
     private func finishServiceCall(_ reply: Data) throws -> Value {
@@ -661,15 +732,11 @@ public actor Bridge {
     private func localCall(_ name: String, _ arguments: Value) throws -> Value {
         try Self.refuseHookOnly(name)
         if let error = startupError ?? serviceError ?? codexRestartError ?? registryStart.error, !ClaudeRegistryStart.limitedToolNames.contains(name) { throw error }
-        // Direct CLI calls already bootstrap/verify. The service checks its current
-        // caller, catalog/schema and grants for the actual command. Fetching and
-        // decoding the entire catalog here adds a serialized round trip per call.
-        // Keep local setup restrictions and MCP's advertised-tool checks.
+        // Direct CLI calls already bootstrap and verify. Keep local restrictions
+        // for setup and for MCP calls that need the serial connection path.
         if command != "call" || setupNotice != nil {
-            let available = try localTools()
-            guard available.contains(where: { $0.name == name }) else {
-                throw BridgeError("METHOD_UNAVAILABLE: This tool is unavailable to the paired connection: \(name)")
-            }
+            let names = try catalogNames ?? Set(localTools().map(\.name))
+            try Self.requireAdvertisedTool(name, in: names)
         }
         guard let parameters = try jsonObject(arguments) as? [String: Any] else {
             throw BridgeError("Tool arguments must be a JSON object.")
@@ -734,13 +801,17 @@ public actor Bridge {
         guard let update = environment.shimUpdate else { return }
         launchState = update.check(force)
         if refused || launchState != .current {
-            if !delegating { delegating = true; updateNoticePending = true }
+            if !delegating {
+                delegating = true
+                invalidateCatalog()
+                catalogNoticePending = true
+            }
         }
     }
 
     func takeUpdateNotice() -> Bool {
-        guard updateNoticePending || creationNoticePending else { return false }
-        updateNoticePending = false;creationNoticePending = false
+        guard catalogNoticePending || creationNoticePending else { return false }
+        catalogNoticePending = false;creationNoticePending = false
         return true
     }
 

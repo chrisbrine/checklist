@@ -279,19 +279,46 @@ extension CommandRouter {
     /// Only the archived round's exact retained handoff records are historical
     /// byte owners. They never become ticket-purge record-removal ownership.
     func mediaDoneCleanupHistory(_ db: Database,task: JSON) throws -> [PurgeRow] {
+        var history: [PurgeRow] = []
+        try streamMediaDoneCleanupHistory(db,task:task) {row,_ in history.append(row)}
+        return history
+    }
+
+    func streamMediaDoneCleanupHistory(_ db: Database,task: JSON,manualPurgeBudget: ManualTicketPurgeBudget? = nil,_ body: (PurgeRow,Int) throws -> Void) throws {
         let tid = try StoredRecord(task,family:"task").string("id"),pid = try StoredRecord(task,family:"task").string("project_id")
-        let rows = try Row.fetchAll(db,sql:"SELECT " + Self.canonicalRecordColumns + " FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL() + " AND json_extract(data,'$.state')='archived' AND (json_extract(data,'$.done_task_cleanup.task_id')=CAST(? AS TEXT) COLLATE BINARY OR EXISTS (SELECT 1 FROM json_each(records.data,'$.done_task_cleanup.managed_attachment_ids') a JOIN records f ON f.id=a.value AND f.type='attachment' AND f.project_id=records.project_id WHERE json_extract(f.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY))",arguments:[Data(pid.utf8),Data(tid.utf8),Data(tid.utf8)])
+        let rows = try Row.fetchCursor(db,sql:"SELECT " + Self.canonicalRecordColumns + ",octet_length(data) AS handoff_bytes FROM records WHERE type='media_round' AND project_id=CAST(? AS TEXT) AND " + MediaRoundDeletionGraph.visibleSQL() + " AND json_extract(data,'$.state')='archived' AND (json_extract(data,'$.done_task_cleanup.task_id')=CAST(? AS TEXT) COLLATE BINARY OR EXISTS (SELECT 1 FROM json_each(records.data,'$.done_task_cleanup.managed_attachment_ids') a JOIN records f ON f.id=a.value AND f.type='attachment' AND f.project_id=records.project_id WHERE json_extract(f.data,'$.task_id')=CAST(? AS TEXT) COLLATE BINARY))",arguments:[Data(pid.utf8),Data(tid.utf8),Data(tid.utf8)])
         var ids = Set<String>()
-        for row in rows {
-            let round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object,cleanup = round["done_task_cleanup"] as? JSON ?? [:]
-            if cleanup["state"] as? String == "deferred" {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff is deferred; originals retained.")}
-            ids.formUnion(strings(cleanup,"record_ids"))
+        while let row = try rows.next() {
+            try autoreleasepool {
+                if let manualPurgeBudget {
+                    try manualPurgeBudget.readDeadline.check()
+                    guard (row["handoff_bytes"] as Int) <= TicketCleanupInventory.rowByteLimit else {
+                        throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected media handoff exceeds the 4 MiB payload limit; bytes retained.")
+                    }
+                }
+                let round = try GRDBRecordEnvelopeAdapter.decode(row,expectedType:"media_round").object,cleanup = round["done_task_cleanup"] as? JSON ?? [:]
+                if cleanup["state"] as? String == "deferred" {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff is deferred; originals retained.")}
+                for id in strings(cleanup,"record_ids") where !ids.contains(id) {
+                    try manualPurgeBudget?.retain(128 + 2 * id.utf8.count)
+                    ids.insert(id)
+                    guard manualPurgeBudget != nil || ids.count <= TicketCleanupInventory.rowLimit else {
+                        throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff exceeds the cleanup inventory; bytes retained.")
+                    }
+                }
+            }
         }
-        guard ids.count <= 4096 else {throw CoreError("CLEANUP_INVENTORY_LIMIT","The media handoff exceeds the cleanup inventory; bytes retained.")}
-        return try ids.sorted().map {id in
-            let value = try record(db,id),type = try String.fetchOne(db,sql:"SELECT type FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)]) ?? ""
-            guard value["project_id"] as? String == pid,MediaRecordRegistry.families.contains(type) || ["storage_job","storage_hold"].contains(type) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A media cleanup history record is unavailable.")}
-            return PurgeRow(id:id,type:type,project:pid,value:value)
+        for id in ids.sorted() {
+            try autoreleasepool {
+                try manualPurgeBudget?.readDeadline.check()
+                let header = try Row.fetchOne(db,sql:"SELECT type,octet_length(data) AS payload_bytes FROM records WHERE id=CAST(? AS TEXT)",arguments:[Data(id.utf8)])
+                let size: Int = header?["payload_bytes"] ?? 0
+                if manualPurgeBudget != nil,size > TicketCleanupInventory.rowByteLimit {
+                    throw CoreError("CLEANUP_INVENTORY_LIMIT","A selected media history record exceeds the 4 MiB payload limit; bytes retained.")
+                }
+                let value = try record(db,id),type: String = header?["type"] ?? ""
+                guard value["project_id"] as? String == pid,MediaRecordRegistry.families.contains(type) || ["storage_job","storage_hold"].contains(type) else {throw CoreError("MEDIA_CAPTURE_INCOMPLETE","A media cleanup history record is unavailable.")}
+                try body(PurgeRow(id:id,type:type,project:pid,value:value),size)
+            }
         }
     }
 }

@@ -69,6 +69,35 @@ final class OverviewReadOptimizationTests: XCTestCase {
         }
     }
 
+    func testCompactDirectionDeliveryWindowSeeksExactMessagesAndKeepsRowOrder() throws {
+        let memory = try DatabaseQueue()
+        try memory.write { db in
+            try db.execute(sql: SchemaMigrations.baselineSQL)
+            try db.execute(sql: SchemaMigrations.deliveryLookupIndexSQL)
+            let references: [Any] = ["first", "second", "0", 0, "é", "e\u{301}", NSNull(), ["not": "an id"]]
+            for index in 0..<640 {
+                let family = index.isMultiple(of: 11) ? "message" : "delivery"
+                let project = index.isMultiple(of: 7) ? "other" : "selected"
+                let reference = references[index % references.count]
+                let data = try jsonString(index.isMultiple(of: 19) ? [:] : ["message_id": reference])
+                try db.execute(sql:"INSERT INTO records VALUES(?,?,?,1,?)",arguments:["record-\(index)",project,family,data])
+            }
+            let old = "SELECT " + CommandRouter.canonicalRecordColumns
+                + " FROM records WHERE type='delivery' AND project_id=CAST(? AS TEXT)"
+                + " AND json_extract(data,'$.message_id') IN (SELECT value FROM json_each(?)) ORDER BY rowid DESC LIMIT 51"
+            let new = CommandRouter.compactDirectionDeliveryWindowSQL
+            for ids in [[], ["first"], ["second", "0"], ["é", "e\u{301}"], ["unrelated"], ["first", "second", "first"]] {
+                let arguments: StatementArguments = [Data("selected".utf8), try jsonString(ids)]
+                let expected = try Row.fetchAll(db,sql:old,arguments:arguments).map { $0["id"] as String }
+                let actual = try Row.fetchAll(db,sql:new,arguments:arguments).map { $0["id"] as String }
+                XCTAssertEqual(actual,expected)
+            }
+            let plan = try Row.fetchAll(db,sql:"EXPLAIN QUERY PLAN " + new,arguments:["selected","[\"first\"]"])
+                .map { $0["detail"] as String }.joined(separator:"\n")
+            XCTAssertTrue(plan.contains("records_delivery_message (project_id=? AND <expr>=?)"),plan)
+        }
+    }
+
     func testReadOnlyBatchClaimProjectionProfile() throws {
         try QualificationSuite.requireEnabled()
         guard let path = ProcessInfo.processInfo.environment["CHECKLIST_READ_ONLY_DATABASE"],
@@ -434,6 +463,9 @@ extension CoreTests {
                 for key in ["unresolved_directions","unresolved_findings","pending_requests","pending_reviews","attempts","blocking_findings"] {XCTAssertEqual(counts[key] as? Int,familyCount,"\(caseIndex):\(key)")}
                 XCTAssertEqual(counts["messages"] as? Int,count)
                 XCTAssertEqual(counts["direction_deliveries"] as? Int,0)
+                if !allFamilies {
+                    XCTAssertFalse(statements.contains { $0.contains("records_delivery_message") || $0.contains("FROM records d JOIN records m") })
+                }
                 XCTAssertEqual(context["truncated"] as? Bool,count>10)
                 XCTAssertEqual(context["next_action"] as? String,allFamilies ? "address_owner_directions" : "claim_work")
                 let recent = try XCTUnwrap(context["recent_messages"] as? [JSON])

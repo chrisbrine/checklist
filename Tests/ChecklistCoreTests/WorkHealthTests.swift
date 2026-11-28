@@ -146,6 +146,56 @@ extension EvidenceAuthorityTests {
         XCTAssertEqual(first["deadline"] as? String,second["deadline"] as? String)
         XCTAssertEqual(try healthRows("message",task:t).count,1)
     }
+    func testWorkHealthUnchangedOpenRequestDoesNotRewriteRecords() throws {
+        let p = try project(), t = try ready(p), worker = try native(p,"health-unchanged-request",domain:"health-unchanged-request")
+        let attempt = try claim(p,t,caller:worker), firstCheck = Date()
+        try ageHealthAttempt(attempt,by:1300)
+        try checkHealth(at:firstCheck)
+        let messageID = try XCTUnwrap(health(p,t)["request_id"] as? String)
+        func requestBytes() throws -> Data {
+            try router.dbQueue.read { db in
+                try XCTUnwrap(Data.fetchOne(db,sql:"SELECT CAST(data AS BLOB) FROM records WHERE id=?",arguments:[messageID]))
+            }
+        }
+        let original = try requestBytes()
+        let writes = LockedTestState<[String]>([])
+        try router.dbQueue.read { db in
+            db.trace { event in
+                if case .statement(let statement) = event, statement.expandedSQL.hasPrefix("INSERT INTO records(") {
+                    writes.withLock { $0.append(statement.expandedSQL) }
+                }
+            }
+        }
+        defer { try? router.dbQueue.read { $0.trace(options:[]) } }
+
+        // The previous tick saved the still-open request even without a change.
+        try healthWrite { db in
+            var request = try router.record(db,messageID,type:"message")
+            request["health_request"] = try XCTUnwrap(request["health_request"] as? JSON)
+            try router.save(db,request,type:"message")
+        }
+        XCTAssertFalse(writes.snapshot.isEmpty)
+        XCTAssertEqual(try requestBytes(),original)
+        writes.withLock { $0 = [] }
+        for offset in [1.0, 600.0, 1199.0] {
+            let result = try router.runWorkHealthChecks(at:firstCheck.addingTimeInterval(offset))
+            XCTAssertEqual(result["inspected"] as? Int,1)
+            XCTAssertEqual(result["changed"] as? Int,0)
+            XCTAssertEqual(try requestBytes(),original)
+        }
+        XCTAssertTrue(writes.snapshot.isEmpty,"Waiting checks leave the main record store unwritten")
+
+        try checkHealth(at:firstCheck.addingTimeInterval(1202))
+        XCTAssertEqual(try health(p,t)["state"] as? String,"no_response")
+        XCTAssertEqual(try requestBytes(),original,"The deadline notice leaves the request open for a late reply")
+        writes.withLock { $0 = [] }
+        try checkHealth(at:firstCheck.addingTimeInterval(1300))
+        XCTAssertTrue(writes.snapshot.isEmpty,"Repeated no-response checks leave the main record store unwritten")
+
+        let reply = try respondHealth(p,t,request:messageID,caller:worker)
+        XCTAssertEqual(reply["outcome"] as? String,"resumed")
+        XCTAssertNotEqual(try requestBytes(),original,"The actual outcome still updates the correlated request")
+    }
     func testWorkHealthLivenessMetadataAndRepeatedCheckpointDoNotAdvanceProgress() throws {
         let p = try project(), t = try ready(p), w = try native(p,"health-live",domain:"health-L"), a = try claim(p,t,caller:w)
         var checkpoint = auth(p,a); checkpoint["progress"] = "Working on the parser"
@@ -263,6 +313,32 @@ extension EvidenceAuthorityTests {
         let state = try health(p,t)
         XCTAssertNotNil(state["request_id"]);XCTAssertTrue((state["known_waits"] as? [JSON] ?? []).contains { $0["kind"] as? String == "dependency" })
         XCTAssertTrue(try healthRelays(w).isEmpty)
+    }
+    func testWorkHealthPreparedRelayUsesCurrentPrerequisitesAndMatchesLegacyDecision() throws {
+        let p = try project(), prerequisite = try ready(p)
+        for required in [false,true] {
+            let t = try ready(p), session = "health-dependency-race-\(required)"
+            let worker = try native(p,session,domain:session)
+            let attempt = try claim(p,t,caller:worker)
+            try ageHealthAttempt(attempt,by:1300)
+            XCTAssertTrue((try health(p,t)["known_waits"] as? [JSON] ?? []).isEmpty)
+            let legacyAllowsRelay = LockedTestState<Bool?>(nil)
+            router.workHealthPreparationProbe = { [self] in
+                try healthWrite { db in
+                    try router.save(db,["id":uuid(),"project_id":p["id"]!,"source_task_id":t["id"]!,"target_task_id":prerequisite["id"]!,"relation":"depends_on","required":required,"state":"active","revision":1],type:"relation")
+                    let task = try router.record(db,t["id"] as! String,type:"task")
+                    let selected = try router.selectedTaskHealthFacts(db,task:task)
+                    let blockers = try XCTUnwrap(selected["prerequisite_blockers"] as? [JSON])
+                    legacyAllowsRelay.withLock { $0 = blockers.isEmpty }
+                }
+            }
+            defer { router.workHealthPreparationProbe = nil }
+            try checkHealth()
+            let state = try health(p,t)
+            XCTAssertNotNil(state["request_id"],"The note remains available on pickup")
+            XCTAssertEqual(legacyAllowsRelay.snapshot,!required)
+            XCTAssertEqual(!((try healthRelays(worker)).isEmpty),legacyAllowsRelay.snapshot)
+        }
     }
     func testWorkHealthRelaysOncePerSessionAcrossTicketsInItsInterval() throws {
         let p = try project(), w = try native(p,"health-many",domain:"health-many")
