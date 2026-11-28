@@ -418,9 +418,13 @@ Apply renames an idle path to a hidden `.<name>.checklist-retiring-<id>` name
 in the same parent. It walks the full checkout under that name and compares
 each entry with the plan. It rechecks the markers, keeps, release state,
 installed and rollback fingerprints, and the contents of the round's shared
-receipts. Apply samples process use of the staged and original paths and
-confirms the filesystem observations before an exclusive rename to the Trash.
-Only that rename produces a receipt, which still names the original source.
+receipts. An early staged process sample can refuse a busy workspace before
+the final confirmation. Apply finishes its scope, receipt, byte and inventory
+checks, then samples process use of the staged path and original workspace
+again. After that sample, only in-memory path matching and the prepared
+exclusive rename to the Trash remain. The same order applies to whole
+workspaces and partial moves. Only the Trash rename produces a receipt,
+which still names the original source.
 
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
@@ -444,8 +448,22 @@ the same file. Leave the lock file in place between operations.
 
 Cooperating publishers can publish before apply plans or after apply releases
 the lock. The lock orders those operations by when they acquire it. Manual
-edits and writes through existing handles can bypass it. Apply still checks
-for those changes, and a writer can act after its last observation.
+edits and writes through existing handles can bypass it and change bytes after
+the last filesystem check.
+
+A process can open a path after the final observation samples its process
+entry and before the rename completes. Closing that interval requires kernel
+coordination between open and rename. The 28 November 2026 fixture measured
+the native `lsof` and `ps` observation and the exclusive rename for each path.
+The tools expose command return times. The time each process entry was read
+is unavailable.
+
+| Fixture path | Payload files | Load before sample → after rename | Sample start to return | `lsof` return to rename completion | Sample return to rename completion | Rename syscall |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Selected file | 1 | 58.48, 42.13, 47.19 → 58.48, 42.13, 47.19 | 1,587.922 ms | 679.908 ms | 8.061 ms | 0.212 ms |
+| Whole workspace | 1 | 56.84, 42.06, 47.13 → 56.84, 42.06, 47.13 | 1,428.888 ms | 680.280 ms | 5.040 ms | 0.299 ms |
+| Whole workspace | 1,000 | 54.77, 41.88, 47.04 → 54.77, 41.88, 47.04 | 1,838.190 ms | 806.855 ms | 7.965 ms | 0.710 ms |
+| Whole workspace | 12,000 | 53.34, 41.80, 46.98 → 52.12, 41.73, 46.93 | 2,270.043 ms | 972.406 ms | 57.896 ms | 4.304 ms |
 
 On 28 November 2026, the read-only p11 preview took 30.908 s on the base
 and 35.449 s with staged cleanup. Both runs reported 46 retained workspaces

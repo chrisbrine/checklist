@@ -1,7 +1,7 @@
 """Scratch cleanup tests use temporary fixtures only; never real scratch or Trash."""
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 import io
 import json
 import os
@@ -1227,7 +1227,7 @@ class CleanScratchTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(result, 0)
         self.assertLess(elapsed, 60, f'large tree apply took {elapsed:.2f}s')
-        self.assertEqual(processes.call_count, 509)  # Planning, 8 group preflights, 2 samples per move.
+        self.assertEqual(processes.call_count, 759)  # Planning, 8 group preflights, 3 samples per move.
         self.assertEqual(inspected.call_count, 750)  # Plan, staged validation and post-move walks.
         summaries = [r for r in records if r['action'] == 'trashed']
         self.assertEqual(len(summaries), 250)
@@ -1917,6 +1917,7 @@ class CleanScratchTests(unittest.TestCase):
 
                     stage_source, read_stat = cleanup.ScratchTrash.stage, os.lstat
                     check_policy = cleanup.check_staged_policy
+                    confirm_round = cleanup.confirm_staged_round
 
                     def stage(trash, path):
                         nonlocal physical
@@ -1943,7 +1944,14 @@ class CleanScratchTests(unittest.TestCase):
 
                     def policy(actual, *args):
                         check_policy(actual, *args)
-                        if phase == 'before commit' and not injected and physical in actual:
+                        if phase == 'before commit' and case != 'process' and not injected and physical in actual:
+                            inject()
+
+                    def confirm(observed, contents):
+                        confirm_round(observed, contents)
+                        # The new process is the case that must be detected
+                        # after all commit-time filesystem checks have returned.
+                        if phase == 'before commit' and case == 'process' and not injected and physical.is_dir():
                             inject()
 
                     def receipt_metadata(path, *, follow_symlinks=False):
@@ -1955,7 +1963,8 @@ class CleanScratchTests(unittest.TestCase):
                     with patch.object(cleanup.ScratchTrash, 'stage', new=stage), \
                          patch.object(os, 'lstat', side_effect=stamp), \
                          patch.object(cleanup, 'path_stamp', side_effect=receipt_metadata), \
-                         patch.object(cleanup, 'check_staged_policy', side_effect=policy):
+                         patch.object(cleanup, 'check_staged_policy', side_effect=policy), \
+                         patch.object(cleanup, 'confirm_staged_round', side_effect=confirm):
                         code, rows = self.run_cleanup(apply=True, session_id=session, keep=keeps,
                                                       process_reader=lambda: list(processes))
 
@@ -2037,6 +2046,107 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b'new')
         self.assertEqual(list(self.trash.iterdir()), [])
 
+    def test_read_only_open_during_final_checks_keeps_workspace_and_moves_idle_sibling(self):
+        checks = ('installed and rollback identities', 'selected-file bytes', 'staged inventory',
+                  'shared confirmation')
+        for layout in ('whole', 'partial'):
+            for check in checks:
+                if layout == 'whole' and check == 'selected-file bytes':
+                    continue  # Only a standalone file needs a content hash after staging.
+                with self.subTest(layout=layout, check=check), ExitStack() as stack:
+                    session = f'{layout}-{checks.index(check)}'
+                    container = self.item('round', session=session)
+                    checkout, sibling = container / 'checkout', container / 'idle'
+                    selected = self.write(checkout, 'src/work.py', b'old source\n')
+                    retained = self.write(checkout, 'src/retained.md', b'uncommitted evidence')
+                    self.write(sibling, 'src/work.py')
+                    self.mark(sibling, session=session, release=True)
+                    if layout == 'whole':
+                        self.mark(checkout, session=session, release=True)
+                        source = checkout
+                    else:
+                        (checkout / 'src/.git').mkdir()
+                        source = selected
+                    shared_receipt = self.write(container, 'shared/deep/build-info.json',
+                                                json.dumps({'source_fingerprint': 'b' * 64}).encode())
+                    staged = opened_path = handle = None
+                    staged_observed = False
+
+                    def open_for_reading():
+                        nonlocal opened_path, handle
+                        if not staged_observed or handle is not None:
+                            return
+                        if layout == 'whole':
+                            opened_path = staged / selected.relative_to(checkout)
+                        elif check == 'selected-file bytes':
+                            opened_path = staged
+                        else:
+                            opened_path = retained
+                        handle = stack.enter_context(opened_path.open('rb'))
+
+                    stage_source, read_stamp = cleanup.ScratchTrash.stage, cleanup.path_stamp
+                    observe_identity = cleanup.installation_observation
+                    digest, match = cleanup.blob_id, cleanup.inventory_stamps_match
+
+                    def stage(trash, path):
+                        nonlocal staged
+                        physical = stage_source(trash, path)
+                        if path == source:
+                            staged = physical
+                        return physical
+
+                    def identities(path):
+                        observed = observe_identity(path)
+                        if check == 'installed and rollback identities':
+                            open_for_reading()
+                        return observed
+
+                    def file_hash(path):
+                        value = digest(path)
+                        if check == 'selected-file bytes' and path == staged:
+                            open_for_reading()
+                        return value
+
+                    def inventory_matches(expected):
+                        relevant = ((check == 'staged inventory' and staged in expected)
+                                    or (check == 'shared confirmation' and str(shared_receipt) in expected))
+                        if not (relevant and staged_observed and handle is None):
+                            return match(expected)
+
+                        def stamp_then_open(path, **options):
+                            observed = read_stamp(path, **options)
+                            open_for_reading()
+                            return observed
+
+                        with patch.object(cleanup, 'path_stamp', side_effect=stamp_then_open):
+                            return match(expected)
+
+                    def processes():
+                        nonlocal staged_observed
+                        if staged is not None and staged.exists():
+                            staged_observed = True
+                        return [opened_path] if handle is not None and not handle.closed else []
+
+                    stack.enter_context(patch.object(cleanup.ScratchTrash, 'stage', new=stage))
+                    stack.enter_context(patch.object(cleanup, 'installation_observation', side_effect=identities))
+                    stack.enter_context(patch.object(cleanup, 'blob_id', side_effect=file_hash))
+                    stack.enter_context(patch.object(cleanup, 'inventory_stamps_match', side_effect=inventory_matches))
+                    code, rows = self.run_cleanup(apply=True, session_id=session, process_reader=processes)
+                    self.assertIsNotNone(handle, f'fixture never opened a descriptor during {check}')
+                    self.assertFalse(handle.closed)
+                    self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                                     [str(sibling)])
+                    self.assertEqual(code, 1)
+                    held = next(row for row in rows if row.get('path') == str(checkout))
+                    self.assertEqual(held['reason'], 'running process began using item; stopped')
+                    self.assertEqual(held['destinations'], [])
+                    self.assertFalse(staged.exists())
+                    self.assertEqual(selected.read_bytes(), b'old source\n')
+                    self.assertEqual(retained.read_bytes(), b'uncommitted evidence')
+                    opened_original = selected if layout == 'whole' or check == 'selected-file bytes' else retained
+                    self.assertEqual(os.fstat(handle.fileno()).st_ino, opened_original.stat().st_ino)
+                    self.assertFalse(sibling.exists())
+
     def test_process_observations_fence_staging_and_trash_separately(self):
         item = self.item()
         source = self.write(item, '.build/object').parent
@@ -2044,6 +2154,7 @@ class CleanScratchTests(unittest.TestCase):
         events = []
         original_stamp = cleanup.path_stamp
         original_stage = cleanup.ScratchTrash.stage
+        original_rename = cleanup.ScratchTrash.rename_exclusive
 
         def stamp(path, *, follow_symlinks=False):
             events.append('metadata')
@@ -2058,20 +2169,23 @@ class CleanScratchTests(unittest.TestCase):
             self.assertEqual(events[-2:], ['metadata', 'source observation'])
             return original_stage(trash, path)
 
-        def rename(paths, *, staged):
-            self.assertEqual(paths, [source])
-            self.assertEqual(events.count('staged observation'), 1)
-            self.assertEqual(set(events[events.index('staged observation') + 1:]), {'metadata'})
-            yield source, trash(staged)
+        def rename(trash, physical, destination):
+            if destination.parent == self.trash:
+                self.assertEqual(events.count('staged observation'), 2)
+                self.assertEqual(events[-1], 'staged observation')
+                earlier = events.index('staged observation')
+                self.assertEqual(set(events[earlier + 1:-1]), {'metadata'})
+            return original_rename(trash, physical, destination)
 
         with patch.object(cleanup, 'path_stamp', side_effect=stamp), \
-             patch.object(cleanup.ScratchTrash, 'stage', new=stage):
-            result, records = self.run_cleanup(apply=True, process_reader=observe, mover=rename)
+             patch.object(cleanup.ScratchTrash, 'stage', new=stage), \
+             patch.object(cleanup.ScratchTrash, 'rename_exclusive', new=rename):
+            result, records = self.run_cleanup(apply=True, process_reader=observe)
         self.assertEqual(result, 0)
         self.assertEqual([row['source'] for row in records if row['action'] == 'trash_move'],
                          [str(source)])
 
-    def test_change_during_staged_process_observation_is_rechecked_before_trash(self):
+    def test_change_during_early_staged_process_observation_is_rechecked_before_trash(self):
         checkout = self.item('checkout')
         self.mark(checkout, release=True)
         self.write(checkout, 'src/nested/work.py', b'original')

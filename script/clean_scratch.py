@@ -1454,6 +1454,10 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 if not inventory_stamps_match(actual):
                     raise ValueError('item changed during inspection/Trash moves; stopped')
                 confirm_staged_round(staged_shared, contents)
+                # A read-only open can leave those checks unchanged. After
+                # this sample, dispatch the prepared rename without more I/O.
+                if used_items(process_reader(), (item, staged)):
+                    raise ValueError('running process began using item; stopped')
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 move_error(decision, error, path, stop=True)
                 continue
