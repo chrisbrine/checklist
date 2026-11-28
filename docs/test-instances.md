@@ -112,10 +112,24 @@ and 25.05 s from launch to health. One-minute load was 381 after create and
 392 to 394 during startup. This run preceded the service-side inspection
 receipt.
 
-On 27 Nov 2026, the live-backup create for build 421 on slot 3 timed out
-after 900.753 s during its single destination scan. The one-minute host load
-went from 255.68 to 323.52 and reached 541.30 during that scan. The run
-exceeded the ten-minute budget. Start and check remained unmeasured.
+Create time depends on host load. On 27 Nov 2026, the round 26 live-backup
+create for build 421 on slot 3 timed out after 900.753 s during its single
+destination scan. One-minute host load started at 255.68, peaked at 541.30,
+and ended at 323.52. Start and check remained unmeasured.
+
+On 28 Nov 2026 from 03:13 to 03:20 UTC, the round 27 stage of main
+`5b5351e` (build 432, fingerprint `1da3b2cd99a62eb7`) seeded slot 1 from the
+newest live backup. With the service-side inspection receipt, create took
+280 s, start took 113 s, and check passed in 17 s. The three commands took
+410 s against the 600 s target.
+
+Create's seed phases took 7.8 s for manifest and membership, 14.4 s for
+payload verification, 4.8 s for database integrity and counts, 54.9 s for
+materialization and verification, and 191.3 s for destination path inspection.
+Host load at the end of create was 43.98/43.54/69.20. Start took 6.2 s for
+preflight, 52.6 s for seed path preflight, 2.7 s for service registration, and
+50.1 s from launch to healthy. Host load during start went from
+43.80/44.18/67.73 to 81.77/53.06/69.59.
 
 The shared Python helpers are `paths_overlap(a, b) -> bool` and `checklist_root_overlap(path, exclude=()) -> str | None`. Root lookup checks `live`, each `slot-N` data root and folder in numerical order, then `test-base`, returning the first non-excluded label. Slot admission excludes its own label and `test-base`; a live or another-slot overlap refuses. Swift uses the same path rule: existing equal/ancestor paths are identified by `(st_dev, st_ino)`; remaining comparisons use the deepest existing ancestor's canonical on-disk spelling (`F_GETPATH` on macOS), with symlinks resolved even for missing tails. Components are NFD-normalized and case-folded, treating every volume as case-insensitive to fail closed. Comparisons never use string prefixes. The shared vectors in `Tests/Fixtures/path-overlap-vectors.json` cover filesystem aliases and missing paths in both languages.
 
