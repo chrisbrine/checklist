@@ -426,8 +426,14 @@ each entry with the plan. It rechecks the markers, keeps, release state,
 installed and rollback fingerprints, and the round's shared scope. An early
 staged process sample can refuse a busy workspace. Apply confirms the workspace's
 own inventory, then rescans the shared scope for cache changes and new receipts.
-Each shared scan rechecks the directory listings after descent and receipt reads.
-It compares every name in shared caches and receipt and cache names elsewhere.
+Each shared scan closes the walked directories in reverse order, with the
+round root last. It compares the scoped listing first, then re-reads receipt
+bytes and re-stats the tracked entries in that directory. Receipts and shared
+cache directories use the full device, inode, mode, size, mtime and ctime
+stamp. The round root uses its device, inode and mode.
+The listing compares every name in shared caches and receipt and cache names
+elsewhere. Ordinary cache payloads contribute their names. The cache directories
+contribute their metadata stamps.
 At every listed directory it also checks for newly arrived child directories,
 including empty directories and populated trees published by rename. It treats
 new symbolic links as possible directory arrivals without following them.
@@ -465,8 +471,9 @@ the same file. Leave the lock file in place between operations.
 Cooperating publishers can publish before apply plans or after apply releases
 the lock. The lock orders those operations by when they acquire it. Inside
 each listed directory the closing listing detects shared entry arrivals during
-the walk. A writer that bypasses the lock can still publish an entry after
-the closing listing of its directory and before the rename.
+the walk. A writer that bypasses the lock can still change state after its
+last observation and before the rename. New names are observed in the closing
+listing. Existing receipt and cache metadata is checked immediately afterward.
 
 A process can open a path after the final observation samples its process
 entry and before the rename completes. Closing that interval requires kernel

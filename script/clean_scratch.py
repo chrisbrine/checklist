@@ -878,7 +878,7 @@ def shared_round_listing(folder, workspaces, in_cache):
     return names, directory_entries, directories, receipts
 
 
-def shared_round_receipts(root, workspaces):
+def shared_round_receipts(root, workspaces, receipt_bytes):
     """Observe round identity, shared cache directories and shared build receipts."""
     root = os.fspath(root)
     pending = [(root, False)]
@@ -900,7 +900,7 @@ def shared_round_receipts(root, workspaces):
             if folder == root or in_cache:
                 raise
             continue
-        walked.append((folder, in_cache, names, directory_entries))
+        walked.append((folder, in_cache, names, directory_entries, directories, receipts))
         pending.extend(directories)
         for receipt in receipts:
             stamp = path_stamp(receipt)
@@ -909,13 +909,14 @@ def shared_round_receipts(root, workspaces):
             tracked[receipt] = stamp
             yield receipt, stamp
 
-    # Finish checking the observed entries before closing the name listings.
+    # Fail fast on changes already visible after discovery. This observation
+    # does not authorize a move. Each directory still needs its closing checks.
     if not inventory_stamps_match(tracked):
         raise ValueError('shared round contents changed during inspection; stopped')
 
-    # Recheck listings with the round root last. A new directory can arrive
-    # populated, so compare directory arrivals even outside the cache scope.
-    for folder, in_cache, names, directory_entries in reversed(walked):
+    # A directory can arrive populated. Check names and arrivals before
+    # confirming the tracked entries of each directory, with the root last.
+    for folder, in_cache, names, directory_entries, directories, receipts in reversed(walked):
         stamp = path_stamp(folder)
         current = None
         if stamp is not None and stat.S_ISDIR(stamp[2]):
@@ -933,23 +934,34 @@ def shared_round_receipts(root, workspaces):
         if current_names != names or not current_directories.issubset(directory_entries):
             raise ValueError('shared round contents changed during inspection; stopped')
 
+        closing_stamps = {receipt: tracked[receipt] for receipt in receipts}
+        closing_stamps.update((child, tracked[child]) for child, _ in directories if child in tracked)
+        if folder in tracked:
+            closing_stamps[folder] = tracked[folder]
+        # build_identity_hold read the discovery bytes as it consumed the walk.
+        # Read them again before the full post-listing metadata comparison.
+        if (any(read_build_identity(Path(receipt)) != receipt_bytes[Path(receipt)] for receipt in receipts)
+                or not inventory_stamps_match(closing_stamps)):
+            raise ValueError('shared round contents changed during inspection; stopped')
+
 
 def shared_round_holds(rounds, fingerprint, previous, snapshots=None, contents=None):
     holds = {}
     if fingerprint is None:  # The normal planner already retains every uncertain item.
         return holds
 
-    def receipts(parent, workspaces):
-        for path, stamp in shared_round_receipts(parent, workspaces):
+    def receipts(parent, workspaces, receipt_bytes):
+        for path, stamp in shared_round_receipts(parent, workspaces, receipt_bytes):
             if snapshots is not None:
                 snapshots.setdefault(parent, {})[path] = stamp
             if stat.S_ISREG(stamp[2]):
                 yield Path(path)
 
     for parent, workspaces in rounds.items():
+        receipt_bytes = {} if contents is None else contents.setdefault(parent, {})
         try:
-            reason = build_identity_hold(receipts(parent, workspaces), fingerprint, previous,
-                                         contents.setdefault(parent, {}) if contents is not None else None)
+            reason = build_identity_hold(receipts(parent, workspaces, receipt_bytes), fingerprint, previous,
+                                         receipt_bytes)
         except (OSError, ValueError) as error:
             reason = ValueError('unreadable shared round identity; retained: ' + str(error))
         if reason:

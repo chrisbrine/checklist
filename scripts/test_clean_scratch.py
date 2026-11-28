@@ -1766,6 +1766,66 @@ class CleanScratchTests(unittest.TestCase):
     def test_removing_ordinary_directory_without_shared_dependencies_allows_move(self):
         self.assert_final_shared_walk_change('reports/nested', 'removed-directory')
 
+    def test_replacement_before_closing_listing_holds_workspace(self):
+        original = json.dumps({'source_fingerprint': 'b' * 64}).encode()
+        matching = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+        for session, data in [('matching-identity', matching), ('same-bytes', original)]:
+            with self.subTest(session=session):
+                container = self.item('round', session=session)
+                self.write(container, '.build/cache/old.o')
+                workspace = container / 'retired'
+                payload = self.write(workspace, 'src/work.py', b'unique released work')
+                self.mark(workspace, session=session, release=True)
+                receipt = self.write(container, 'reports/staged/build-info.json', original)
+                incoming = self.write(self.root, session + '-incoming.json', data)
+                old_receipt = self.root / (session + '-previous.json')
+                scan, stamp, compare = os.scandir, cleanup.path_stamp, cleanup.inventory_stamps_match
+                workspace_checked = published = False
+                closing_reads, late_process_samples = [], []
+
+                def replace_after_stamp(path, **options):
+                    nonlocal published
+                    observed = stamp(path, **options)
+                    if Path(path) == receipt and not published:
+                        receipt.rename(old_receipt)
+                        incoming.rename(receipt)
+                        published = True
+                    return observed
+
+                def check_inventory(expected):
+                    nonlocal workspace_checked
+                    if workspace_checked and not published and any(Path(path) == receipt for path in expected):
+                        with patch.object(cleanup, 'path_stamp', new=replace_after_stamp):
+                            return compare(expected)
+                    result = compare(expected)
+                    if not workspace.exists() and any(
+                            isinstance(path, Path) and path.name == payload.name for path in expected):
+                        workspace_checked = True
+                    return result
+
+                def list_directory(path):
+                    if published and Path(path) == receipt.parent:
+                        closing_reads.append(path)
+                    return scan(path)
+
+                def observe_processes():
+                    if published:
+                        late_process_samples.append(True)
+                    return []
+
+                with patch.object(cleanup, 'inventory_stamps_match', new=check_inventory), \
+                     patch.object(os, 'scandir', new=list_directory):
+                    result, rows = self.run_cleanup(apply=True, session_id=session, process_reader=observe_processes)
+
+                self.assertTrue(published)
+                self.assertTrue(closing_reads)
+                self.assertEqual(late_process_samples, [])
+                self.assertEqual(receipt.read_bytes(), data)
+                self.assertNotEqual(receipt.stat().st_ino, old_receipt.stat().st_ino)
+                self.assertEqual(result, 1)
+                self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
+                self.assertEqual(payload.read_bytes(), b'unique released work')
+
     def test_loose_scratch_file_is_retained_with_a_file_reason(self):
         workspace = self.item()
         loose = self.write(workspace.parent, 'run.jsonl', b'uncommitted log')
@@ -1815,11 +1875,11 @@ class CleanScratchTests(unittest.TestCase):
         original = cleanup.shared_round_receipts
         scans = []
         observed_paths = []
-        def scan(root, workspaces):
+        def scan(root, workspaces, receipt_bytes):
             scans.append(set(workspaces))
             if len(scans) == 2:
                 observed_paths.append(payload)
-            yield from original(root, workspaces)
+            yield from original(root, workspaces, receipt_bytes)
 
         with patch.object(cleanup, 'shared_round_receipts', side_effect=scan):
             result, rows = self.run_cleanup(apply=True, process_reader=lambda: list(observed_paths))
@@ -1847,9 +1907,9 @@ class CleanScratchTests(unittest.TestCase):
         original = cleanup.shared_round_receipts
         scans = 0
 
-        def scan(root, workspaces):
+        def scan(root, workspaces, receipt_bytes):
             nonlocal scans
-            yield from original(root, workspaces)
+            yield from original(root, workspaces, receipt_bytes)
             scans += 1
             if scans == 2:
                 self.mark(workspace)  # Reassign while the shared tree is inspected.
@@ -1959,12 +2019,12 @@ class CleanScratchTests(unittest.TestCase):
                             inject('final metadata')
                         return read_stamp(path, follow_symlinks=follow_symlinks)
 
-                    def scan(root, workspaces):
+                    def scan(root, workspaces, receipt_bytes):
                         nonlocal scans
                         scans += 1
                         if scans == 2:
                             inject('shared scan')
-                        yield from scan_receipts(root, workspaces)
+                        yield from scan_receipts(root, workspaces, receipt_bytes)
 
                     def process_reader():
                         nonlocal reads
