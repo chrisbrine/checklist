@@ -34,7 +34,7 @@ TICKET = re.compile(r'[A-Z][A-Z0-9]*-\d+')
 # Status categories that end a ticket's work; its registered folders may retire (CL-359).
 FINISHED = {'done', 'canceled', 'cancelled'}
 DEFAULT_BUDGET_GB = 50.0
-# Bound decision memory while sharing process observations across moves.
+# Bound planning and preparation independently of the per-path move checks.
 ITEM_BATCH_SIZE = 32
 MOVE_BATCH_SIZE = 256
 MOVE_BATCH_BYTES = 64 * 1024
@@ -235,7 +235,25 @@ def running_paths():
             value = argument.split('=', 1)[-1] if argument.startswith('-') else argument
             if value.startswith('/'):
                 paths.add(value)
-    return [Path(path).resolve() for path in sorted(paths)]
+    return resolved_process_paths(paths)
+
+
+def resolved_process_paths(paths):
+    """Reuse parent resolution within one observation, including aliased arguments."""
+    parents = {}
+    resolved = []
+    for raw in sorted(paths):
+        path = Path(raw)
+        parent = path.parent
+        if parent not in parents:
+            parents[parent] = parent.resolve()
+        canonical = parents[parent] / path.name
+        if path.name == '..':
+            canonical = canonical.parent.parent
+        elif canonical.is_symlink():
+            canonical = canonical.resolve()
+        resolved.append(canonical)
+    return resolved
 
 
 _SHELL_SYNTAX = re.compile(r'[\'"\\]')
@@ -1144,7 +1162,7 @@ def restore_modes(modes, destinations):
             os.close(descriptor)
 
 
-def validate_move(decision, path, used, installations, shared, round_hold, keep,
+def validate_move(decision, path, used, installations, shared, observed_shared, round_hold, keep,
                   session_id, include_released, modes):
     """Check only named paths and observations. The caller can rename on return."""
     item = Path(decision['path'])
@@ -1154,7 +1172,7 @@ def validate_move(decision, path, used, installations, shared, round_hold, keep,
         raise ValueError('explicitly retained qualified copy or persistent build slot')
     before = decision['inventory']
     inventory_unchanged = stamps_match(before)
-    shared_unchanged = stamps_match(shared)
+    shared_unchanged = observed_shared == shared and stamps_match(shared)
     if not in_scope(item, decision['kind'], session_id, include_released) or not stamps_match(decision['markers']):
         raise ValueError('workspace ownership/release changed; stopped')
     if not inventory_unchanged:
@@ -1190,15 +1208,22 @@ def record_move(decision, path, destination):
 
 
 def note_directory_changes(expected, shared, directories):
-    """Update only the parent/mode entries directly changed by our move."""
+    """Account for our own rename without adopting unplanned checkout entries."""
     for directory in directories:
-        for observations, key in ((expected, directory), (shared, os.fspath(directory))):
-            if key not in observations:
+        key = os.fspath(directory)
+        if directory not in expected and key not in shared:
+            continue
+        current = path_stamp(directory)
+        if directory in expected:
+            names = {path.name for path in expected if path.parent == directory}
+            if set(os.listdir(directory)) != names or path_stamp(directory) != current:
+                raise ValueError('remaining files changed during Trash move; stopped')
+        for observations, entry in ((expected, directory), (shared, key)):
+            if entry not in observations:
                 continue
-            current = path_stamp(directory)
-            if current is None or current[:3] != observations[key][:3]:
+            if current is None or current[:3] != observations[entry][:3]:
                 raise ValueError('remaining directory changed during Trash move: ' + str(directory))
-            observations[key] = current
+            observations[entry] = current
 
 
 def apply_batch(batch, installations, fingerprint, process_reader, mover,
@@ -1214,32 +1239,34 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 prepared[path] = trash.prepare(path, decision['inventory'][path])
             except (OSError, ValueError) as error:
                 move_error(decision, error, path)
-    try:
-        # The first observation also fences paths reported before the shared scan.
-        processes = list(process_reader())
-        parents = {Path(d['path']).parent for d in decisions}
-        shared_rounds_in_batch = {parent: items for parent, items in rounds.items() if parent in parents}
-        round_holds = shared_round_holds(shared_rounds_in_batch, fingerprint, previous)
-        if shared_rounds_in_batch:
-            processes.extend(process_reader())
-        used = used_items(processes, (Path(d['path']) for d in decisions))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        for decision in decisions:
-            move_error(decision, error, stop=True)
-        return
-
+    first = True
     moved = {}
     retry = []
     for offset, (decision, path) in enumerate(batch):
         if decision.get('stopped') or (mover is None and path not in prepared):
             continue
-        shared = shared_snapshots.get(Path(decision['path']).parent, {})
-        hold = round_holds.get(Path(decision['path']).parent)
+        item = Path(decision['path'])
+        parent = item.parent
+        shared = shared_snapshots.get(parent, {})
+        observed = {}
+        try:
+            # A fresh walk rediscovers receipts even when an earlier rename
+            # updated the same directory's timestamp. Complete it before the
+            # current process observation and after the prior receipt output.
+            round_roots = {parent: rounds[parent]} if parent in rounds else {}
+            processes = list(process_reader()) if first and round_roots else []
+            first = False
+            hold = shared_round_holds(round_roots, fingerprint, previous, observed).get(parent)
+            processes.extend(process_reader())
+            used = used_items(processes, (item,))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            move_error(decision, error, path, stop=True)
+            continue
         modes = {}
         destination = None
         try:
             try:
-                validate_move(decision, path, used, installations, shared, hold, keep,
+                validate_move(decision, path, used, installations, shared, observed.get(parent, {}), hold, keep,
                               session_id, include_released, modes)
             except PermissionError as error:
                 move_error(decision, error, path)
@@ -1273,14 +1300,18 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                     moved[id(decision)] = decision
                     changed_dirs.discard(path)
                     changed_dirs.add(path.parent)
-                note_directory_changes(expected, shared, changed_dirs)
                 if destination is not None:
-                    if path == Path(decision['path']):
+                    if path == item:
                         expected.clear()
+                        # The prior workspace no longer owns this name. If it
+                        # reappears, scan it as part of the round's shared tree.
+                        if parent in rounds:
+                            rounds[parent].discard(os.fspath(item))
                     else:
                         prefix = os.fspath(path) + '/'
                         for entry in [entry for entry in expected if entry == path or os.fspath(entry).startswith(prefix)]:
                             del expected[entry]
+                note_directory_changes(expected, shared, changed_dirs)
             except (OSError, ValueError) as error:
                 move_error(decision, error, path, stop=True)
         if destination is not None:

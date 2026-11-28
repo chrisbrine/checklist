@@ -410,19 +410,18 @@ reason. A protected child can stay while eligible released siblings move to the
 Trash. The parent cache, loose evidence and unmarked children stay. When a
 receipt in the shared files identifies the installed or immediate rollback build,
 every workspace in the round stays. Apply prepares same-volume Trash destinations
-and takes its process observations in bounded groups. In a split round, it
-refreshes process use after scanning shared receipts. Immediately before each
-move, it checks the recorded inventory entries and directory timestamps,
-workspace markers, explicit keeps, installed and rollback receipts, and the
-latest process result. Directory timestamps cover additions and removals.
-Shared receipts and the directory that selects the rollback bundle also have
-recorded metadata. A change refuses the affected move.
+in bounded groups. After each earlier move and its receipt output, apply scans
+the next path's shared round for receipts and takes a fresh process observation.
+The scan discovers newly created receipts even when an earlier rename changed
+the same directory timestamp. Apply then checks the recorded inventory,
+workspace markers, explicit keeps, installed and rollback identities, and the
+latest process result. A change refuses the affected move.
 
-The final check uses the paths already recorded. Once it passes, apply calls an
-exclusive, no-follow rename in the same process. The gap contains no scan,
-directory walk or subprocess. Process use can change after its last observation,
-and another writer can change a path after its final metadata check. The
-observations do not lock other processes or make the checks and rename atomic.
+Once the final metadata checks pass, apply calls an exclusive, no-follow rename
+in the same process. The gap contains no scan, directory walk or subprocess.
+A process can open the next path after that path's process observation.
+A writer can also change a path after its final metadata read. The observations
+leave other processes free to act during those intervals.
 See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 

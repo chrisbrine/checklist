@@ -137,6 +137,22 @@ class CleanScratchTests(unittest.TestCase):
              patch.object(cleanup.subprocess, 'check_output', return_value=f'{item}/source\n'):
             self.assertEqual(cleanup.running_paths(), [(item / 'source').resolve()])
 
+    def test_process_path_resolution_matches_individual_resolution(self):
+        item = self.item()
+        payload = self.write(item, 'src/file')
+        alias = self.root / 'alias'
+        alias.symlink_to(item / 'src', target_is_directory=True)
+        leaf = self.root / 'leaf'
+        leaf.symlink_to(alias / payload.name)
+        broken = self.root / 'broken'
+        broken.symlink_to(alias / 'absent')
+        loop = self.root / 'loop'
+        loop.symlink_to(loop)
+        paths = {str(path) for path in (payload, alias, alias / 'file', alias / '..' / 'missing',
+                                       leaf, broken, broken / '..', Path('/'), loop, loop / 'file')}
+        expected = [Path(name).resolve() for name in sorted(paths)]
+        self.assertEqual(cleanup.resolved_process_paths(paths), expected)
+
     def test_process_inspection_failure_refuses_all_moves(self):
         item = self.item();self.write(item, '.build/object')
         with self.assertRaisesRegex(ValueError, 'inspection incomplete'):
@@ -1161,7 +1177,7 @@ class CleanScratchTests(unittest.TestCase):
                 def reader():
                     nonlocal calls
                     calls += 1
-                    if calls == 3:
+                    if calls == 4:
                         if failure == 'process':
                             raise OSError('fixture process inspection failed')
                         self.installed.write_text(json.dumps({'source_fingerprint': 'b' * 64}))
@@ -1201,7 +1217,7 @@ class CleanScratchTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(result, 0)
         self.assertLess(elapsed, 60, f'large tree apply took {elapsed:.2f}s')
-        self.assertEqual(processes.call_count, 9)  # One observation per 32-item window, plus planning.
+        self.assertEqual(processes.call_count, 251)  # Fresh observation for each move, plus planning.
         self.assertEqual(inspected.call_count, 500)  # Plan and post-move walks, no walk in the final gate.
         summaries = [r for r in records if r['action'] == 'trashed']
         self.assertEqual(len(summaries), 250)
@@ -1495,7 +1511,7 @@ class CleanScratchTests(unittest.TestCase):
         with patch.object(cleanup, 'shared_round_receipts', side_effect=scan):
             result, rows = self.run_cleanup(apply=True, process_reader=lambda: list(observed_paths))
         self.assertEqual(result, 1)
-        self.assertEqual(scans, 2)
+        self.assertEqual(scans, 3)  # Planning plus one shared scan for each released sibling.
         self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
                          [str(sibling)])
         decision = next(row for row in rows if row.get('path') == str(checkout))
@@ -1542,7 +1558,8 @@ class CleanScratchTests(unittest.TestCase):
             'shared receipt matches installed': 'qualified copy of latest installed round (matching source fingerprint); stopped before Trash',
         }
         round_wide = {'installed matches receipt', 'rollback matches receipt', 'shared receipt matches installed'}
-        stages = ('shared scan', 'process refresh', 'size walk')
+        between_moves = {'after rename', 'after receipt output'}
+        stages = ('shared scan', 'process refresh', 'size walk', 'after rename', 'after receipt output')
         for stage_index, stage in enumerate(stages):
             for case_index, (case, expected_reason) in enumerate(change_cases.items()):
                 with self.subTest(stage=stage, change=case):
@@ -1553,7 +1570,12 @@ class CleanScratchTests(unittest.TestCase):
                     sibling = container / 'idle'
                     payload = self.write(checkout, 'src/work.py', b'original payload')
                     self.write(sibling, 'src/work.py')
-                    for workspace in (checkout, sibling):
+                    first = container / 'a-earlier'
+                    workspaces = [checkout, sibling]
+                    if stage in between_moves:
+                        self.write(first, 'src/work.py', b'first move')
+                        workspaces.insert(0, first)
+                    for workspace in workspaces:
                         self.mark(workspace, session=session, release=True)
                     identity = lambda value: json.dumps({'source_fingerprint': value}).encode()
                     next_build = 'b' * 64
@@ -1580,6 +1602,12 @@ class CleanScratchTests(unittest.TestCase):
                     self.write(applications, '.Checklist-previous-20261127T000000Z-1.app/'
                                              'Contents/Resources/build-info.json', identity('c' * 64))
                     processes, keeps, injected = [], [], []
+                    changed_receipt = receipt
+                    if stage == 'after rename':
+                        # The old workspace name is no longer a discovery boundary.
+                        changed_receipt = first / 'source-manifest.json'
+                    elif stage == 'after receipt output':
+                        changed_receipt = container / 'source-manifest.json'
                     changes = {
                         're-marked persistent': lambda: cleanup.write_marker(
                             checkout, session, 'opened another ticket', tickets=['CL-21']),
@@ -1592,7 +1620,8 @@ class CleanScratchTests(unittest.TestCase):
                         'new process': lambda: processes.append(payload),
                         'new inventory file': lambda: self.write(checkout, 'src/new.py', b'new source'),
                         'new explicit keep': lambda: keeps.append(checkout),
-                        'shared receipt matches installed': lambda: receipt.write_bytes(identity(self.fingerprint)),
+                        'shared receipt matches installed': lambda: self.write(
+                            changed_receipt.parent, changed_receipt.name, identity(self.fingerprint)),
                     }
 
                     def inject(point):
@@ -1621,8 +1650,26 @@ class CleanScratchTests(unittest.TestCase):
                         inject('size walk')
                         return size_reader(paths)
 
+                    account_for_move, record_receipt = cleanup.note_directory_changes, cleanup.record_move
+
+                    def after_rename(expected, shared, directories):
+                        if container in directories and stage == 'after rename' and not injected:
+                            self.assertFalse(first.exists())
+                            self.assertTrue(checkout.exists())
+                            inject('after rename')
+                        account_for_move(expected, shared, directories)
+
+                    def after_receipt(decision, path, destination):
+                        record_receipt(decision, path, destination)
+                        if path == first and stage == 'after receipt output':
+                            self.assertFalse(first.exists())
+                            self.assertTrue(checkout.exists())
+                            inject('after receipt output')
+
                     with patch.object(cleanup, 'shared_round_receipts', side_effect=scan), \
-                         patch.object(cleanup, 'du_sizes', side_effect=size_walk):
+                         patch.object(cleanup, 'du_sizes', side_effect=size_walk), \
+                         patch.object(cleanup, 'note_directory_changes', side_effect=after_rename), \
+                         patch.object(cleanup, 'record_move', side_effect=after_receipt):
                         code, rows = self.run_cleanup(
                             apply=True, session_id=session, keep=keeps, process_reader=process_reader,
                             after_inspection=lambda: cleanup.du_sizes([container]))
@@ -1638,10 +1685,34 @@ class CleanScratchTests(unittest.TestCase):
                     self.assertEqual(held['moved_count'], 0)
                     self.assertEqual(held['destinations'], [])
                     self.assertEqual(payload.read_bytes(), b'original payload')
-                    expected_moves = [] if case in round_wide else [str(sibling)]
+                    expected_moves = [str(first)] if stage in between_moves else []
+                    if case not in round_wide:
+                        expected_moves.append(str(sibling))
                     self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
                                      expected_moves)
-                    self.assertEqual(sibling.is_dir(), not expected_moves)
+                    self.assertEqual(sibling.is_dir(), case in round_wide)
+
+    def test_partial_move_cannot_adopt_an_unplanned_entry_in_its_parent(self):
+        item = self.item()
+        self.write(item, '.build/object')
+        source = self.write(item, 'CompilationCache/payload')
+        self.write(item, 'hand-in.md', b'evidence')
+        account = cleanup.note_directory_changes
+        added = item / 'new-work.txt'
+
+        def after_rename(expected, shared, directories):
+            if item in directories and not added.exists():
+                added.write_bytes(b'newly authored work')
+            account(expected, shared, directories)
+
+        with patch.object(cleanup, 'note_directory_changes', side_effect=after_rename):
+            code, rows = self.run_cleanup(apply=True)
+        self.assertEqual(code, 1)
+        self.assertEqual([row['source'] for row in rows if row['action'] == 'trash_move'],
+                         [str(item / '.build')])
+        self.assertEqual(rows[-1]['reason'], 'remaining files changed during Trash move; stopped')
+        self.assertEqual(added.read_bytes(), b'newly authored work')
+        self.assertTrue(source.exists())
 
     def test_build_cache_container_respects_parent_and_foreign_scope(self):
         protected = self.item('marked-parent')
