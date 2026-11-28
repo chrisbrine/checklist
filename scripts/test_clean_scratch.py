@@ -1,7 +1,7 @@
 """Scratch cleanup tests use temporary fixtures only; never real scratch or Trash."""
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 import io
 import json
 import os
@@ -1626,6 +1626,106 @@ class CleanScratchTests(unittest.TestCase):
     def test_new_matching_shared_receipt_during_final_workspace_check(self):
         identity = json.dumps({'source_fingerprint': self.fingerprint}).encode()
         self.assert_late_shared_change_refuses('reports/build-info.json', identity)
+
+    def assert_final_shared_walk_change(self, directory, change, *, during_descent=False):
+        session = 'walk-' + directory.replace('/', '-') + '-' + change
+        container = self.item('round', session=session)
+        cache = self.write(container, '.build/cache/deep/old.o').parent
+        self.write(container, 'module-cache/deep/old.o')
+        self.write(container, 'reports/nested/keep.txt')
+        log = self.write(container, 'run-active.jsonl')
+        workspace, sibling = container / 'retired', container / 'active'
+        payload = self.write(workspace, 'src/work.py', b'only copy of retired work')
+        self.mark(workspace, session=session, release=True)
+        self.write(sibling, 'src/old.py')
+        self.mark(sibling, session=session)
+
+        trash_before = set(self.trash.iterdir())
+        listed = container / directory
+        in_cache = any(part in cleanup.BUILD_NAMES for part in Path(directory).parts)
+        final_inventory_checked = False
+        writes = []
+        samples_after_write = []
+        compare, scan, stamp = cleanup.inventory_stamps_match, os.scandir, cleanup.path_stamp
+
+        def publish():
+            if change == 'receipt':
+                data = json.dumps({'source_fingerprint': self.fingerprint}).encode()
+                writes.append(self.write(listed, 'build-info.json', data))
+            elif change == 'cache':
+                name = 'new.o' if in_cache else 'CompilationCache/new.o'
+                writes.append(self.write(listed, name))
+            else:
+                log.rename(container / 'run-active-previous.jsonl')
+                writes.append(self.write(container, log.name))
+                writes.append(self.write(sibling, 'src/new.py'))
+                if not in_cache:
+                    writes.append(self.write(listed, 'unrelated.txt'))
+
+        def check_inventory(expected):
+            nonlocal final_inventory_checked
+            result = compare(expected)
+            if not workspace.exists() and any(
+                    isinstance(path, Path) and path.name == payload.name for path in expected):
+                final_inventory_checked = True
+            return result
+
+        @contextmanager
+        def check_listing(path):
+            if final_inventory_checked and not during_descent and not writes and Path(path) == listed:
+                with scan(path) as entries:
+                    before = list(entries)
+                publish()
+                yield iter(before)
+            else:
+                with scan(path) as entries:
+                    yield entries
+
+        def check_stamp(path, **options):
+            if final_inventory_checked and during_descent and not writes and Path(path) == cache:
+                publish()
+            return stamp(path, **options)
+
+        def observe_processes():
+            if writes:
+                samples_after_write.append(True)
+            return [sibling / 'src']
+
+        with patch.object(cleanup, 'inventory_stamps_match', new=check_inventory), \
+             patch.object(os, 'scandir', new=check_listing), \
+             patch.object(cleanup, 'path_stamp', new=check_stamp):
+            result, rows = self.run_cleanup(apply=True, session_id=session, process_reader=observe_processes)
+
+        self.assertTrue(writes)
+        self.assertTrue(all(path.is_file() for path in writes))
+        moves = [row for row in rows if row['action'] == 'trash_move']
+        if change == 'unrelated':
+            self.assertEqual((result, samples_after_write), (0, [True]))
+            move, = moves
+            self.assertEqual(move['source'], str(workspace))
+            self.assertFalse(workspace.exists())
+            self.assertEqual((Path(move['trash']) / 'src/work.py').read_bytes(), b'only copy of retired work')
+        else:
+            self.assertEqual((result, moves, samples_after_write), (1, [], []))
+            kept = next(row for row in rows if row.get('path') == str(workspace))
+            self.assertEqual(kept['action'], 'kept_error')
+            self.assertIn('shared round contents changed', kept['reason'])
+            self.assertEqual(payload.read_bytes(), b'only copy of retired work')
+            self.assertEqual(set(self.trash.iterdir()), trash_before)
+
+    def test_relevant_arrivals_after_each_final_shared_listing(self):
+        directories = ('.', '.build', '.build/cache', '.build/cache/deep', 'module-cache',
+                       'module-cache/deep', 'reports', 'reports/nested')
+        for directory in directories:
+            for change in ('receipt', 'cache', 'unrelated'):
+                with self.subTest(directory=directory, change=change):
+                    self.assert_final_shared_walk_change(directory, change)
+
+    def test_root_receipt_published_during_final_shared_walk_stops_move(self):
+        self.assert_final_shared_walk_change('.', 'receipt', during_descent=True)
+
+    def test_root_cache_created_during_final_shared_walk_stops_move(self):
+        self.assert_final_shared_walk_change('.', 'cache', during_descent=True)
 
     def test_loose_scratch_file_is_retained_with_a_file_reason(self):
         workspace = self.item()

@@ -855,10 +855,31 @@ def shared_rounds(items):
     return rounds
 
 
+def shared_round_listing(folder, workspaces, in_cache):
+    """List relevant entry names and locate child directories and receipt files."""
+    names, directories, receipts = set(), [], []
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if entry.path in workspaces:
+                continue
+            directory = entry.is_dir(follow_symlinks=False)
+            cache = entry.name in BUILD_NAMES and directory
+            identity = entry.name in BUILD_IDENTITY_NAMES
+            receipt = identity and not directory and entry.is_file(follow_symlinks=False)
+            if in_cache or cache or identity:
+                names.add((entry.name, directory, receipt))
+            if directory:
+                directories.append((entry.path, in_cache or cache))
+            elif receipt:
+                receipts.append(entry.path)
+    return names, directories, receipts
+
+
 def shared_round_receipts(root, workspaces):
     """Observe round identity, shared cache directories and shared build receipts."""
     root = os.fspath(root)
     pending = [(root, False)]
+    walked, tracked = [], {}
     while pending:
         folder, in_cache = pending.pop()
         stamp = path_stamp(folder)
@@ -866,26 +887,47 @@ def shared_round_receipts(root, workspaces):
             if folder == root or in_cache:
                 raise ValueError('shared round directory changed: ' + folder)
             continue
-        if folder == root:
-            # Staging a workspace or creating a loose log changes these timestamps.
-            yield folder, stamp[:3]
-        elif in_cache:
-            yield folder, stamp
+        if folder == root or in_cache:
+            # Staging a workspace or creating a loose log changes the root timestamps.
+            tracked[folder] = stamp[:3] if folder == root else stamp
+            yield folder, tracked[folder]
         try:
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    if entry.path in workspaces:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        pending.append((entry.path, in_cache or entry.name in BUILD_NAMES))
-                    elif entry.name in BUILD_IDENTITY_NAMES and entry.is_file(follow_symlinks=False):
-                        stamp = path_stamp(entry.path)
-                        if stamp is None or not stat.S_ISREG(stamp[2]):
-                            raise ValueError('shared round receipt changed: ' + entry.path)
-                        yield entry.path, stamp
+            names, directories, receipts = shared_round_listing(folder, workspaces, in_cache)
         except FileNotFoundError:
             if folder == root or in_cache:
                 raise
+            continue
+        walked.append((folder, in_cache, names))
+        pending.extend(directories)
+        for receipt in receipts:
+            stamp = path_stamp(receipt)
+            if stamp is None or not stat.S_ISREG(stamp[2]):
+                raise ValueError('shared round receipt changed: ' + receipt)
+            tracked[receipt] = stamp
+            yield receipt, stamp
+
+    # Finish checking the observed entries before closing the name listings.
+    if not inventory_stamps_match(tracked):
+        raise ValueError('shared round contents changed during inspection; stopped')
+
+    # A receipt or cache entry can arrive in an already-listed directory while
+    # we descend or read a receipt elsewhere. Recheck each listing on the way
+    # back up, with the round root last. Check every name in shared caches and
+    # only names that can affect shared identity elsewhere.
+    for folder, in_cache, names in reversed(walked):
+        stamp = path_stamp(folder)
+        current = None
+        if stamp is not None and stat.S_ISDIR(stamp[2]):
+            try:
+                current, _, _ = shared_round_listing(folder, workspaces, in_cache)
+            except FileNotFoundError:
+                pass
+        if current is None:
+            if folder == root or in_cache:
+                raise ValueError('shared round directory changed: ' + folder)
+            current = set()
+        if current != names:
+            raise ValueError('shared round contents changed during inspection; stopped')
 
 
 def shared_round_holds(rounds, fingerprint, previous, snapshots=None, contents=None):
@@ -1301,8 +1343,7 @@ def confirm_staged_round(parent, workspaces, shared, contents, fingerprint, prev
     # New receipts may be published under previously irrelevant directories.
     observed, read_contents = {}, {}
     hold = shared_round_holds({parent: workspaces}, fingerprint, previous, observed, read_contents).get(parent)
-    if (hold or read_contents.get(parent, {}) != contents
-            or observed.get(parent, {}) != shared or not inventory_stamps_match(shared)):
+    if hold or read_contents.get(parent, {}) != contents or observed.get(parent, {}) != shared:
         raise ValueError('shared round contents changed during inspection; stopped')
 
 

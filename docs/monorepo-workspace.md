@@ -426,9 +426,11 @@ each entry with the plan. It rechecks the markers, keeps, release state,
 installed and rollback fingerprints, and the round's shared scope. An early
 staged process sample can refuse a busy workspace. Apply confirms the workspace's
 own inventory, then rescans the shared scope for cache changes and new receipts.
-It samples process use of the staged path and original workspace again. After
-that sample, only in-memory path matching and the prepared exclusive rename to
-the Trash remain. The same order applies to whole
+Each shared scan rechecks the directory listings after descent and receipt reads.
+It compares every name in shared caches and receipt and cache names elsewhere,
+excluding independently discovered workspaces. Apply then samples process use
+of the staged path and original workspace again. After that sample, only
+in-memory path matching and the prepared exclusive rename to the Trash remain. The same order applies to whole
 workspaces and partial moves. Only the Trash rename produces a receipt,
 which still names the original source.
 
