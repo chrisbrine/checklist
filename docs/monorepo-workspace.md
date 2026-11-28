@@ -410,33 +410,33 @@ reason. A protected child can stay while eligible released siblings move to the
 Trash. The parent cache, loose evidence and unmarked children stay. When a
 receipt in the shared files identifies the installed or immediate rollback build,
 every workspace in the round stays. Apply prepares same-volume Trash destinations
-in bounded groups. After each earlier move and its receipt output, apply scans
-the next path's shared round for receipts. The scan discovers new receipts in a
-directory whose timestamp an earlier rename changed. Apply finishes the path's
-inventory, directory and permission checks, then verifies workspace markers,
-explicit keeps, ownership, release state, and installed and rollback identities.
-A change refuses the affected move.
+in bounded groups. Before staging each path, it scans the shared round again
+and checks the planned inventory, permissions, markers, keeps, release state,
+installed identities and process use.
 
-Apply takes its final process observation after those checks. When the path is
-idle, it calls an exclusive, no-follow rename in the same process. Once the
-observation returns, the rename follows without a filesystem scan, metadata
-read or subprocess. A process can open a file after its record is sampled.
-A writer can also change a path after its final metadata read, including
-during the process observation.
+Apply renames an idle path to a hidden `.<name>.checklist-retiring-<id>` name
+in the same parent. It walks the full checkout under that name and compares
+each entry with the plan. It rechecks the markers, keeps, release state,
+installed and rollback fingerprints, and the contents of the round's shared
+receipts. Apply samples process use of the staged and original paths and
+confirms the filesystem observations before an exclusive rename to the Trash.
+Only that rename produces a receipt, which still names the original source.
 
-The measured process-to-rename window on 28 November 2026 used three generated
-released workspaces, native `lsof` and `ps`, and a temporary Trash. Each row runs
-from the start of the path's final observation to entry into its prepared rename.
-The last column measures from the observation's return to that same entry.
+If a check fails, apply attempts an exclusive rename back to the original
+name and reports the reason. If the original name is occupied, apply keeps
+both entries and reports the staged location in `staged_path`. A later cleanup
+retains a discovered staging name for recovery. A process with an open
+descriptor can still change the staged tree after its last observation.
+Staging and validation do not lock out other writers.
 
-| Payload files | Load (1m, 5m, 15m) | Start to rename | Return to rename |
-| --- | --- | ---: | ---: |
-| 1 | 299.82, 293.00, 250.80 | 5.548 s | 135.1 ms |
-| 1,000 | 300.71, 293.30, 251.15 | 2.725 s | 5.4 ms |
-| 12,000 | 300.02, 293.28, 251.39 | 1.728 s | 9.2 ms |
+On 28 November 2026, the read-only p11 preview took 30.908 s on the base
+and 35.449 s with staged cleanup. Both runs reported 46 retained workspaces
+and zero eligible paths. Preview runs no staging checks. The median apply
+time in three paired runs on six generated workspaces and 2,500 shared
+cache files was 0.376 s on the base and 1.563 s with staging. The fixture
+injected empty process samples. The number of samples rose from 9 to 15,
+so the fixture isolates the filesystem work from native process scan time.
 
-These timings describe the recorded run. The observation and rename leave
-other processes free to act during the checks.
 See the
 [scratch cleanup procedure](../skills/checklist/references/driven-sessions.md#scratch-cleanup-and-cache-settings).
 

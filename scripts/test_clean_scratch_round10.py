@@ -34,11 +34,11 @@ class ReleasedFolderTests(unittest.TestCase):
         self.write(root, 'src/.git/config', b'private git metadata')
         self.write(root, 'notes.md', b'evidence preserved externally before release')
         moved = []
-        def rename(paths):
+        def rename(paths, *, staged):
             for path in paths:
                 moved.append(path)
                 destination = self.trash / path.name
-                path.rename(destination)
+                staged.rename(destination)
                 yield path, destination
         with patch.object(cleanup, 'du_sizes', side_effect=AssertionError('per-move size scan')):
             result, records = self.run_cleanup(apply=True, mover=rename)
@@ -100,10 +100,10 @@ class ReleasedFolderTests(unittest.TestCase):
             # Logical size exercises byte accounting; sparse bytes are not 96 GiB on disk.
             with (root/'store-copy/large').open('wb') as output: output.truncate(32*1024**3)
         moves=[]
-        def rename(paths):
+        def rename(paths, *, staged):
             for path in paths:
                 moves.append(path); destination=self.trash/path.name
-                path.rename(destination); yield path,destination
+                staged.rename(destination); yield path,destination
         load=subprocess.check_output(['sysctl','-n','vm.loadavg'],text=True).strip()
         started=time.monotonic()
         with patch.object(cleanup,'du_sizes',side_effect=AssertionError('repeated sizing')):
