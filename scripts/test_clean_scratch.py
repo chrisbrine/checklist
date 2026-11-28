@@ -802,9 +802,10 @@ class CleanScratchTests(unittest.TestCase):
         existing.write_bytes(b'keep destination')
         with patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
              patch.object(cleanup.uuid, 'uuid4', return_value=cleanup.uuid.UUID('f' * 32)):
-            move = cleanup.ScratchTrash().prepare(source, cleanup.path_stamp(source))
+            trash_move = cleanup.ScratchTrash()
+            destination = trash_move.prepare(source, cleanup.path_stamp(source))
         with self.assertRaises(FileExistsError):
-            move()
+            trash_move.rename_exclusive(source, destination)
         self.assertEqual(source.read_bytes(), b'keep original')
         self.assertEqual(existing.read_bytes(), b'keep destination')
 
@@ -813,8 +814,9 @@ class CleanScratchTests(unittest.TestCase):
         source = self.write(item, 'quote"and\nnewline.txt', b'payload')
         with patch.dict(os.environ, CHECKLIST_TRASH_DIR=str(self.trash)), \
              patch.object(cleanup.subprocess, 'run', side_effect=AssertionError('Trash subprocess')):
-            move = cleanup.ScratchTrash().prepare(source, cleanup.path_stamp(source))
-            destination = move()
+            trash_move = cleanup.ScratchTrash()
+            destination = trash_move.prepare(source, cleanup.path_stamp(source))
+            trash_move.rename_exclusive(source, destination)
         self.assertFalse(source.exists())
         self.assertEqual(destination.parent, self.trash)
         self.assertEqual(destination.read_bytes(), b'payload')
@@ -2484,9 +2486,11 @@ class CleanScratchTests(unittest.TestCase):
             nonce = cleanup.stage_nonce(destination)
             self.assertEqual(source, selected)
             self.assertFalse(destination.exists())
-            self.assertEqual(cleanup.read_stage_records()[nonce], {
+            record = cleanup.read_stage_records()[nonce]
+            self.assertEqual(Path(record.pop('destination')).parent, self.trash)
+            self.assertEqual(record, {
                 'version': 1, 'nonce': nonce, 'name': destination.name, 'path': str(destination),
-                'identity': cleanup.stage_identity(cleanup.path_stamp(source)),
+                'identity': cleanup.stage_identity(cleanup.path_stamp(source)), 'source': str(source),
             })
             rename(trash, source, destination)
 
@@ -2542,6 +2546,96 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(row['eligible_paths'], [])
         self.assertEqual(original.read_bytes(), b'original build')
         self.assertEqual(staged.read_bytes(), b'new occupant')
+
+    def test_finished_trash_move_closes_stage_record(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        self.write(workspace, 'payload', b'workspace bytes')
+
+        code, rows = self.run_cleanup(apply=True)
+        move, = [row for row in rows if row['action'] == 'trash_move']
+        self.assertEqual(code, 0)
+        self.assertEqual(cleanup.read_stage_records(), {})
+        relocated = Path(move['trash']).rename(workspace.with_name('restored-elsewhere'))
+
+        code, rows = self.run_cleanup()
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['eligible_paths'], [str(relocated)])
+        self.assertNotIn('recovery_path', row)
+
+    def test_successful_restore_closes_stage_record(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        self.write(workspace, 'payload', b'workspace bytes')
+
+        def refuse_trash(paths, *, staged):
+            self.assertTrue(staged.is_dir())
+            raise ValueError('synthetic Trash refusal')
+
+        code, rows = self.run_cleanup(apply=True, mover=refuse_trash)
+        self.assertEqual(code, 1)
+        self.assertEqual(rows[0]['reason'], 'synthetic Trash refusal')
+        self.assertEqual(cleanup.read_stage_records(), {})
+        relocated = workspace.rename(workspace.with_name('restored-elsewhere'))
+
+        code, rows = self.run_cleanup()
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['eligible_paths'], [str(relocated)])
+        self.assertNotIn('recovery_path', row)
+        self.assertEqual((relocated / 'payload').read_bytes(), b'workspace bytes')
+
+    def test_retry_closes_unused_stage_intent_left_by_sync_failure(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        self.write(workspace, 'payload', b'workspace bytes')
+
+        with patch.object(os, 'fsync', side_effect=OSError('synthetic stage journal sync failure')):
+            code, rows = self.run_cleanup(apply=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(any(row['action'] == 'trash_move' for row in rows))
+        old_intent, = cleanup.read_stage_records().values()
+        self.assertEqual(old_intent['source'], str(workspace))
+        self.assertTrue(workspace.is_dir())
+
+        code, rows = self.run_cleanup(apply=True)
+        self.assertEqual(code, 0)
+        move, = [row for row in rows if row['action'] == 'trash_move']
+        self.assertEqual(cleanup.read_stage_records(), {})
+        relocated = Path(move['trash']).rename(workspace.with_name('restored-elsewhere'))
+
+        code, rows = self.run_cleanup()
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['eligible_paths'], [str(relocated)])
+        self.assertNotIn('recovery_path', row)
+
+    def test_interrupted_trash_receipt_recognizes_planned_destination(self):
+        workspace = self.item('released')
+        self.mark(workspace, release=True)
+        self.write(workspace, 'payload', b'workspace bytes')
+        rename = cleanup.ScratchTrash.rename_exclusive
+
+        def interrupt_after_trash_move(trash, source, destination):
+            rename(trash, source, destination)
+            if destination.parent == self.trash:
+                raise KeyboardInterrupt
+
+        with patch.object(cleanup.ScratchTrash, 'rename_exclusive', new=interrupt_after_trash_move):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cleanup(apply=True)
+
+        destination, = self.trash.iterdir()
+        record, = cleanup.read_stage_records().values()
+        self.assertEqual(record['destination'], str(destination))
+        self.qualification = self.trash
+
+        code, rows = self.run_cleanup()
+        self.assertEqual(code, 0)
+        row, = rows
+        self.assertEqual(row['eligible_paths'], [str(destination)])
+        self.assertNotIn('recovery_path', row)
 
     def test_interrupted_whole_workspace_reports_actual_staged_name(self):
         for source in ('released', 'long-name-' + 'r' * 210):
@@ -2639,6 +2733,9 @@ class CleanScratchTests(unittest.TestCase):
         self.assertEqual(code, 1)
         held, = rows
         staged = Path(held['staged_path'])
+        self.assertEqual(held['recovery_path'], str(staged))
+        self.assertEqual(held['recovery_provenance'], 'recorded')
+        self.assertIn(cleanup.stage_nonce(staged), cleanup.read_stage_records())
         self.assertEqual(held['destinations'], [])
         self.assertIn('original name occupied', held['reason'])
         self.assertIn(str(staged), held['reason'])

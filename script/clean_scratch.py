@@ -11,6 +11,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import hashlib
+from itertools import chain
 import json
 import os
 from pathlib import Path
@@ -52,18 +53,18 @@ def staging_name(path, token):
     return name if len(os.fsencode(name)) <= 255 else suffix
 
 
-def recovery_sibling(source, staged=None):
-    """Find an interrupted staging name for this source in its rename parent."""
+def recovery_siblings(source, staged=None):
+    """Find interrupted staging names for this source in its rename parent."""
     parent = source.parent
     if parent.is_symlink():
-        return None
+        return []
     prefix = staging_name(source, '0' * 32)[:-32]
     staged_name = staged.name if staged is not None else None
     with os.scandir(parent) as entries:
-        name = min((entry.name for entry in entries
-                    if entry.name != staged_name and entry.name[:-32] == prefix
-                    and RETIRING_NAME.fullmatch(entry.name)), default=None)
-    return parent / name if name is not None else None
+        names = sorted(entry.name for entry in entries
+                       if entry.name != staged_name and entry.name[:-32] == prefix
+                       and RETIRING_NAME.fullmatch(entry.name))
+    return [parent / name for name in names]
 
 
 def recovery_reason(path):
@@ -87,7 +88,15 @@ def owned_regular(descriptor):
     return stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
 
 
-def write_stage_records(entries):
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def append_stage_journal(records):
     path = stage_records_path()
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     fd = os.open(path, flags, 0o600)
@@ -96,20 +105,42 @@ def write_stage_records(entries):
             raise ValueError('scratch stage journal must be a caller-owned regular file: ' + str(path))
         # An interrupted append can leave a partial trailing line.
         output.write(b'\n')
-        for staged, stamp in entries:
-            record = {'version': 1, 'nonce': stage_nonce(staged), 'name': staged.name,
-                      'path': str(staged.absolute()), 'identity': stage_identity(stamp)}
+        for record in records:
             output.write(json.dumps(record).encode() + b'\n')
         output.flush()
         os.fsync(output.fileno())
-    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(parent)
-    finally:
-        os.close(parent)
+    sync_directory(path.parent)
+
+
+def resolved_stage_record(nonce):
+    return {'version': 1, 'nonce': nonce, 'state': 'resolved'}
+
+
+def stage_at_outcome(record, location):
+    return location in (record.get('source'), record.get('destination'))
+
+
+def write_stage_records(entries):
+    records = stage_index()
+    settled = set()
+    intents = []
+    for source, staged, stamp, destination in entries:
+        identity = stage_identity(stamp)
+        location = str(source.absolute())
+        # A retry can prove older intents settled at this source. Close them
+        # before moving the entry away from that proof.
+        settled.update(record['nonce'] for record in records.get(stamp[1], ())
+                       if record['identity'] == identity and stage_at_outcome(record, location))
+        intent = {'version': 1, 'nonce': stage_nonce(staged), 'name': staged.name,
+                  'source': location, 'path': str(staged.absolute()), 'identity': identity}
+        if destination is not None:
+            intent['destination'] = str(destination.absolute())
+        intents.append(intent)
+    append_stage_journal(chain(map(resolved_stage_record, sorted(settled)), intents))
 
 
 def read_stage_records():
+    """Replay the journal by nonce, retaining only well-formed open intents."""
     records = {}
     try:
         fd = os.open(stage_records_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -117,71 +148,89 @@ def read_stage_records():
             if not owned_regular(source.fileno()):
                 return records
             for line in source:
+                if not line.endswith(b'\n'):
+                    continue
                 try:
                     record = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
-                if isinstance(record, dict) and record.get('version') == 1 and isinstance(record.get('nonce'), str):
-                    records[record['nonce']] = record
+                if not isinstance(record, dict) or record.get('version') != 1:
+                    continue
+                nonce = record.get('nonce')
+                if not isinstance(nonce, str) or not re.fullmatch('[0-9a-f]{32}', nonce):
+                    continue
+                identity = record.get('identity')
+                if record.get('state') == 'resolved':
+                    records.pop(nonce, None)
+                elif isinstance(identity, list) and len(identity) == 3 and all(type(n) is int for n in identity):
+                    records[nonce] = record
     except OSError:
-        pass
+        return {}
     return records
 
 
-def stage_record_matches(path, record):
-    if not record or record.get('name') != path.name:
+def stage_index():
+    by_inode = {}
+    for record in read_stage_records().values():
+        by_inode.setdefault(record['identity'][1], []).append(record)
+    return by_inode
+
+
+def recorded_stage(path, stamp, records):
+    if stamp is None or not (matches := records.get(stamp[1])):
         return False
-    stamp = path_stamp(path)
-    return bool(stamp and record.get('identity') == stage_identity(stamp))
+    identity = stage_identity(stamp)
+    location = str(path.absolute())
+    # The source proves an unused intent or restoration. The exclusive,
+    # unique final destination proves the Trash rename. Older records have
+    # neither field and remain open wherever the entry is found.
+    return any(record['identity'] == identity and not stage_at_outcome(record, location) for record in matches)
 
 
-def recovery_report(path, records):
-    provenance = 'unverified'
-    try:
-        if stage_record_matches(path, records.get(stage_nonce(path))):
-            provenance = 'recorded'
-    except OSError:
-        # Missing, unreadable and mismatched records never authorize a move.
-        pass
+def recovery_details(path, stamp, records):
+    if recorded_stage(path, stamp, records):
+        provenance = 'recorded'
+    elif RETIRING_NAME.fullmatch(path.name):
+        provenance = 'unverified'
+    else:
+        return {}
     return {'recovery_path': str(path), 'recovery_provenance': provenance}
 
 
-def recorded_recovery_items(items):
-    """Find recorded stages at known paths before the held-root preview shortcut."""
-    roots = {item for item, _ in items}
-    matches = set()
-    for nonce, record in read_stage_records().items():
-        if not isinstance(record.get('path'), str):
-            continue
-        path = Path(record['path'])
-        if (not path.is_absolute() or '..' in path.parts
-                or not RETIRING_NAME.fullmatch(path.name) or stage_nonce(path) != nonce):
-            continue
-        owners = roots.intersection((path, *path.parents))
-        try:
-            if owners and stage_record_matches(path, record):
-                matches.update(owners)
-        except OSError:
-            pass
-    return matches
-
-
-def pending_recovery(item, before):
-    if RETIRING_NAME.fullmatch(item.name):
-        return recovery_report(item, read_stage_records())
-    sibling = recovery_sibling(item)
-    paths = [sibling] if sibling is not None else []
-    paths.extend(path for path in before if RETIRING_NAME.fullmatch(path.name))
-    if not paths:
+def recovery_summary(entries, records):
+    found = {}
+    for path, stamp in entries:
+        if details := recovery_details(path, stamp, records):
+            found[details['recovery_path']] = details
+    if not found:
         return {}
-    records = read_stage_records()
-    first = {}
-    for path in paths:
-        details = recovery_report(path, records)
-        if details['recovery_provenance'] == 'recorded':
-            return details
-        first = first or details
-    return first
+    ordered = sorted(found.values(), key=lambda details: details['recovery_provenance'] != 'recorded')
+    return {**ordered[0], 'recovery_entries': ordered} if len(ordered) > 1 else ordered[0]
+
+
+def recovery_entries(root, records):
+    """Walk marker-held roots without hashing or building a full inventory."""
+    stamp = path_stamp(root)
+    yield root, stamp
+
+    def descend(directory):
+        with os.scandir(directory) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            if RETIRING_NAME.fullmatch(entry.name) or (records and entry.inode() in records):
+                yield Path(entry.path), path_stamp(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                yield from descend(entry.path)
+
+    if stamp and stat.S_ISDIR(stamp[2]):
+        yield from descend(root)
+
+
+def pending_recovery(item, entries, records):
+    # An adjacent staged sibling can outlive an interrupted whole-root move.
+    # Inspect it as well as the candidate's own inventory.
+    siblings = ((path, path_stamp(path)) for path in recovery_siblings(item))
+    return recovery_summary(chain(siblings, entries), records)
 
 
 class ScratchTrash:
@@ -245,13 +294,7 @@ class ScratchTrash:
         name = f'{path.stem}-{uuid.uuid4().hex}{path.suffix}'
         if len(os.fsencode(name)) > 255:
             name = uuid.uuid4().hex
-        destination = self.directories[device] / name
-
-        def move(source=path):
-            self.rename_exclusive(source, destination)
-            return destination
-
-        return move
+        return self.directories[device] / name
 
     def rename_exclusive(self, source, destination):
         # RENAME_EXCL | RENAME_NOFOLLOW_ANY. Neither replace a name nor follow
@@ -260,11 +303,13 @@ class ScratchTrash:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(source), None, str(destination))
 
-    def prepare_stages(self, entries):
+    def prepare_stages(self, entries, destinations=None):
         stages = {path: (path.with_name(staging_name(path, uuid.uuid4().hex)), stamp)
                   for path, stamp in entries if path not in self.prepared_stages}
         if stages:
-            write_stage_records(stages.values())
+            destinations = destinations or {}
+            write_stage_records((path, staged, stamp, destinations.get(path))
+                                for path, (staged, stamp) in stages.items())
             self.prepared_stages.update((path, staged) for path, (staged, _) in stages.items())
 
     def stage(self, path):
@@ -833,33 +878,45 @@ def private_copy(path, *, allow_build_only=True):
             or (path / 'build-info.json').is_file())
 
 
-def session_items(item):
+def session_items(item, records=None):
+    records = stage_index() if records is None else records
     # Inspect just one level into an unmarked container. Loose files and other
     # directories are not cleanup candidates. A marked root keeps its ordinary
     # whole-item protections (including malformed markers failing closed).
     try:
-        if (RETIRING_NAME.fullmatch(item.name) or item.is_symlink() or not item.is_dir()
+        if (RETIRING_NAME.fullmatch(item.name) or (records and recorded_stage(item, path_stamp(item), records))
+                or item.is_symlink() or not item.is_dir()
                 or read_marker(item) is not None
                 or re.fullmatch(r'ws[a-z]*\d+', item.name) or private_copy(item, allow_build_only=False)):
             return [item]
         # A round container can have its own .build. In that case only marked
         # children establish separate workspaces, and the remaining tree stays.
+        entries = children(item)
         if (item / '.build').is_dir():
-            return [child for child in children(item) if not child.is_symlink() and child.is_dir()
-                    and os.path.lexists(child / WORKSPACE_MARKER)] or [item]
-        copies = [child for child in children(item)
-                  if private_copy(child) or os.path.lexists(child / WORKSPACE_MARKER)]
-        return copies or [item]
+            copies = [child for child in entries if not child.is_symlink() and child.is_dir()
+                      and os.path.lexists(child / WORKSPACE_MARKER)]
+        else:
+            copies = [child for child in entries
+                      if private_copy(child) or os.path.lexists(child / WORKSPACE_MARKER)]
+        if not copies:
+            return [item]
+        # Keep the existing split boundary. A recorded stage is an extra
+        # candidate only in a container that was already split.
+        if records:
+            kept = set(copies)
+            return [child for child in entries if child in kept or recorded_stage(child, path_stamp(child), records)]
+        return copies
     except (OSError, ValueError):
         return [item]
 
 
-def candidates(sessions, qualification, session_id, include_released=False):
+def candidates(sessions, qualification, session_id, include_released=False, *, records=None):
     """Default scope is the caller's session, never another session's idle copies.
 
     --include-released admits foreign roots only with that session's release.
     Spare items still need their own retained Checklist package in plan().
     """
+    records = stage_index() if records is None else records
     for host in children(sessions):
         checklist = 'Checklist' in host.name
         if not checklist and 'spare-' not in host.name:
@@ -872,7 +929,7 @@ def candidates(sessions, qualification, session_id, include_released=False):
                 if in_scope(item, kind, session_id, include_released):
                     # Foreign scope still requires the owner's root release;
                     # container discovery never expands that authorization.
-                    for candidate in session_items(item) if session.name == session_id else [item]:
+                    for candidate in session_items(item, records) if session.name == session_id else [item]:
                         yield candidate, kind
     for item in children(qualification):
         if in_scope(item, 'qualification', session_id, include_released):
@@ -1180,7 +1237,7 @@ def shared_round_holds(rounds, fingerprint, previous, snapshots=None, contents=N
 
 
 def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaustive=False,
-         *, previous=None, round_hold=None):
+         *, previous=None, round_hold=None, records=None):
     """exhaustive=True skips the item-wide-hold shortcut (tests prove both agree)."""
     before = inventory(item)
     below_item = os.fspath(item).rstrip('/') + '/'
@@ -1201,9 +1258,10 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
     whole = retire_run or released_retire
     # A previous partial move may have staged a child before this tree
     # was marked or released. The current plan cannot rule out that history.
-    recovery_details = pending_recovery(item, before)
-    if recovery_details:
-        reason = recovery_reason(recovery_details['recovery_path'])
+    records = stage_index() if records is None else records
+    recovery = pending_recovery(item, before.items(), records)
+    if recovery:
+        reason = recovery_reason(recovery['recovery_path'])
     elif item.is_symlink():
         reason = 'symbolic link; never followed'
     elif stat.S_ISREG(before[item][2]):
@@ -1257,7 +1315,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
         return {'path': str(item), 'kind': kind, **counts, 'total_bytes': size, 'reason': reason,
                 'reasons': {reason: size} if files else {},
                 'retained_legacy_paths': [str(p) for p in legacy], 'planned_move_count': 0,
-                'move_bytes': {}, 'moves': [], 'inventory': before, **recovery_details}
+                'move_bytes': {}, 'moves': [], 'inventory': before, **recovery}
     if whole and not reason:
         # An owner's root release authorizes one rename of the checked tree.
         # Do not classify/hash its managed objects or split at Git/legacy paths:
@@ -1338,7 +1396,7 @@ def plan(item, kind, objects, processes, fingerprint, keep=(), now=None, exhaust
             'reasons': dict(reasons), 'retained_legacy_paths': [str(p) for p in legacy],
             'planned_move_count': len(moves),
             'move_bytes': {path: tree_bytes[path] for path in moves},
-            'moves': moves, 'inventory': before, **recovery_details}
+            'moves': moves, 'inventory': before, **recovery}
 
 
 def preview_public(decision):
@@ -1358,17 +1416,21 @@ def _set_preview_objects(objects):
 
 
 def preview_one(item, kind, in_use, fingerprint, keep, now, session_id, include_released,
-                objects=None, sizer=None, *, previous=None, round_hold=None, inspect_recovery=False):
+                objects=None, sizer=None, *, previous=None, round_hold=None, records=None):
     """One read-only preview decision; module-level so a process pool can run it."""
     # An old --preview is never an executable deletion plan.
     if not in_scope(item, kind, session_id, include_released):
         raise ValueError('workspace ownership/release changed; retained')
-    # Preview reads a held root's marker and du size only (CL-359 speed).
-    if not inspect_recovery and (held := held_preview(item, kind, keep, sizer)):
+    records = stage_index() if records is None else records
+    if held := held_preview(item, kind, keep, sizer):
+        recovery = pending_recovery(item, recovery_entries(item, records), records)
+        if recovery:
+            reason = recovery_reason(recovery['recovery_path'])
+            held.update(reason=reason, reasons={reason: held['total_bytes']}, **recovery)
         return held
     return preview_public(plan(item, kind, _PREVIEW_OBJECTS if objects is None else objects,
                                [item] if in_use else [], fingerprint, keep, now,
-                               previous=previous, round_hold=round_hold))
+                               previous=previous, round_hold=round_hold, records=records))
 
 
 def preview_executor(objects, workers=PREVIEW_WORKERS):
@@ -1382,7 +1444,7 @@ def preview_executor(objects, workers=PREVIEW_WORKERS):
 
 
 def preview_items(items, objects, used, fingerprint, keep, clock, session_id, include_released,
-                  workers=PREVIEW_WORKERS, executor=None, sizer=None, *, previous=None, round_holds=None):
+                  workers=PREVIEW_WORKERS, executor=None, sizer=None, *, previous=None, round_holds=None, records=None):
     """Read-only preview: the same per-item decisions and output order as apply's
     planning, with held-root du sizes and item plans computed in parallel.
 
@@ -1390,7 +1452,7 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
     process pool from preview_executor()."""
     failed = False
     process_pool = executor is not None
-    recoveries = recorded_recovery_items(items)
+    records = stage_index() if records is None else records
     with (executor(objects) if process_pool else ThreadPoolExecutor(max_workers=max(1, workers))) as pool, \
             ThreadPoolExecutor(max_workers=max(1, workers)) as size_pool:
         futures = []
@@ -1398,15 +1460,14 @@ def preview_items(items, objects, used, fingerprint, keep, clock, session_id, in
             round_hold = (round_holds or {}).get(item.parent)
             # Held roots use the very same background size futures as size_report;
             # do not make each process launch a duplicate du of that subtree.
-            inspect_recovery = item in recoveries or bool(RETIRING_NAME.fullmatch(item.name))
-            if not inspect_recovery and sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
+            if sizer is not None and held_preview(item, kind, keep, lambda paths: {}):
                 future = size_pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
                                           session_id, include_released, objects, sizer,
-                                          previous=previous, round_hold=round_hold)
+                                          previous=previous, round_hold=round_hold, records=records)
             else:
                 future = pool.submit(preview_one, item, kind, item in used, fingerprint, keep, clock(),
                                      session_id, include_released, None if process_pool else objects,
-                                     previous=previous, round_hold=round_hold, inspect_recovery=inspect_recovery)
+                                     previous=previous, round_hold=round_hold, records=records)
             futures.append((item, future))
         for item, future in futures:
             try:
@@ -1423,6 +1484,58 @@ def move_error(decision, error, path=None, stop=False):
         {'source': str(path or decision['path']), 'reason': str(error)})
     if stop:
         decision['stopped'] = True
+
+
+def stop_for_recovery(decision, path, details):
+    if not details:
+        return False
+    decision['public'].update(eligible_paths=[], planned_move_count=0, **details)
+    move_error(decision, recovery_reason(details['recovery_path']), path, stop=True)
+    return True
+
+
+def sibling_recovery(path, staged=None):
+    siblings = recovery_siblings(path, staged)
+    if not siblings:
+        return {}
+    return recovery_summary(((sibling, path_stamp(sibling)) for sibling in siblings), stage_index())
+
+
+def late_tree_recovery(item, actual, staged):
+    # The final shared walk can take time. A name added underneath the
+    # staged candidate changes a directory stamp; rescan for recovery only
+    # when needed. The stage currently being retired is our own entry.
+    if all(path_stamp(folder) == stamp for folder, stamp in actual.items() if stat.S_ISDIR(stamp[2])):
+        return {}
+    records = stage_index()
+    entries = ((path, stamp) for path, stamp in recovery_entries(item, records) if path != staged)
+    return recovery_summary(entries, records)
+
+
+def relocate_recovery(public, source, destination):
+    if 'recovery_path' not in public:
+        return
+    entries = public.get('recovery_entries', [])
+    for details in [public, *entries]:
+        original = Path(details['recovery_path'])
+        details['recovery_path'] = str(staged_path(original, source, destination))
+    public['reason'] = recovery_reason(public['recovery_path'])
+    public['errors'][-1]['reason'] = public['reason']
+
+
+def finish_stage_batch(stage_batch, trash, completed):
+    # Intents that never reached rename are also safe to close. An attempted
+    # rename with an uncertain outcome remains open.
+    for _, path in stage_batch:
+        staged = trash.prepared_stages.pop(path, None)
+        if staged is not None:
+            completed.append((staged, ()))
+
+    if completed:
+        # Close a moved or restored stage only after its rename is durable.
+        for parent in sorted({parent for _, parents in completed for parent in parents}):
+            sync_directory(parent)
+        append_stage_journal(resolved_stage_record(stage_nonce(staged)) for staged, _ in completed)
 
 
 def permission_root(item, kind, session_id):
@@ -1644,12 +1757,13 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 move_error(decision, error, path)
     stage_batch = [(decision, path) for decision, path in batch if mover is not None or path in prepared]
     try:
-        trash.prepare_stages((path, decision['inventory'][path]) for decision, path in stage_batch)
+        trash.prepare_stages(((path, decision['inventory'][path]) for decision, path in stage_batch), prepared)
     except (OSError, ValueError) as error:
         for decision, path in stage_batch:
             move_error(decision, error, path, stop=True)
         return
     first = True
+    completed = []
     moved = {}
     retry = []
     for offset, (decision, path) in enumerate(batch):
@@ -1684,8 +1798,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
         staged = None
         try:
             try:
-                if recovery := recovery_sibling(path):
-                    raise ValueError(recovery_reason(recovery))
+                if stop_for_recovery(decision, path, sibling_recovery(path)):
+                    continue
                 validate_move(decision, path, installations, shared, observed.get(parent, {}), hold, keep,
                               session_id, include_released, modes)
             except PermissionError as error:
@@ -1731,8 +1845,9 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 # The workspace scan can take time. Check for later shared
                 # cache and receipt changes before sampling processes.
                 confirm_staged_round(parent, workspaces, staged_shared, contents, fingerprint, previous)
-                if recovery := recovery_sibling(path, staged):
-                    raise ValueError(recovery_reason(recovery))
+                recovery = sibling_recovery(path, staged) or late_tree_recovery(staged_item, actual, staged)
+                if stop_for_recovery(decision, path, recovery):
+                    continue
                 if path_stamp(path) is not None:
                     raise ValueError('original name reappeared before Trash')
                 # A read-only open can leave those checks unchanged. After
@@ -1743,7 +1858,8 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                 move_error(decision, error, path, stop=True)
                 continue
             if mover is None:
-                destination = prepared[path](staged)
+                trash.rename_exclusive(staged, prepared[path])
+                destination = prepared[path]
             else:
                 # Test adapters get both the receipt source and its physical name.
                 receipts = iter(mover([path], staged=staged))
@@ -1767,6 +1883,13 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                         decision['public']['staged_path'] = str(staged)
                         move_error(decision, decision['public']['reason'] + '; ' + error, path, stop=True)
                         restore_path = staged
+                        if 'recovery_path' not in decision['public'] and (stamp := path_stamp(staged)):
+                            decision['public'].update(recovery_details(staged, stamp, stage_index()))
+                    else:
+                        relocate_recovery(decision['public'], staged, path)
+                        completed.append((staged, (path.parent,)))
+                elif destination is not None:
+                    completed.append((staged, (path.parent, destination.parent)))
                 restore_modes(modes, {path: restore_path} if restore_path is not None else {})
                 changed_dirs = set(modes)
                 expected = decision['inventory']
@@ -1807,6 +1930,13 @@ def apply_batch(batch, installations, fingerprint, process_reader, mover,
                     move_error(decision, error, path, stop=True)
         if retry:
             break
+
+    try:
+        finish_stage_batch(stage_batch, trash, completed)
+    except (OSError, ValueError) as error:
+        for decision in decisions:
+            move_error(decision, ValueError('could not finish scratch stage journal: ' + str(error)), stop=True)
+        return
 
     # Receipt reporting and post-move inventories stay outside the rename gate.
     for decision in moved.values():
@@ -1857,7 +1987,8 @@ def clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
         except (OSError, ValueError) as error:
             print(json.dumps({'path': str(item), 'action': 'kept_error', 'reason': str(error)}))
             failed = True
-    items = list(candidates(sessions, qualification, session_id, include_released))
+    records = stage_index()
+    items = list(candidates(sessions, qualification, session_id, include_released, records=records))
     rounds = shared_rounds(items)
     objects = git_objects(repo) if items else set()
     fingerprint, previous, installations = installation_observation(installed_info) if items else (None, None, {})
@@ -1871,9 +2002,13 @@ def clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
         sizer = after_inspection() if after_inspection else None
         return 1 if preview_items(items, objects, used, fingerprint, keep, clock, session_id,
                                   include_released, executor=preview_pool, sizer=sizer,
-                                  previous=previous, round_holds=round_holds) or failed else 0
+                                  previous=previous, round_holds=round_holds, records=records) or failed else 0
     trash = None
     for offset in range(0, len(items), ITEM_BATCH_SIZE):
+        # A previous batch can leave a new unresolved stage after a failed
+        # restore. The next plan must see it even if its name was changed.
+        if offset:
+            records = stage_index()
         pending = []
         for item, kind in items[offset:offset + ITEM_BATCH_SIZE]:
             try:
@@ -1884,7 +2019,7 @@ def clean_candidates(sessions, qualification, repo, installed_info, keep, apply,
                 markers = {folder / WORKSPACE_MARKER: path_stamp(folder / WORKSPACE_MARKER)
                            for folder in marker_roots}
                 decision = plan(item, kind, objects, [item] if item in used else [], fingerprint, keep, clock(),
-                                previous=previous, round_hold=round_holds.get(item.parent))
+                                previous=previous, round_hold=round_holds.get(item.parent), records=records)
                 public = preview_public(decision)
                 if decision['moves']:
                     public.update(action='trashed', destinations=[], moved_count=0, moved_bytes=0)

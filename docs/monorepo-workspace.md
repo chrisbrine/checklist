@@ -457,17 +457,30 @@ the original source.
 
 If a check fails, apply attempts an exclusive rename back to the original
 name and reports the reason. If the original name is occupied, apply keeps
-both entries and reports the staged location in `staged_path`. A later cleanup
-retains a discovered staging entry and reports its recovery path. Staging names
-sit beside the selected source and use a basename-free fallback for long names.
-Before staging, cleanup appends the nonce, staging name, path and source entry
-identity to `.checklist-scratch-stages.jsonl` beside the publication lock. It
-syncs the journal and its parent once per move batch. It verifies the name and
-entry identity when reporting a recorded stage. A prior partial move can leave a
-staged child anywhere in a workspace. Marking or releasing that workspace
-keeps the recovery hold. Cleanup retains earlier or unverified names because
-legacy stages and fixture lookalikes share the same spelling. The Trash rename
-uses a unique final destination and requires no intermediate Trash stage.
+both entries and reports the stage. A later cleanup checks the root and
+descendants of each candidate. Marker-held preview also walks those entries.
+A recovery row reports the current `recovery_path` and `recovery_provenance`.
+A matching unresolved device, inode and entry type identifies a recorded
+stage even if the stage or its ancestor was renamed. A different identity at
+the old path cannot inherit the record.
+
+Before staging, cleanup writes each intent and nonce to the caller-owned
+`.checklist-scratch-stages.jsonl` journal beside the publication lock. It
+syncs the journal and its parent before each move batch. It closes intents
+for unused moves, verified Trash moves and successful rollbacks. For moves
+and rollbacks it syncs the changed rename directories before recording the
+resolution. After an interruption, a matching identity at the recorded
+original path or at its unique final Trash destination can establish the
+outcome before a resolution record was written. A retry records those known resolutions
+before moving the entry away from that path. Older records without those
+paths stay open when their identities are encountered.
+
+A reserved-format name with no matching identity remains held as
+`unverified`. Earlier genuine stages and fixture names share that format.
+After checking that an entry is a fixture, move it to the Trash or rename it
+outside the reserved format. Other workspace checks still apply. Staging
+occurs beside the selected source, with a basename-free fallback for long
+names. A qualifying move uses a unique final same-volume Trash destination.
 
 Scratch apply and Checklist identity publishers take an exclusive advisory
 lock on `~/Library/Caches/ChecklistQualification/.checklist-publication.lock`.
